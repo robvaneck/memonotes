@@ -488,30 +488,146 @@ fn install_app_menu(
     let about_action = adw::gio::SimpleAction::new("about", None);
     let window_for_about = window.clone();
     about_action.connect_activate(move |_, _| {
-        let dialog = adw::AboutDialog::builder()
-            .application_name("Memonotes")
-            .developer_name("Rob van Eck")
-            .version(env!("CARGO_PKG_VERSION"))
-            .support_url("https://github.com/sponsors/robvaneck")
-            .issue_url("https://github.com/robvaneck/memonotes")
-            .license_type(gtk::License::Gpl30)
-            .build();
-        dialog.add_credit_section(
-            Some("Credits"),
-            &[
-                "Coded by Rob van Eck",
-                "Bitcoin wallet: bc1sfsdfsdfsdfsdfsdfx4",
-            ],
-        );
-        dialog.add_legal_section(
-            "Legal",
-            None,
-            gtk::License::Gpl30,
-            Some(include_str!("../LICENSE")),
-        );
-        dialog.present(Some(&window_for_about));
+        show_about_window(&window_for_about);
     });
     window.add_action(&about_action);
+}
+
+fn show_about_window(parent: &ApplicationWindow) {
+    let about_window = gtk::Window::builder()
+        .title("Memonotes")
+        .transient_for(parent)
+        .modal(true)
+        .default_width(360)
+        .default_height(640)
+        .build();
+    about_window.set_size_request(360, -1);
+    about_window.add_css_class("about");
+
+    let header = HeaderBar::builder()
+        .show_start_title_buttons(false)
+        .show_end_title_buttons(false)
+        .build();
+    header.add_css_class("flat");
+    header.set_title_widget(Some(&gtk::Label::new(None)));
+    let start_controls = gtk::WindowControls::new(gtk::PackType::Start);
+    header.pack_start(&start_controls);
+    let close_controls = gtk::WindowControls::new(gtk::PackType::End);
+    header.pack_end(&close_controls);
+
+    let about_content = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    let app_icon = gtk::Image::from_icon_name("accessories-text-editor-symbolic");
+    app_icon.set_pixel_size(128);
+    app_icon.add_css_class("icon-dropshadow");
+    app_icon.set_halign(gtk::Align::Center);
+    about_content.append(&app_icon);
+
+    let identity = gtk::Grid::builder()
+        .row_spacing(0)
+        .hexpand(true)
+        .build();
+    identity.set_margin_bottom(12);
+    let app_name = gtk::Label::builder()
+        .label("Memonotes")
+        .css_classes(["title-1"])
+        .hexpand(true)
+        .xalign(0.5)
+        .justify(gtk::Justification::Center)
+        .wrap(true)
+        .build();
+    identity.attach(&app_name, 0, 0, 1, 1);
+    let developer_name = gtk::Label::builder()
+        .label("Rob van Eck")
+        .hexpand(true)
+        .xalign(0.5)
+        .justify(gtk::Justification::Center)
+        .wrap(true)
+        .build();
+    developer_name.set_margin_bottom(8);
+    identity.attach(&developer_name, 0, 1, 1, 1);
+    let version = gtk::Button::with_label(env!("CARGO_PKG_VERSION"));
+    version.set_halign(gtk::Align::Center);
+    version.add_css_class("app-version");
+    identity.attach(&version, 0, 2, 1, 1);
+    about_content.append(&identity);
+
+    let links_group = adw::PreferencesGroup::new();
+    links_group.add(&about_link_row(
+        "GitHub",
+        "https://github.com/robvaneck/memonotes",
+    ));
+    links_group.add(&about_link_row(
+        "Donate",
+        "https://github.com/sponsors/robvaneck",
+    ));
+    about_content.append(&links_group);
+
+    let credits_group = adw::PreferencesGroup::new();
+    credits_group.add(
+        &adw::ActionRow::builder()
+            .title("Coded by Rob van Eck")
+            .build(),
+    );
+    let bitcoin_address = "bc1sfsdfsdfsdfsdfsdfx4";
+    let bitcoin_row = adw::ActionRow::builder()
+        .title("Bitcoin wallet")
+        .subtitle(bitcoin_address)
+        .subtitle_selectable(true)
+        .build();
+    let copy_button = gtk::Button::from_icon_name("edit-copy-symbolic");
+    copy_button.set_tooltip_text(Some("Copy Bitcoin address"));
+    copy_button.add_css_class("flat");
+    copy_button.set_valign(gtk::Align::Center);
+    let clipboard = gtk::prelude::WidgetExt::display(&about_window).clipboard();
+    copy_button.connect_clicked(move |_| {
+        clipboard.set_text(bitcoin_address);
+    });
+    bitcoin_row.add_suffix(&copy_button);
+    credits_group.add(&bitcoin_row);
+    about_content.append(&credits_group);
+
+    let legal_group = adw::PreferencesGroup::new();
+    legal_group.add(&about_link_row(
+        "GNU GPL-3.0-or-later",
+        "https://github.com/robvaneck/memonotes/blob/main/LICENSE",
+    ));
+    about_content.append(&legal_group);
+
+    let about_clamp = adw::Clamp::builder().child(&about_content).build();
+    let about_scroll = gtk::ScrolledWindow::builder()
+        .child(&about_clamp)
+        .build();
+    about_scroll.add_css_class("main-page");
+
+    about_window.set_titlebar(Some(&header));
+    about_window.set_child(Some(&about_scroll));
+    about_window.present();
+}
+
+fn about_link_row(title: &str, uri: &str) -> adw::ActionRow {
+    let button = gtk::Button::builder()
+        .icon_name("adw-external-link-symbolic")
+        .tooltip_text(format!("Open {title}"))
+        .valign(gtk::Align::Center)
+        .build();
+    button.add_css_class("flat");
+
+    let uri = uri.to_owned();
+    button.connect_clicked(move |_| {
+        if let Err(error) = adw::gio::AppInfo::launch_default_for_uri(
+            &uri,
+            None::<&adw::gio::AppLaunchContext>,
+        ) {
+            eprintln!("Link openen mislukt: {error}");
+        }
+    });
+
+    let row = adw::ActionRow::builder()
+        .title(title)
+        .activatable_widget(&button)
+        .build();
+    row.add_suffix(&button);
+    row
 }
 
 fn build_accounts_page(
