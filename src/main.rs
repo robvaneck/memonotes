@@ -350,8 +350,8 @@ fn install_app_menu(window: &ApplicationWindow, more_button: &gtk::MenuButton) {
             .version(env!("CARGO_PKG_VERSION"))
             .comments("BTC-donatieadres: [walletadres toevoegen]")
             .license_type(gtk::License::Gpl30)
-            .website("https://github.com/your-username/memonotes")
-            .website_label("GitHub (placeholder)")
+            .website("https://github.com/robvaneck/memonotes")
+            .website_label("GitHub")
             .transient_for(&window_for_about)
             .modal(true)
             .build();
