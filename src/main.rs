@@ -61,6 +61,7 @@ struct WindowState {
     undo_stack: RefCell<Vec<UndoOperation>>,
     active_filter: RefCell<ActiveNoteFilter>,
     note_id: RefCell<Option<String>>,
+    note_windows: RefCell<HashMap<String, ApplicationWindow>>,
     note_list: gtk::ListBox,
     note_list_focus: gtk::ScrolledWindow,
     pinned_separator_row: gtk::ListBoxRow,
@@ -97,6 +98,7 @@ fn main() -> Result<()> {
 
 fn build_window(application: &Application) -> Result<()> {
     install_pinned_separator_style();
+    install_note_detail_style();
     let store = Store::open(database_path()?).context("Lokale notities openen")?;
     let folders = store.folders()?;
     let initial_notes = store.notes(&NoteFilter::default())?;
@@ -112,6 +114,7 @@ fn build_window(application: &Application) -> Result<()> {
         .selection_mode(gtk::SelectionMode::Multiple)
         .css_classes(["navigation-sidebar"])
         .build();
+    note_list.set_activate_on_single_click(false);
     let list_scroll = gtk::ScrolledWindow::builder()
         .vexpand(true)
         .child(&note_list)
@@ -120,10 +123,13 @@ fn build_window(application: &Application) -> Result<()> {
     let search = gtk::SearchEntry::builder()
         .placeholder_text("Zoek in notities")
         .build();
+    search.set_width_chars(12);
+    search.set_hexpand(true);
     let title = gtk::Entry::builder()
         .placeholder_text("Nieuwe notities")
         .css_classes(["title-1"])
         .build();
+    title.add_css_class("note-detail-surface");
     let content = gtk::TextView::builder()
         .wrap_mode(gtk::WrapMode::WordChar)
         .top_margin(12)
@@ -131,8 +137,9 @@ fn build_window(application: &Application) -> Result<()> {
         .left_margin(12)
         .right_margin(12)
         .build();
+    content.add_css_class("note-detail-surface");
     let pin_button = icon_button("view-pin-symbolic", "Vastpinnen");
-    let archive_button = icon_button("mail-archive-symbolic", "Archiveer");
+    let archive_button = icon_button("user-trash-symbolic", "Archiveer");
     let folder_picker = gtk::DropDown::new(Some(folder_model.clone()), None::<&gtk::Expression>);
     folder_picker.set_tooltip_text(Some("Verplaats naar map"));
     let folder_button = icon_button("folder-symbolic", "Verplaats naar map");
@@ -159,6 +166,7 @@ fn build_window(application: &Application) -> Result<()> {
         undo_stack: RefCell::new(Vec::new()),
         active_filter: RefCell::new(ActiveNoteFilter::All),
         note_id: RefCell::new(initial_note.as_ref().map(|note| note.id.clone())),
+        note_windows: RefCell::new(HashMap::new()),
         note_list: note_list.clone(),
         note_list_focus: list_scroll.clone(),
         pinned_separator_row,
@@ -191,48 +199,71 @@ fn build_window(application: &Application) -> Result<()> {
     list_column.set_margin_bottom(12);
     list_column.set_margin_start(12);
     list_column.set_margin_end(12);
-    let search_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    search_row.append(&search);
-    search.set_hexpand(true);
     let new_note = icon_button("document-new-symbolic", "Nieuwe notitie");
-    search_row.append(&new_note);
-    list_column.append(&search_row);
+    list_column.append(&search);
     list_column.append(&list_scroll);
 
     let editor = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    editor.set_margin_top(24);
+    editor.add_css_class("note-detail-surface");
     editor.set_margin_bottom(24);
     editor.set_margin_start(32);
     editor.set_margin_end(32);
-    editor.append(&title);
+    let title_row = gtk::Overlay::new();
+    title.set_hexpand(true);
+    title.set_margin_end(124);
+    title_row.set_child(Some(&title));
+    let editor_actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    editor_actions.append(&pin_button);
+    editor_actions.append(&archive_button);
+    editor_actions.append(&folder_button);
+    editor_actions.set_halign(gtk::Align::End);
+    editor_actions.set_valign(gtk::Align::Center);
+    title_row.add_overlay(&editor_actions);
+    editor.append(&title_row);
     let editor_scroll = gtk::ScrolledWindow::builder()
         .vexpand(true)
         .child(&content)
         .build();
+    editor_scroll.add_css_class("note-detail-surface");
     editor.append(&editor_scroll);
 
-    let content_pane = gtk::Paned::new(gtk::Orientation::Horizontal);
-    content_pane.set_wide_handle(true);
-    content_pane.set_hexpand(true);
-    content_pane.set_start_child(Some(&list_column));
-    content_pane.set_end_child(Some(&editor));
-    content_pane.set_position(310);
+    let navigation_layout = gtk::Paned::new(gtk::Orientation::Horizontal);
+    navigation_layout.add_css_class("sidebar-layout");
+    navigation_layout.set_wide_handle(true);
+    navigation_layout.set_hexpand(true);
+    navigation_layout.set_start_child(Some(&sidebar));
+    navigation_layout.set_end_child(Some(&list_column));
+    navigation_layout.set_position(225);
+
+    let navigation_toolbar = ToolbarView::new();
+    let navigation_header = HeaderBar::new();
+    navigation_toolbar.add_top_bar(&navigation_header);
+    navigation_toolbar.set_content(Some(&navigation_layout));
+
+    let editor_toolbar = ToolbarView::new();
+    editor_toolbar.add_css_class("note-detail-surface");
+    let editor_header = HeaderBar::new();
+    editor_header.add_css_class("note-detail-surface");
+    editor_header.set_title_widget(Some(&gtk::Label::new(None)));
+    editor_header.set_show_start_title_buttons(false);
+    editor_header.set_show_end_title_buttons(false);
+    editor_toolbar.add_top_bar(&editor_header);
+    editor_toolbar.set_content(Some(&editor));
 
     let layout = gtk::Paned::new(gtk::Orientation::Horizontal);
-    layout.add_css_class("sidebar-layout");
     layout.set_wide_handle(true);
     layout.set_hexpand(true);
-    layout.set_start_child(Some(&sidebar));
-    layout.set_end_child(Some(&content_pane));
+    layout.set_start_child(Some(&navigation_toolbar));
+    layout.set_end_child(Some(&editor_toolbar));
+    layout.set_position(535);
     let sidebar_width = Rc::new(Cell::new(225));
-    layout.set_position(sidebar_width.get());
 
     let sidebar_icon = gtk::Image::from_icon_name("sidebar-show-symbolic");
     let sidebar_toggle = gtk::ToggleButton::new();
     sidebar_toggle.set_child(Some(&sidebar_icon));
     sidebar_toggle.set_active(true);
     sidebar_toggle.set_tooltip_text(Some("Zijbalk tonen of verbergen"));
-    let layout_for_toggle = layout.clone();
+    let layout_for_toggle = navigation_layout.clone();
     let animation_generation = Rc::new(Cell::new(0_u64));
     let generation_for_toggle = Rc::clone(&animation_generation);
     let sidebar_width_for_toggle = Rc::clone(&sidebar_width);
@@ -256,30 +287,77 @@ fn build_window(application: &Application) -> Result<()> {
         );
     });
 
+    navigation_header.pack_start(&sidebar_toggle);
+    navigation_header.pack_start(&add_folder);
+    let more_button = gtk::MenuButton::new();
+    more_button.set_icon_name("view-more-symbolic");
+    more_button.set_tooltip_text(Some("Meer"));
+    let titlebar_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    titlebar_actions.append(&new_note);
+    titlebar_actions.append(&more_button);
+    navigation_header.pack_end(&titlebar_actions);
+    install_app_menu(&window, &more_button);
     let toolbar = ToolbarView::new();
-    let header = HeaderBar::new();
-    header.pack_start(&sidebar_toggle);
-    header.pack_start(&add_folder);
-    header.set_title_widget(Some(&gtk::Label::new(Some("Memonotes"))));
-    header.pack_end(&pin_button);
-    header.pack_end(&archive_button);
-    header.pack_end(&folder_button);
-    toolbar.add_top_bar(&header);
     toolbar.set_content(Some(&layout));
     window.set_content(Some(&toolbar));
-    let layout_for_map = layout.clone();
+    let layout_for_map = navigation_layout.clone();
     window.connect_map(move |_| {
         layout_for_map.set_position(225);
     });
 
     connect_events(&state, &new_note);
-    install_shortcuts(application, &window, &state, &new_note, &add_folder);
+    install_shortcuts(
+        application,
+        &window,
+        &state,
+        &new_note,
+        &add_folder,
+    );
     refresh_notes(&state)?;
     if let Some(note) = initial_note {
         show_note(&state, &note);
     }
     window.present();
     Ok(())
+}
+
+fn install_app_menu(window: &ApplicationWindow, more_button: &gtk::MenuButton) {
+    let menu = adw::gio::Menu::new();
+    menu.append(Some("Instellingen"), Some("win.settings"));
+    menu.append(Some("Over Memonotes"), Some("win.about"));
+    more_button.set_menu_model(Some(&menu));
+
+    let settings_action = adw::gio::SimpleAction::new("settings", None);
+    let window_for_settings = window.clone();
+    settings_action.connect_activate(move |_, _| {
+        let dialog = gtk::MessageDialog::builder()
+            .transient_for(&window_for_settings)
+            .modal(true)
+            .message_type(gtk::MessageType::Info)
+            .buttons(gtk::ButtonsType::Close)
+            .text("Instellingen zijn nog niet beschikbaar.")
+            .build();
+        dialog.connect_response(|dialog, _| dialog.close());
+        dialog.present();
+    });
+    window.add_action(&settings_action);
+
+    let about_action = adw::gio::SimpleAction::new("about", None);
+    let window_for_about = window.clone();
+    about_action.connect_activate(move |_, _| {
+        let dialog = gtk::AboutDialog::builder()
+            .program_name("Memonotes")
+            .version(env!("CARGO_PKG_VERSION"))
+            .comments("BTC-donatieadres: [walletadres toevoegen]")
+            .license_type(gtk::License::Gpl30)
+            .website("https://github.com/your-username/memonotes")
+            .website_label("GitHub (placeholder)")
+            .transient_for(&window_for_about)
+            .modal(true)
+            .build();
+        dialog.present();
+    });
+    window.add_action(&about_action);
 }
 
 fn animate_sidebar_position(
@@ -667,6 +745,21 @@ fn install_folder_menu_style() {
     );
 }
 
+fn install_note_detail_style() {
+    let Some(display) = gtk::gdk::Display::default() else {
+        return;
+    };
+    let provider = gtk::CssProvider::new();
+    provider.load_from_data(
+        ".note-detail-surface { background-color: #fffbed; background-image: none; }",
+    );
+    gtk::style_context_add_provider_for_display(
+        &display,
+        &provider,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+}
+
 fn confirm_delete_folder(
     state: &Rc<WindowState>,
     list: &gtk::ListBox,
@@ -873,7 +966,7 @@ fn update_archive_button(button: &gtk::Button, archived: bool) {
         if archived {
             "document-revert-symbolic"
         } else {
-            "mail-archive-symbolic"
+            "user-trash-symbolic"
         },
         if archived { "Terugzetten" } else { "Archiveer" },
     );
@@ -890,7 +983,8 @@ fn install_shortcuts(
     let application_for_quit = application.clone();
     quit_action.connect_activate(move |_, _| application_for_quit.quit());
     application.add_action(&quit_action);
-    application.set_accels_for_action("app.quit", &["<Control>q", "<Control>w"]);
+    application.set_accels_for_action("app.quit", &["<Control>q"]);
+    install_close_shortcut(window);
 
     let new_note_action = adw::gio::SimpleAction::new("new-note", None);
     let new_note_for_action = new_note.clone();
@@ -932,7 +1026,39 @@ fn install_shortcuts(
     state.search.add_controller(search_keys);
 }
 
+fn install_close_shortcut(window: &ApplicationWindow) {
+    let close_action = adw::gio::SimpleAction::new("close-window", None);
+    let window_for_close = window.clone();
+    close_action.connect_activate(move |_, _| window_for_close.close());
+    window.add_action(&close_action);
+    let application = window
+        .application()
+        .expect("window is attached to an application");
+    application.set_accels_for_action("win.close-window", &["<Control>w"]);
+}
+
 fn connect_events(state: &Rc<WindowState>, new_note: &gtk::Button) {
+    let state_for_activation = Rc::clone(state);
+    state.note_list.connect_row_activated(move |_, row| {
+        let Some(application) = row
+            .root()
+            .and_downcast::<ApplicationWindow>()
+            .and_then(|window| window.application())
+        else {
+            return;
+        };
+        let note_id = row.widget_name();
+        let note = { state_for_activation.store.borrow().note(&note_id).ok().flatten() };
+        if let Some(note) = note {
+            open_note_window(&application, &state_for_activation, &note);
+            clear_note_selection(&state_for_activation);
+            let state_for_clear = Rc::clone(&state_for_activation);
+            gtk::glib::idle_add_local_once(move || {
+                clear_note_selection(&state_for_clear);
+            });
+        }
+    });
+
     let state_for_search = Rc::clone(state);
     state.search.connect_search_changed(move |_| {
         let _ = refresh_notes(&state_for_search);
@@ -941,7 +1067,7 @@ fn connect_events(state: &Rc<WindowState>, new_note: &gtk::Button) {
     let delete_keys = gtk::EventControllerKey::new();
     delete_keys.set_propagation_phase(gtk::PropagationPhase::Capture);
     let state_for_delete = Rc::clone(state);
-    delete_keys.connect_key_pressed(move |_, key, _, _| match key {
+    delete_keys.connect_key_pressed(move |_, key, _, modifiers| match key {
         gtk::gdk::Key::Delete => {
             if state_for_delete.active_filter.borrow().is_archived() {
                 delete_current_note(&state_for_delete);
@@ -952,9 +1078,38 @@ fn connect_events(state: &Rc<WindowState>, new_note: &gtk::Button) {
         }
         gtk::gdk::Key::Up => move_note_selection(&state_for_delete, -1),
         gtk::gdk::Key::Down => move_note_selection(&state_for_delete, 1),
+        gtk::gdk::Key::Tab if !modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK) => {
+            state_for_delete.title.grab_focus();
+            gtk::glib::Propagation::Stop
+        }
         _ => gtk::glib::Propagation::Proceed,
     });
     state.note_list_focus.add_controller(delete_keys);
+    connect_tab_navigation(
+        &state.title,
+        state.content.clone().upcast(),
+        state.note_list_focus.clone().upcast(),
+    );
+    connect_tab_navigation(
+        &state.content,
+        state.pin_button.clone().upcast(),
+        state.title.clone().upcast(),
+    );
+    connect_tab_navigation(
+        &state.pin_button,
+        state.archive_button.clone().upcast(),
+        state.content.clone().upcast(),
+    );
+    connect_tab_navigation(
+        &state.archive_button,
+        state.folder_button.clone().upcast(),
+        state.pin_button.clone().upcast(),
+    );
+    connect_tab_navigation(
+        &state.folder_button,
+        state.search.clone().upcast(),
+        state.archive_button.clone().upcast(),
+    );
 
     let state_for_new = Rc::clone(state);
     new_note.connect_clicked(move |_| {
@@ -1063,6 +1218,28 @@ fn connect_events(state: &Rc<WindowState>, new_note: &gtk::Button) {
             let _ = refresh_notes(&state_for_move);
         }
     });
+}
+
+fn connect_tab_navigation(
+    widget: &impl gtk::prelude::IsA<gtk::Widget>,
+    next: gtk::Widget,
+    previous: gtk::Widget,
+) {
+    let keys = gtk::EventControllerKey::new();
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    keys.connect_key_pressed(move |_, key, _, modifiers| {
+        if key != gtk::gdk::Key::Tab {
+            return gtk::glib::Propagation::Proceed;
+        }
+        let target = if modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
+            &previous
+        } else {
+            &next
+        };
+        target.grab_focus();
+        gtk::glib::Propagation::Stop
+    });
+    widget.add_controller(keys);
 }
 
 fn refresh_notes(state: &Rc<WindowState>) -> Result<()> {
@@ -1641,6 +1818,117 @@ fn show_note(state: &Rc<WindowState>, note: &Note) {
         state.folder_picker.set_selected(index as u32);
     }
     set_editor_text(state, &note.title, &note.content);
+}
+
+fn open_note_window(application: &gtk::Application, state: &Rc<WindowState>, note: &Note) {
+    if let Some(window) = state.note_windows.borrow().get(&note.id) {
+        window.present();
+        return;
+    }
+
+    let window = ApplicationWindow::builder()
+        .application(application)
+        .title(if note.title.is_empty() {
+            "Nieuwe notitie"
+        } else {
+            &note.title
+        })
+        .default_width(720)
+        .default_height(560)
+        .build();
+
+    let title = gtk::Entry::builder()
+        .text(&note.title)
+        .placeholder_text("Nieuwe notities")
+        .css_classes(["title-1", "note-detail-surface"])
+        .build();
+    let content = gtk::TextView::builder()
+        .wrap_mode(gtk::WrapMode::WordChar)
+        .top_margin(12)
+        .bottom_margin(24)
+        .left_margin(12)
+        .right_margin(12)
+        .build();
+    content.add_css_class("note-detail-surface");
+    content.buffer().set_text(&note.content);
+
+    let editor = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    editor.add_css_class("note-detail-surface");
+    editor.set_margin_top(24);
+    editor.set_margin_bottom(24);
+    editor.set_margin_start(32);
+    editor.set_margin_end(32);
+    editor.append(&title);
+    let content_scroll = gtk::ScrolledWindow::builder()
+        .vexpand(true)
+        .child(&content)
+        .build();
+    content_scroll.add_css_class("note-detail-surface");
+    editor.append(&content_scroll);
+
+    let toolbar = ToolbarView::new();
+    toolbar.add_top_bar(&HeaderBar::new());
+    toolbar.set_content(Some(&editor));
+    window.set_content(Some(&toolbar));
+    install_close_shortcut(&window);
+
+    let note_id = note.id.clone();
+    let state_for_close = Rc::downgrade(state);
+    window.connect_close_request(move |_| {
+        if let Some(state) = state_for_close.upgrade() {
+            state.note_windows.borrow_mut().remove(&note_id);
+        }
+        gtk::glib::Propagation::Proceed
+    });
+
+    let note_id = note.id.clone();
+    let state_for_title = Rc::clone(state);
+    let buffer_for_title = content.buffer();
+    title.connect_changed(move |entry| {
+        save_detached_note(
+            &state_for_title,
+            &note_id,
+            entry.text().as_str(),
+            &buffer_for_title,
+        );
+    });
+
+    let note_id = note.id.clone();
+    let state_for_content = Rc::clone(state);
+    let title_for_content = title.clone();
+    content.buffer().connect_changed(move |buffer| {
+        save_detached_note(
+            &state_for_content,
+            &note_id,
+            title_for_content.text().as_str(),
+            buffer,
+        );
+    });
+
+    state
+        .note_windows
+        .borrow_mut()
+        .insert(note.id.clone(), window.clone());
+    window.present();
+    title.grab_focus();
+}
+
+fn save_detached_note(
+    state: &Rc<WindowState>,
+    note_id: &str,
+    title: &str,
+    buffer: &gtk::TextBuffer,
+) {
+    let (start, end) = buffer.bounds();
+    let content = buffer.text(&start, &end, true);
+    if state
+        .store
+        .borrow()
+        .save_note(note_id, content.as_str(), title)
+        .is_ok()
+    {
+        let _ = refresh_notes(state);
+    }
 }
 
 fn save_current(state: &Rc<WindowState>, title: &str, content: Option<&str>) {
