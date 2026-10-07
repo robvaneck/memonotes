@@ -3,12 +3,52 @@ use adw::prelude::*;
 use adw::{Application, ApplicationWindow, HeaderBar, ToolbarView};
 use anyhow::{Context, Result};
 use libadwaita as adw;
-use memonotes::{Note, NoteFilter, Store};
+use memonotes::{BackendAccount, Note, NoteFilter, Store};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
+use uuid::Uuid;
+
+const NOTE_COLOR_PALETTE: [(&str, &str, &str, &str); 32] = [
+    ("default", "Standaard", "#ffffff", "#242424"),
+    ("gray", "Grijs", "#f1f1f0", "#2a2a2a"),
+    ("mauve", "Mauve", "#f0eff1", "#2e2b31"),
+    ("slate", "Leisteen", "#eff0f3", "#292d32"),
+    ("sage", "Salie", "#eff1f0", "#292d2b"),
+    ("olive", "Olijf", "#f1f1ed", "#2d2e26"),
+    ("sand", "Zand", "#f1f0ed", "#2e2d2b"),
+    ("tomato", "Tomaat", "#feebe7", "#3b1813"),
+    ("red", "Rood", "#feebec", "#3b1219"),
+    ("ruby", "Robijn", "#ffeaef", "#3a141e"),
+    ("crimson", "Karmijn", "#ffe9f0", "#381525"),
+    ("pink", "Roze", "#fee9f5", "#3b152f"),
+    ("plum", "Pruim", "#fce9f8", "#351a36"),
+    ("purple", "Paars", "#f2eafe", "#301c3b"),
+    ("violet", "Violet", "#f4f0fe", "#2a1c40"),
+    ("iris", "Iris", "#efedfe", "#24203f"),
+    ("indigo", "Indigo", "#e8f0fe", "#1c2340"),
+    ("blue", "Blauw", "#e6f4fe", "#172b46"),
+    ("cyan", "Cyaan", "#e1f8fa", "#12343b"),
+    ("teal", "Turkoois", "#e1f8f4", "#12372f"),
+    ("jade", "Jade", "#e6f7ed", "#123a31"),
+    ("green", "Groen", "#e6f6eb", "#17392c"),
+    ("grass", "Gras", "#e9f6e9", "#25391d"),
+    ("bronze", "Brons", "#f5f0e7", "#352c25"),
+    ("gold", "Goud", "#f9f1dd", "#382f1e"),
+    ("brown", "Bruin", "#f6eee7", "#38291f"),
+    ("orange", "Oranje", "#feefe7", "#3c271b"),
+    ("amber", "Amber", "#fff1c6", "#3c3015"),
+    ("yellow", "Geel", "#fff7c2", "#3a3214"),
+    ("lime", "Limoen", "#f2f9c7", "#303716"),
+    ("mint", "Munt", "#e1f9f2", "#15382e"),
+    ("sky", "Hemelblauw", "#e1f6fd", "#183747"),
+];
+
+const LEGACY_NOTE_COLORS: [&str; 4] = ["rose", "peach", "lemon", "lilac"];
 
 #[derive(Clone, PartialEq, Eq)]
 enum ActiveNoteFilter {
@@ -58,6 +98,7 @@ impl ActiveNoteFilter {
 
 struct WindowState {
     store: RefCell<Store>,
+    note_color: RefCell<String>,
     undo_stack: RefCell<Vec<UndoOperation>>,
     active_filter: RefCell<ActiveNoteFilter>,
     note_id: RefCell<Option<String>>,
@@ -76,14 +117,46 @@ struct WindowState {
     folder_options: RefCell<Vec<Option<String>>>,
     folder_count_labels: RefCell<Vec<(String, gtk::Label)>>,
     note_rows: RefCell<HashMap<String, gtk::ListBoxRow>>,
+    note_surfaces: RefCell<Vec<gtk::Widget>>,
     selection_anchor: RefCell<Option<String>>,
     suppress_folder_picker_events: Cell<bool>,
     suppress_editor_events: Cell<bool>,
 }
 
+#[derive(Clone)]
+struct AccountRows {
+    group: adw::glib::WeakRef<adw::PreferencesGroup>,
+    parent: adw::glib::WeakRef<ApplicationWindow>,
+    rows: Rc<RefCell<Vec<adw::glib::WeakRef<gtk::Widget>>>>,
+    add_row: adw::ButtonRow,
+    add_row_attached: Rc<Cell<bool>>,
+}
+
+impl AccountRows {
+    fn new(
+        group: &adw::PreferencesGroup,
+        parent: &ApplicationWindow,
+        add_row: &adw::ButtonRow,
+    ) -> Self {
+        Self {
+            group: group.downgrade(),
+            parent: parent.downgrade(),
+            rows: Rc::new(RefCell::new(Vec::new())),
+            add_row: add_row.clone(),
+            add_row_attached: Rc::new(Cell::new(false)),
+        }
+    }
+}
+
 fn main() -> Result<()> {
+    let flags = if std::env::var_os("MEMONOTES_DEV").is_some() {
+        adw::gio::ApplicationFlags::NON_UNIQUE
+    } else {
+        adw::gio::ApplicationFlags::FLAGS_NONE
+    };
     let application = Application::builder()
         .application_id("app.memonotes.Desktop")
+        .flags(flags)
         .build();
 
     application.connect_activate(|application| {
@@ -99,10 +172,12 @@ fn main() -> Result<()> {
 fn build_window(application: &Application) -> Result<()> {
     install_pinned_separator_style();
     install_note_detail_style();
+    install_account_error_style();
     let store = Store::open(database_path()?).context("Lokale notities openen")?;
     let folders = store.folders()?;
     let initial_notes = store.notes(&NoteFilter::default())?;
     let initial_note = initial_notes.first().cloned();
+    let note_color = store.note_color()?;
     let folder_model = gtk::StringList::new(&["Zonder map"]);
     let mut folder_options = vec![None];
     for folder in &folders {
@@ -163,6 +238,7 @@ fn build_window(application: &Application) -> Result<()> {
 
     let state = Rc::new(WindowState {
         store: RefCell::new(store),
+        note_color: RefCell::new(note_color),
         undo_stack: RefCell::new(Vec::new()),
         active_filter: RefCell::new(ActiveNoteFilter::All),
         note_id: RefCell::new(initial_note.as_ref().map(|note| note.id.clone())),
@@ -181,6 +257,7 @@ fn build_window(application: &Application) -> Result<()> {
         folder_options: RefCell::new(folder_options),
         folder_count_labels: RefCell::new(Vec::new()),
         note_rows: RefCell::new(HashMap::new()),
+        note_surfaces: RefCell::new(Vec::new()),
         selection_anchor: RefCell::new(initial_note.as_ref().map(|note| note.id.clone())),
         suppress_folder_picker_events: Cell::new(false),
         suppress_editor_events: Cell::new(false),
@@ -229,7 +306,7 @@ fn build_window(application: &Application) -> Result<()> {
 
     let navigation_layout = gtk::Paned::new(gtk::Orientation::Horizontal);
     navigation_layout.add_css_class("sidebar-layout");
-    navigation_layout.set_wide_handle(true);
+    navigation_layout.set_wide_handle(false);
     navigation_layout.set_hexpand(true);
     navigation_layout.set_start_child(Some(&sidebar));
     navigation_layout.set_end_child(Some(&list_column));
@@ -242,16 +319,20 @@ fn build_window(application: &Application) -> Result<()> {
 
     let editor_toolbar = ToolbarView::new();
     editor_toolbar.add_css_class("note-detail-surface");
+    editor_toolbar.add_css_class("note-detail-pane");
     let editor_header = HeaderBar::new();
     editor_header.add_css_class("note-detail-surface");
+    editor_header.add_css_class("note-detail-pane");
     editor_header.set_title_widget(Some(&gtk::Label::new(None)));
     editor_header.set_show_start_title_buttons(false);
     editor_header.set_show_end_title_buttons(false);
     editor_toolbar.add_top_bar(&editor_header);
     editor_toolbar.set_content(Some(&editor));
+    let note_surfaces = collect_note_surfaces(&editor_toolbar.clone().upcast());
+    *state.note_surfaces.borrow_mut() = note_surfaces.clone();
 
     let layout = gtk::Paned::new(gtk::Orientation::Horizontal);
-    layout.set_wide_handle(true);
+    layout.set_wide_handle(false);
     layout.set_hexpand(true);
     layout.set_start_child(Some(&navigation_toolbar));
     layout.set_end_child(Some(&editor_toolbar));
@@ -296,7 +377,7 @@ fn build_window(application: &Application) -> Result<()> {
     titlebar_actions.append(&new_note);
     titlebar_actions.append(&more_button);
     navigation_header.pack_end(&titlebar_actions);
-    install_app_menu(&window, &more_button);
+    install_app_menu(&window, &more_button, &state);
     let toolbar = ToolbarView::new();
     toolbar.set_content(Some(&layout));
     window.set_content(Some(&toolbar));
@@ -321,7 +402,11 @@ fn build_window(application: &Application) -> Result<()> {
     Ok(())
 }
 
-fn install_app_menu(window: &ApplicationWindow, more_button: &gtk::MenuButton) {
+fn install_app_menu(
+    window: &ApplicationWindow,
+    more_button: &gtk::MenuButton,
+    state: &Rc<WindowState>,
+) {
     let menu = adw::gio::Menu::new();
     menu.append(Some("Instellingen"), Some("win.settings"));
     menu.append(Some("Over Memonotes"), Some("win.about"));
@@ -329,35 +414,688 @@ fn install_app_menu(window: &ApplicationWindow, more_button: &gtk::MenuButton) {
 
     let settings_action = adw::gio::SimpleAction::new("settings", None);
     let window_for_settings = window.clone();
+    let state_for_settings = Rc::clone(state);
     settings_action.connect_activate(move |_, _| {
-        let dialog = gtk::MessageDialog::builder()
-            .transient_for(&window_for_settings)
-            .modal(true)
-            .message_type(gtk::MessageType::Info)
-            .buttons(gtk::ButtonsType::Close)
-            .text("Instellingen zijn nog niet beschikbaar.")
+        let settings_dialog = adw::PreferencesDialog::builder()
+            .title("Instellingen")
+            .content_width(940)
+            .content_height(680)
             .build();
-        dialog.connect_response(|dialog, _| dialog.close());
-        dialog.present();
+
+        let palette = gtk::Grid::builder()
+            .column_spacing(6)
+            .row_spacing(6)
+            .build();
+        palette.set_column_homogeneous(true);
+        palette.set_row_homogeneous(true);
+        let current_color = state_for_settings.note_color.borrow().clone();
+        let mut first_option: Option<gtk::ToggleButton> = None;
+        for (index, &(color, label, _, _)) in NOTE_COLOR_PALETTE.iter().enumerate() {
+            let button = gtk::ToggleButton::new();
+            button.set_size_request(68, 64);
+            button.set_hexpand(true);
+            button.set_vexpand(true);
+            button.add_css_class("note-color-option");
+            button.set_tooltip_text(Some(label));
+            if let Some(first_option) = &first_option {
+                button.set_group(Some(first_option));
+            } else {
+                first_option = Some(button.clone());
+            }
+            button.set_active(canonical_note_color(color) == canonical_note_color(&current_color));
+
+            let option_content = gtk::Box::new(gtk::Orientation::Vertical, 5);
+            option_content.set_halign(gtk::Align::Center);
+            let swatch = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            swatch.set_size_request(30, 30);
+            swatch.set_halign(gtk::Align::Center);
+            swatch.set_valign(gtk::Align::Center);
+            swatch.add_css_class("note-color-swatch");
+            swatch.add_css_class(&format!("swatch-{color}"));
+            option_content.append(&swatch);
+            let color_label = gtk::Label::new(Some(label));
+            color_label.set_width_chars(9);
+            color_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            option_content.append(&color_label);
+            button.set_child(Some(&option_content));
+
+            let state_for_color = Rc::clone(&state_for_settings);
+            button.connect_toggled(move |button| {
+                if button.is_active() {
+                    set_note_color(&state_for_color, color);
+                }
+            });
+            palette.attach(&button, (index % 6) as i32, (index / 6) as i32, 1, 1);
+        }
+
+        let accounts_page = build_accounts_page(&window_for_settings, &state_for_settings);
+        settings_dialog.add(&accounts_page);
+
+        let appearance_page = adw::PreferencesPage::builder()
+            .title("Weergave")
+            .icon_name("applications-graphics-symbolic")
+            .build();
+        let appearance_group = adw::PreferencesGroup::builder()
+            .title("Notitiekleur")
+            .build();
+        appearance_group.add(&palette);
+        appearance_page.add(&appearance_group);
+        settings_dialog.add(&appearance_page);
+        settings_dialog.present(Some(&window_for_settings));
     });
     window.add_action(&settings_action);
 
     let about_action = adw::gio::SimpleAction::new("about", None);
     let window_for_about = window.clone();
     about_action.connect_activate(move |_, _| {
-        let dialog = gtk::AboutDialog::builder()
-            .program_name("Memonotes")
+        let dialog = adw::AboutDialog::builder()
+            .application_name("Memonotes")
+            .developer_name("Rob van Eck")
             .version(env!("CARGO_PKG_VERSION"))
-            .comments("BTC-donatieadres: [walletadres toevoegen]")
+            .support_url("https://github.com/sponsors/robvaneck")
+            .issue_url("https://github.com/robvaneck/memonotes")
             .license_type(gtk::License::Gpl30)
-            .website("https://github.com/robvaneck/memonotes")
-            .website_label("GitHub")
-            .transient_for(&window_for_about)
-            .modal(true)
             .build();
-        dialog.present();
+        dialog.add_credit_section(
+            Some("Credits"),
+            &[
+                "Coded by Rob van Eck",
+                "Bitcoin wallet: bc1sfsdfsdfsdfsdfsdfx4",
+            ],
+        );
+        dialog.add_legal_section(
+            "Legal",
+            None,
+            gtk::License::Gpl30,
+            Some(include_str!("../LICENSE")),
+        );
+        dialog.present(Some(&window_for_about));
     });
     window.add_action(&about_action);
+}
+
+fn build_accounts_page(
+    parent: &ApplicationWindow,
+    state: &Rc<WindowState>,
+) -> adw::PreferencesPage {
+    let page = adw::PreferencesPage::builder()
+        .title("Accounts")
+        .icon_name("network-server-symbolic")
+        .build();
+    let add_row = adw::ButtonRow::builder()
+        .title("Account toevoegen")
+        .start_icon_name("list-add-symbolic")
+        .build();
+    let accounts_group = adw::PreferencesGroup::builder()
+        .title("Accounts")
+        .build();
+    let account_rows = AccountRows::new(&accounts_group, parent, &add_row);
+    let status = gtk::Label::new(None);
+    status.set_xalign(0.0);
+    status.set_wrap(true);
+    status.add_css_class("dim-label");
+    status.set_visible(false);
+
+    accounts_group.add(&status);
+    refresh_backend_accounts(&account_rows, state, &status);
+    page.add(&accounts_group);
+
+    let parent_for_add_row = parent.clone();
+    let state_for_add_row = Rc::clone(state);
+    let rows_for_add_row = account_rows.clone();
+    let status_for_add_row = status.clone();
+    add_row.connect_activated(move |_| {
+        open_account_editor(
+            &parent_for_add_row,
+            &state_for_add_row,
+            &rows_for_add_row,
+            &status_for_add_row,
+            None,
+        );
+    });
+
+    let security_group = adw::PreferencesGroup::builder()
+        .title("Beveiliging")
+        .build();
+    let security_info = gtk::Label::new(Some(
+        "Toegangstokens worden bewaard in GNOME Keyring, niet in de notitiedatabase.",
+    ));
+    security_info.set_xalign(0.0);
+    security_info.set_wrap(true);
+    security_info.add_css_class("dim-label");
+    security_group.add(&security_info);
+    page.add(&security_group);
+    page
+}
+
+fn refresh_backend_accounts(rows: &AccountRows, state: &Rc<WindowState>, status: &gtk::Label) {
+    let Some(group) = rows.group.upgrade() else {
+        return;
+    };
+    if rows.add_row_attached.replace(false) {
+        group.remove(&rows.add_row);
+    }
+    for row in rows.rows.borrow_mut().drain(..).filter_map(|row| row.upgrade()) {
+        group.remove(&row);
+    }
+    match state.store.borrow().backend_accounts() {
+        Ok(accounts) if accounts.is_empty() => {
+            status.set_text("");
+            status.set_visible(false);
+        }
+        Ok(accounts) => {
+            status.set_text("");
+            status.set_visible(false);
+            for account in accounts {
+                append_backend_account(rows, state, status, account);
+            }
+        }
+        Err(error) => {
+            status.set_text(&format!("Accounts laden mislukt: {error:#}"));
+            status.set_visible(true);
+        }
+    }
+    group.add(&rows.add_row);
+    rows.add_row_attached.set(true);
+}
+
+fn append_backend_account(
+    rows: &AccountRows,
+    state: &Rc<WindowState>,
+    status: &gtk::Label,
+    account: BackendAccount,
+) {
+    let provider_name = match account.provider.as_str() {
+        "memos" => "Memos",
+        "imap" => "IMAP",
+        "joplin" => "Joplin",
+        _ => "Backend",
+    };
+    let row = adw::SwitchRow::builder()
+        .title(format!("{} · {}", provider_name, account.label))
+        .subtitle(&account.server_url)
+        .subtitle_lines(1)
+        .active(account.enabled)
+        .build();
+
+    let state_for_toggle = Rc::clone(state);
+    let account_id_for_toggle = account.id.clone();
+    let status_for_toggle = status.clone();
+    let restoring = Rc::new(Cell::new(false));
+    let restoring_for_toggle = Rc::clone(&restoring);
+    row.connect_active_notify(move |row| {
+        if restoring_for_toggle.get() {
+            return;
+        }
+        let enabled = row.is_active();
+        if let Err(error) = state_for_toggle
+            .store
+            .borrow()
+            .set_backend_account_enabled(&account_id_for_toggle, enabled)
+        {
+            status_for_toggle.set_text(&format!("Accountstatus wijzigen mislukt: {error:#}"));
+            status_for_toggle.set_visible(true);
+            restoring_for_toggle.set(true);
+            row.set_active(!enabled);
+            restoring_for_toggle.set(false);
+        } else {
+            status_for_toggle.set_visible(false);
+        }
+    });
+
+    let details_button = gtk::Button::builder()
+        .icon_name("document-edit-symbolic")
+        .tooltip_text("Accountdetails bewerken")
+        .valign(gtk::Align::Center)
+        .build();
+    details_button.add_css_class("flat");
+    let state_for_details = Rc::clone(state);
+    let rows_for_details = rows.clone();
+    let status_for_details = status.clone();
+    let account_for_details = account.clone();
+    details_button.connect_clicked(move |_| {
+        if let Some(parent) = rows_for_details.parent.upgrade() {
+            open_account_editor(
+                &parent,
+                &state_for_details,
+                &rows_for_details,
+                &status_for_details,
+                Some(account_for_details.clone()),
+            );
+        }
+    });
+
+    let remove_button = gtk::Button::builder()
+        .icon_name("user-trash-symbolic")
+        .tooltip_text("Account verwijderen")
+        .valign(gtk::Align::Center)
+        .build();
+    remove_button.add_css_class("flat");
+    let state_for_remove = Rc::clone(state);
+    let rows_for_remove = rows.clone();
+    let status_for_remove = status.clone();
+    remove_button.connect_clicked(move |button| {
+        let Some(parent) = button
+            .root()
+            .and_then(|root| root.downcast::<gtk::Window>().ok())
+        else {
+            return;
+        };
+        let alert = adw::AlertDialog::builder()
+            .heading("Account verwijderen?")
+            .body(format!(
+                "{} en de opgeslagen PAT uit GNOME Keyring verwijderen? Notities op de server blijven staan.",
+                account.label
+            ))
+            .build();
+        alert.add_responses(&[("cancel", "Annuleren"), ("delete", "Verwijderen")]);
+        alert.set_default_response(Some("cancel"));
+        alert.set_close_response("cancel");
+        alert.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+
+        let state = Rc::clone(&state_for_remove);
+        let rows = rows_for_remove.clone();
+        let status = status_for_remove.clone();
+        let account_for_confirmation = account.clone();
+        alert.choose(Some(&parent), None::<&adw::gio::Cancellable>, move |response| {
+            if response == "delete" {
+                remove_backend_account(&state, &rows, &status, account_for_confirmation);
+            }
+        });
+    });
+
+    row.add_suffix(&details_button);
+    row.add_suffix(&remove_button);
+    if let Some(group) = rows.group.upgrade() {
+        group.add(&row);
+        let widget: gtk::Widget = row.clone().upcast();
+        rows.rows.borrow_mut().push(widget.downgrade());
+    }
+}
+
+fn open_account_editor(
+    parent: &ApplicationWindow,
+    state: &Rc<WindowState>,
+    rows: &AccountRows,
+    list_status: &gtk::Label,
+    account: Option<BackendAccount>,
+) {
+    let creating = account.is_none();
+    let heading = if creating { "Account toevoegen" } else { "Accountdetails" };
+    let subtitle = account.as_ref().map_or("Verbind jouw server", |account| {
+        account.server_url.as_str()
+    });
+    let dialog = gtk::Dialog::builder()
+        .title(heading)
+        .transient_for(parent)
+        .modal(true)
+        .default_width(620)
+        .default_height(520)
+        .build();
+    dialog.add_css_class("account-editor");
+    let window_title = adw::WindowTitle::new(heading, subtitle);
+    let titlebar = adw::HeaderBar::builder()
+        .title_widget(&window_title)
+        .show_start_title_buttons(false)
+        .show_end_title_buttons(true)
+        .build();
+    dialog.set_titlebar(Some(&titlebar));
+    dialog.add_button(
+        if creating { "Annuleren" } else { "Sluiten" },
+        gtk::ResponseType::Cancel,
+    );
+    dialog.add_button(
+        if creating { "Verbinden en toevoegen" } else { "Bewerken" },
+        gtk::ResponseType::Accept,
+    );
+    dialog.set_default_response(gtk::ResponseType::Accept);
+
+    let account_state = Rc::new(RefCell::new(account.clone()));
+    let editing = Rc::new(Cell::new(creating));
+    let providers = gtk::StringList::new(&["Memos", "IMAP", "Joplin"]);
+    let provider_index = account.as_ref().map_or(0, |account| match account.provider.as_str() {
+        "imap" => 1,
+        "joplin" => 2,
+        _ => 0,
+    });
+    let provider_row = adw::ComboRow::builder()
+        .title("Account type")
+        .model(&providers)
+        .selected(provider_index)
+        .sensitive(creating)
+        .build();
+    let account_name_row = adw::EntryRow::builder()
+        .title("Accountnaam")
+        .text(account.as_ref().map_or("", |account| account.label.as_str()))
+        .build();
+    let server_row = adw::EntryRow::builder()
+        .title("Serveradres")
+        .text(account.as_ref().map_or("", |account| account.server_url.as_str()))
+        .build();
+    let token_row = adw::PasswordEntryRow::builder()
+        .title(if creating { "Personal Access Token" } else { "Vervang PAT (optioneel)" })
+        .build();
+    let token_info = adw::ActionRow::builder()
+        .title("Toegangstoken")
+        .subtitle("Veilig opgeslagen in GNOME Keyring")
+        .build();
+    token_info.set_visible(!creating);
+    token_row.set_visible(creating);
+    let advanced_row = adw::ExpanderRow::builder()
+        .title("Geavanceerde verbinding")
+        .expanded(false)
+        .build();
+    let allow_http_row = adw::SwitchRow::builder()
+        .title("Onversleuteld HTTP toestaan")
+        .subtitle("Alleen voor een vertrouwd lokaal netwerk.")
+        .active(account.as_ref().is_some_and(|account| account.server_url.starts_with("http://")))
+        .build();
+    advanced_row.add_row(&allow_http_row);
+    let error_banner = adw::Banner::builder().revealed(false).build();
+    error_banner.add_css_class("account-error-banner");
+
+    let form_group = adw::PreferencesGroup::builder().title("Verbinding").build();
+    form_group.set_margin_top(24);
+    form_group.set_margin_bottom(24);
+    form_group.set_margin_start(24);
+    form_group.set_margin_end(24);
+    form_group.add(&provider_row);
+    form_group.add(&account_name_row);
+    form_group.add(&server_row);
+    form_group.add(&token_info);
+    form_group.add(&token_row);
+    form_group.add(&advanced_row);
+    dialog.content_area().append(&error_banner);
+    dialog.content_area().append(&form_group);
+
+    set_account_editor_editable(
+        &dialog,
+        &account_state.borrow(),
+        editing.get(),
+        &provider_row,
+        &account_name_row,
+        &server_row,
+        &token_row,
+        &token_info,
+        &allow_http_row,
+    );
+
+    let state = Rc::clone(state);
+    let rows = rows.clone();
+    let list_status = list_status.clone();
+    let state_for_dialog = Rc::clone(&account_state);
+    let editing_for_dialog = Rc::clone(&editing);
+    let title_for_dialog = window_title.clone();
+    dialog.connect_response(move |dialog, response| {
+        if response != gtk::ResponseType::Accept {
+            dialog.close();
+            return;
+        }
+
+        if state_for_dialog.borrow().is_some() && !editing_for_dialog.get() {
+            editing_for_dialog.set(true);
+            set_account_editor_editable(
+                dialog,
+                &state_for_dialog.borrow(),
+                true,
+                &provider_row,
+                &account_name_row,
+                &server_row,
+                &token_row,
+                &token_info,
+                &allow_http_row,
+            );
+            set_dialog_response_label(dialog, "Opslaan");
+            dialog.set_title(Some("Account bewerken"));
+            title_for_dialog.set_title("Account bewerken");
+            if let Some(account) = state_for_dialog.borrow().as_ref() {
+                title_for_dialog.set_subtitle(&account.server_url);
+            }
+            return;
+        }
+
+        if provider_row.selected() != 0 {
+            error_banner.set_title("Deze backend is nog niet beschikbaar.");
+            error_banner.set_revealed(true);
+            return;
+        }
+        let label = account_name_row.text().trim().to_owned();
+        let server_url = server_row.text().trim().to_owned();
+        let new_token = token_row.text().to_string();
+        if label.is_empty() || server_url.is_empty() || (state_for_dialog.borrow().is_none() && new_token.trim().is_empty()) {
+            error_banner.set_title("Vul accountnaam, serveradres en PAT in.");
+            error_banner.set_revealed(true);
+            return;
+        }
+
+        let current_account = state_for_dialog.borrow().clone();
+        let account_id = current_account.as_ref().map_or_else(|| Uuid::new_v4().to_string(), |account| account.id.clone());
+        let enabled = current_account.as_ref().is_none_or(|account| account.enabled);
+        let allow_http = allow_http_row.is_active();
+        error_banner.set_revealed(false);
+        if let Some(button) = dialog.widget_for_response(gtk::ResponseType::Accept) {
+            button.set_sensitive(false);
+        }
+        if let Some(button) = dialog.widget_for_response(gtk::ResponseType::Cancel) {
+            button.set_sensitive(false);
+        }
+
+        let account_id_for_worker = account_id.clone();
+        let server_for_worker = server_url.clone();
+        let new_token_for_worker = new_token.clone();
+        let existing_for_worker = current_account.clone();
+        let label_for_worker = label.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = (|| -> Result<Option<Option<String>>> {
+                let previous_token = if existing_for_worker.is_some() && !new_token_for_worker.is_empty() {
+                    Some(memonotes::credentials::lookup_token(&account_id_for_worker)?)
+                } else {
+                    None
+                };
+                let effective_token = if !new_token_for_worker.is_empty() {
+                    Some(new_token_for_worker.clone())
+                } else if enabled {
+                    memonotes::credentials::lookup_token(&account_id_for_worker)?
+                } else {
+                    None
+                };
+                let client = memonotes::memos::MemosClient::new(
+                    &server_for_worker,
+                    effective_token.as_deref().unwrap_or("offline-account-without-token"),
+                )?;
+                if client.uses_plain_http() && !allow_http {
+                    anyhow::bail!("HTTP is onversleuteld; bevestig dit expliciet in Geavanceerde verbinding");
+                }
+                if enabled {
+                    let token = effective_token
+                        .as_deref()
+                        .context("Er is geen PAT in GNOME Keyring; vul een nieuwe PAT in")?;
+                    memonotes::memos::MemosClient::new(&server_for_worker, token)?.check_connection()?;
+                }
+                if !new_token_for_worker.is_empty() {
+                    memonotes::credentials::store_token(
+                        &account_id_for_worker,
+                        &label_for_worker,
+                        &new_token_for_worker,
+                    )?;
+                }
+                Ok(previous_token)
+            })();
+            let _ = sender.send(result);
+        });
+
+        let state_for_save = Rc::clone(&state);
+        let rows_for_save = rows.clone();
+        let list_status_for_save = list_status.clone();
+        let dialog_for_save = dialog.clone();
+        let error_banner_for_save = error_banner.clone();
+        let account_id_for_save = account_id.clone();
+        gtk::glib::timeout_add_local(Duration::from_millis(50), move || {
+            match receiver.try_recv() {
+                Ok(worker_result) => {
+                    if !dialog_for_save.is_visible() {
+                        if let Ok(previous_token) = worker_result {
+                            rollback_account_token(
+                                &account_id_for_save,
+                                current_account.is_none(),
+                                previous_token,
+                                &label,
+                            );
+                        }
+                        return gtk::glib::ControlFlow::Break;
+                    }
+                    match worker_result {
+                        Ok(previous_token) => {
+                            let save_result = if current_account.is_some() {
+                                state_for_save.store.borrow().update_backend_account(
+                                    &account_id_for_save,
+                                    &label,
+                                    &server_url,
+                                )
+                            } else {
+                                state_for_save.store.borrow().add_backend_account_with_state(
+                                    &account_id_for_save,
+                                    &label,
+                                    "memos",
+                                    &server_url,
+                                    true,
+                                )
+                            };
+                            match save_result {
+                                Ok(()) => {
+                                    refresh_backend_accounts(&rows_for_save, &state_for_save, &list_status_for_save);
+                                    dialog_for_save.close();
+                                }
+                                Err(error) => {
+                                    rollback_account_token(
+                                        &account_id_for_save,
+                                        current_account.is_none(),
+                                        previous_token,
+                                        &label,
+                                    );
+                                    error_banner_for_save.set_title(&format!("Account opslaan mislukt: {error:#}"));
+                                    error_banner_for_save.set_revealed(true);
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            error_banner_for_save.set_title(&format!("Accountverbinding mislukt: {error:#}"));
+                            error_banner_for_save.set_revealed(true);
+                        }
+                    }
+                    if let Some(button) = dialog_for_save.widget_for_response(gtk::ResponseType::Accept) {
+                        button.set_sensitive(true);
+                    }
+                    if let Some(button) = dialog_for_save.widget_for_response(gtk::ResponseType::Cancel) {
+                        button.set_sensitive(true);
+                    }
+                    gtk::glib::ControlFlow::Break
+                }
+                Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    error_banner_for_save.set_title("Account opslaan is onverwacht gestopt.");
+                    error_banner_for_save.set_revealed(true);
+                    gtk::glib::ControlFlow::Break
+                }
+            }
+        });
+    });
+    dialog.present();
+}
+
+fn set_account_editor_editable(
+    dialog: &gtk::Dialog,
+    account: &Option<BackendAccount>,
+    editable: bool,
+    provider_row: &adw::ComboRow,
+    account_name_row: &adw::EntryRow,
+    server_row: &adw::EntryRow,
+    token_row: &adw::PasswordEntryRow,
+    token_info: &adw::ActionRow,
+    allow_http_row: &adw::SwitchRow,
+) {
+    provider_row.set_sensitive(editable && account.is_none());
+    account_name_row.set_editable(editable);
+    server_row.set_editable(editable);
+    token_row.set_editable(editable);
+    token_row.set_visible(editable);
+    token_info.set_visible(account.is_some() && !editable);
+    allow_http_row.set_sensitive(editable);
+    if let Some(button) = dialog.widget_for_response(gtk::ResponseType::Accept) {
+        button.set_sensitive(true);
+    }
+}
+
+fn set_dialog_response_label(dialog: &gtk::Dialog, label: &str) {
+    if let Some(button) = dialog
+        .widget_for_response(gtk::ResponseType::Accept)
+        .and_then(|widget| widget.downcast::<gtk::Button>().ok())
+    {
+        button.set_label(label);
+    }
+}
+
+fn rollback_account_token(
+    account_id: &str,
+    is_new: bool,
+    previous_token: Option<Option<String>>,
+    label: &str,
+) {
+    let account_id = account_id.to_owned();
+    let label = label.to_owned();
+    thread::spawn(move || {
+        if is_new {
+            let _ = memonotes::credentials::delete_token(&account_id);
+        } else if let Some(previous_token) = previous_token {
+            if let Some(previous_token) = previous_token {
+                let _ = memonotes::credentials::store_token(&account_id, &label, &previous_token);
+            } else {
+                let _ = memonotes::credentials::delete_token(&account_id);
+            }
+        }
+    });
+}
+
+fn remove_backend_account(
+    state: &Rc<WindowState>,
+    rows: &AccountRows,
+    status: &gtk::Label,
+    account: BackendAccount,
+) {
+    status.set_text("Account en sleutel uit de keyring verwijderen…");
+    let (sender, receiver) = mpsc::channel();
+    let account_id = account.id.clone();
+    thread::spawn(move || {
+        let _ = sender.send(memonotes::credentials::delete_token(&account_id));
+    });
+
+    let state = Rc::clone(state);
+    let rows = rows.clone();
+    let status = status.clone();
+    gtk::glib::timeout_add_local(Duration::from_millis(50), move || {
+        match receiver.try_recv() {
+            Ok(Ok(())) => match state.store.borrow().remove_backend_account(&account.id) {
+                Ok(()) => {
+                    refresh_backend_accounts(&rows, &state, &status);
+                    gtk::glib::ControlFlow::Break
+                }
+                Err(error) => {
+                    status.set_text(&format!("Account verwijderen mislukt: {error:#}"));
+                    gtk::glib::ControlFlow::Break
+                }
+            },
+            Ok(Err(error)) => {
+                status.set_text(&format!("Key uit de GNOME-keyring verwijderen mislukt: {error:#}"));
+                gtk::glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                status.set_text("Account verwijderen is onverwacht gestopt.");
+                gtk::glib::ControlFlow::Break
+            }
+        }
+    });
 }
 
 fn animate_sidebar_position(
@@ -745,19 +1483,145 @@ fn install_folder_menu_style() {
     );
 }
 
-fn install_note_detail_style() {
+fn install_account_error_style() {
     let Some(display) = gtk::gdk::Display::default() else {
         return;
     };
     let provider = gtk::CssProvider::new();
     provider.load_from_data(
-        ".note-detail-surface { background-color: #fffbed; background-image: none; }",
+        "window.account-editor .dialog-action-box { \
+             margin: 0; \
+             padding: 0 24px 24px; \
+         } \
+         window.account-editor .dialog-action-area { \
+             margin: 0; \
+             padding: 0; \
+         } \
+         banner.account-error-banner, \
+         banner.account-error-banner > revealer, \
+         banner.account-error-banner > revealer > widget { \
+             background-color: #f6cdd2; \
+             background-image: none; \
+             border-radius: 8px; \
+         } \
+         banner.account-error-banner > revealer > widget > label { \
+             color: #8f1d32; \
+             font-weight: 600; \
+         }",
     );
+    gtk::style_context_add_provider_for_display(
+        &display,
+        &provider,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+    );
+}
+
+fn install_note_detail_style() {
+    let Some(display) = gtk::gdk::Display::default() else {
+        return;
+    };
+    let provider = gtk::CssProvider::new();
+    let style_manager = adw::StyleManager::default();
+    provider.load_from_data(&note_detail_css(style_manager.is_dark()));
     gtk::style_context_add_provider_for_display(
         &display,
         &provider,
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
+    let provider_for_theme = provider.clone();
+    style_manager.connect_dark_notify(move |style_manager| {
+        provider_for_theme.load_from_data(&note_detail_css(style_manager.is_dark()));
+    });
+}
+
+fn note_detail_css(dark: bool) -> String {
+    let default = note_color_value("default", dark);
+    let mut css = format!(
+        ".note-detail-surface {{ background-color: {default}; background-image: none; }} \
+         .note-detail-pane {{ background-image: linear-gradient(to right, alpha(black, 0.05), transparent 8px); }} \
+         .note-color-option {{ padding: 5px; }} \
+         .note-color-swatch {{ border-radius: 50px; border: 1px solid alpha(@theme_fg_color, 0.18); }} "
+    );
+    for &(color, _, _, _) in &NOTE_COLOR_PALETTE {
+        let value = note_color_value(color, dark);
+        if color != "default" {
+            css.push_str(&format!(
+                ".note-detail-surface.note-color-{color} {{ background-color: {value}; }} "
+            ));
+        }
+        css.push_str(&format!(
+            ".note-color-swatch.swatch-{color} {{ background-color: {value}; }} "
+        ));
+    }
+    for color in LEGACY_NOTE_COLORS {
+        let value = note_color_value(color, dark);
+        css.push_str(&format!(
+            ".note-detail-surface.note-color-{color} {{ background-color: {value}; }} \
+             .note-color-swatch.swatch-{color} {{ background-color: {value}; }} "
+        ));
+    }
+    css
+}
+
+fn canonical_note_color(color: &str) -> &str {
+    match color {
+        "rose" => "pink",
+        "peach" => "orange",
+        "lemon" => "yellow",
+        "lilac" => "plum",
+        _ => color,
+    }
+}
+
+fn note_color_value(color: &str, dark: bool) -> &'static str {
+    let canonical = canonical_note_color(color);
+    NOTE_COLOR_PALETTE
+        .iter()
+        .find(|entry| entry.0 == canonical)
+        .map(|entry| if dark { entry.3 } else { entry.2 })
+        .unwrap_or("#ffffff")
+}
+
+fn collect_note_surfaces(root: &gtk::Widget) -> Vec<gtk::Widget> {
+    let mut surfaces = Vec::new();
+    let mut pending = vec![root.clone()];
+    while let Some(widget) = pending.pop() {
+        if widget.has_css_class("note-detail-surface") {
+            surfaces.push(widget.clone());
+        }
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            child = current.next_sibling();
+            pending.push(current);
+        }
+    }
+    surfaces
+}
+
+fn set_note_surfaces_color(surfaces: &[gtk::Widget], color: &str) {
+    for surface in surfaces {
+        for &(old_color, _, _, _) in &NOTE_COLOR_PALETTE {
+            surface.remove_css_class(&format!("note-color-{old_color}"));
+        }
+        for old_color in LEGACY_NOTE_COLORS {
+            surface.remove_css_class(&format!("note-color-{old_color}"));
+        }
+        if color != "default" {
+            surface.add_css_class(&format!("note-color-{color}"));
+        }
+    }
+}
+
+fn set_note_color(state: &Rc<WindowState>, color: &str) {
+    if state.store.borrow().set_note_color(color).is_err() {
+        return;
+    }
+    *state.note_color.borrow_mut() = color.to_owned();
+    set_note_surfaces_color(&state.note_surfaces.borrow(), color);
+    for window in state.note_windows.borrow().values() {
+        let surfaces = collect_note_surfaces(&window.clone().upcast());
+        set_note_surfaces_color(&surfaces, color);
+    }
 }
 
 fn confirm_delete_folder(
@@ -1119,6 +1983,10 @@ fn connect_events(state: &Rc<WindowState>, new_note: &gtk::Button) {
         *state_for_new.note_id.borrow_mut() = None;
         state_for_new.note_list.unselect_all();
         set_editor_text(&state_for_new, "", "");
+        set_note_surfaces_color(
+            &state_for_new.note_surfaces.borrow(),
+            &state_for_new.note_color.borrow(),
+        );
         state_for_new.pin_button.set_sensitive(false);
         state_for_new.archive_button.set_sensitive(false);
         state_for_new.folder_button.set_sensitive(true);
@@ -1818,6 +2686,7 @@ fn show_note(state: &Rc<WindowState>, note: &Note) {
         state.folder_picker.set_selected(index as u32);
     }
     set_editor_text(state, &note.title, &note.content);
+    set_note_surfaces_color(&state.note_surfaces.borrow(), &state.note_color.borrow());
 }
 
 fn open_note_window(application: &gtk::Application, state: &Rc<WindowState>, note: &Note) {
@@ -1865,9 +2734,13 @@ fn open_note_window(application: &gtk::Application, state: &Rc<WindowState>, not
         .build();
     content_scroll.add_css_class("note-detail-surface");
     editor.append(&content_scroll);
-
+    let mut note_surfaces = collect_note_surfaces(&editor.clone().upcast());
+    let note_header = HeaderBar::new();
+    note_header.add_css_class("note-detail-surface");
+    note_surfaces.push(note_header.clone().upcast());
+    set_note_surfaces_color(&note_surfaces, &state.note_color.borrow());
     let toolbar = ToolbarView::new();
-    toolbar.add_top_bar(&HeaderBar::new());
+    toolbar.add_top_bar(&note_header);
     toolbar.set_content(Some(&editor));
     window.set_content(Some(&toolbar));
     install_close_shortcut(&window);
