@@ -1,18 +1,18 @@
 use anyhow::Result;
-use memonotes::memos::MemosClient;
+use memonotes::adapters::{BackendAdapter, MemosAdapter};
 
 fn main() -> Result<()> {
-    let client = MemosClient::from_env()?;
-    if client.uses_plain_http() {
+    let adapter = MemosAdapter::from_env()?;
+    if adapter.uses_plain_http() {
         eprintln!("Waarschuwing: HTTP versleutelt de PAT en notities niet tijdens transport.");
     }
-    client.check_connection()?;
-    let memos = client.list_memos()?;
-    let spaces = client.list_spaces()?;
+    adapter.check_connection()?;
+    let memos = adapter.list_memos()?;
+    let folders = adapter.list_folders()?;
     println!(
         "Memos API werkt; {} actieve notities en {} spaces opgehaald.",
         memos.len(),
-        spaces.len()
+        folders.len()
     );
     Ok(())
 }

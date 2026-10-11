@@ -3,6 +3,7 @@ use adw::prelude::*;
 use adw::{Application, ApplicationWindow, HeaderBar, ToolbarView};
 use anyhow::{Context, Result};
 use libadwaita as adw;
+use memonotes::adapters::{BackendAdapter, MemosAdapter};
 use memonotes::{BackendAccount, Note, NoteFilter, Store};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -49,45 +50,59 @@ const NOTE_COLOR_PALETTE: [(&str, &str, &str, &str); 32] = [
 ];
 
 const LEGACY_NOTE_COLORS: [&str; 4] = ["rose", "peach", "lemon", "lilac"];
+const SAVE_DEBOUNCE: Duration = Duration::from_millis(1000);
 
+/// The account id is `None` for notes that only live on this device.
 #[derive(Clone, PartialEq, Eq)]
 enum ActiveNoteFilter {
-    All,
-    Unfiled,
-    Folder(String),
-    Archive,
+    All(Option<String>),
+    Unfiled(Option<String>),
+    Folder(Option<String>, String),
+    Archive(Option<String>),
 }
 
 #[derive(Clone)]
 enum UndoOperation {
     Archive(Note),
-    Delete(Note),
 }
 
 impl ActiveNoteFilter {
     fn is_archived(&self) -> bool {
-        matches!(self, Self::Archive)
+        matches!(self, Self::Archive(_))
+    }
+
+    fn account_id(&self) -> Option<String> {
+        match self {
+            Self::All(account_id)
+            | Self::Unfiled(account_id)
+            | Self::Folder(account_id, _)
+            | Self::Archive(account_id) => account_id.clone(),
+        }
     }
 
     fn folder_id(&self) -> Option<String> {
         match self {
-            Self::Folder(folder_id) => Some(folder_id.clone()),
-            Self::All | Self::Unfiled | Self::Archive => None,
+            Self::Folder(_, folder_id) => Some(folder_id.clone()),
+            Self::All(_) | Self::Unfiled(_) | Self::Archive(_) => None,
         }
     }
 
-    fn for_folder_picker(folder_id: Option<String>) -> Self {
-        folder_id.map_or(Self::Unfiled, Self::Folder)
+    fn for_folder_picker(account_id: Option<String>, folder_id: Option<String>) -> Self {
+        match folder_id {
+            Some(folder_id) => Self::Folder(account_id, folder_id),
+            None => Self::Unfiled(account_id),
+        }
     }
 
     fn to_note_filter(&self, search: String) -> NoteFilter {
         let (folder_id, unfiled, archived) = match self {
-            Self::All => (None, false, false),
-            Self::Unfiled => (None, true, false),
-            Self::Folder(folder_id) => (Some(folder_id.clone()), false, false),
-            Self::Archive => (None, false, true),
+            Self::All(_) => (None, false, false),
+            Self::Unfiled(_) => (None, true, false),
+            Self::Folder(_, folder_id) => (Some(folder_id.clone()), false, false),
+            Self::Archive(_) => (None, false, true),
         };
         NoteFilter {
+            account_id: self.account_id(),
             folder_id,
             unfiled,
             archived,
@@ -96,26 +111,47 @@ impl ActiveNoteFilter {
     }
 }
 
+struct SidebarEntry {
+    row: gtk::ListBoxRow,
+    filter: ActiveNoteFilter,
+    count_label: gtk::Label,
+}
+
 struct WindowState {
     store: RefCell<Store>,
+    signal_handlers: RefCell<Vec<(gtk::glib::WeakRef<gtk::glib::Object>, gtk::glib::SignalHandlerId)>>,
+    api_sources: RefCell<HashMap<u32, gtk::glib::SourceId>>,
+    toast_overlay: adw::ToastOverlay,
+    api_toast: RefCell<Option<adw::Toast>>,
+    api_errors: RefCell<HashMap<String, String>>,
+    loading_accounts: RefCell<HashSet<String>>,
+    loading_memos: RefCell<HashSet<String>>,
+    loading_folders: RefCell<HashSet<(String, String)>>,
+    uploading_accounts: RefCell<HashSet<String>>,
+    upload_retry_at: RefCell<HashMap<String, Instant>>,
+    refresh_after_upload: RefCell<HashSet<String>>,
+    upload_after: RefCell<HashMap<String, Instant>>,
     note_color: RefCell<String>,
     undo_stack: RefCell<Vec<UndoOperation>>,
     active_filter: RefCell<ActiveNoteFilter>,
     note_id: RefCell<Option<String>>,
     note_windows: RefCell<HashMap<String, ApplicationWindow>>,
+    note_window_editors: RefCell<HashMap<String, gtk::glib::WeakRef<gtk::TextBuffer>>>,
+    suppress_detached_editor_events: Cell<bool>,
     note_list: gtk::ListBox,
     note_list_focus: gtk::ScrolledWindow,
     pinned_separator_row: gtk::ListBoxRow,
     search: gtk::SearchEntry,
-    title: gtk::Entry,
     content: gtk::TextView,
     pin_button: gtk::Button,
     archive_button: gtk::Button,
+    delete_button: gtk::Button,
     folder_button: gtk::Button,
     folder_popover: gtk::Popover,
     folder_picker: gtk::DropDown,
     folder_options: RefCell<Vec<Option<String>>>,
-    folder_count_labels: RefCell<Vec<(String, gtk::Label)>>,
+    sidebar: gtk::ListBox,
+    sidebar_entries: RefCell<Vec<SidebarEntry>>,
     note_rows: RefCell<HashMap<String, gtk::ListBoxRow>>,
     note_surfaces: RefCell<Vec<gtk::Widget>>,
     selection_anchor: RefCell<Option<String>>,
@@ -170,20 +206,20 @@ fn main() -> Result<()> {
 }
 
 fn build_window(application: &Application) -> Result<()> {
-    install_pinned_separator_style();
-    install_note_detail_style();
-    install_account_error_style();
+    let display = gtk::gdk::Display::default().context("GTK-display openen")?;
+    gtk::IconTheme::for_display(&display).add_search_path(env!("CARGO_MANIFEST_DIR"));
     let store = Store::open(database_path()?).context("Lokale notities openen")?;
-    let folders = store.folders()?;
-    let initial_notes = store.notes(&NoteFilter::default())?;
+    let initial_filter = ActiveNoteFilter::All(
+        sidebar_sections(&store)?
+            .into_iter()
+            .next()
+            .and_then(|(account_id, _)| account_id),
+    );
+    let initial_notes = store.notes(&initial_filter.to_note_filter(String::new()))?;
     let initial_note = initial_notes.first().cloned();
     let note_color = store.note_color()?;
     let folder_model = gtk::StringList::new(&["Zonder map"]);
-    let mut folder_options = vec![None];
-    for folder in &folders {
-        folder_model.append(&folder.name);
-        folder_options.push(Some(folder.id.clone()));
-    }
+    let folder_options = vec![None];
 
     let note_list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::Multiple)
@@ -200,11 +236,6 @@ fn build_window(application: &Application) -> Result<()> {
         .build();
     search.set_width_chars(12);
     search.set_hexpand(true);
-    let title = gtk::Entry::builder()
-        .placeholder_text("Nieuwe notities")
-        .css_classes(["title-1"])
-        .build();
-    title.add_css_class("note-detail-surface");
     let content = gtk::TextView::builder()
         .wrap_mode(gtk::WrapMode::WordChar)
         .top_margin(12)
@@ -213,8 +244,12 @@ fn build_window(application: &Application) -> Result<()> {
         .right_margin(12)
         .build();
     content.add_css_class("note-detail-surface");
+    prepare_empty_heading(&content);
     let pin_button = icon_button("view-pin-symbolic", "Vastpinnen");
     let archive_button = icon_button("user-trash-symbolic", "Archiveer");
+    let delete_button = icon_button("user-trash-symbolic", "Definitief wissen");
+    delete_button.add_css_class("destructive-action");
+    delete_button.set_visible(false);
     let folder_picker = gtk::DropDown::new(Some(folder_model.clone()), None::<&gtk::Expression>);
     folder_picker.set_tooltip_text(Some("Verplaats naar map"));
     let folder_button = icon_button("folder-symbolic", "Verplaats naar map");
@@ -238,24 +273,42 @@ fn build_window(application: &Application) -> Result<()> {
 
     let state = Rc::new(WindowState {
         store: RefCell::new(store),
+        signal_handlers: RefCell::new(Vec::new()),
+        api_sources: RefCell::new(HashMap::new()),
+        toast_overlay: adw::ToastOverlay::new(),
+        api_toast: RefCell::new(None),
+        api_errors: RefCell::new(HashMap::new()),
+        loading_accounts: RefCell::new(HashSet::new()),
+        loading_memos: RefCell::new(HashSet::new()),
+        loading_folders: RefCell::new(HashSet::new()),
+        uploading_accounts: RefCell::new(HashSet::new()),
+        upload_retry_at: RefCell::new(HashMap::new()),
+        refresh_after_upload: RefCell::new(HashSet::new()),
+        upload_after: RefCell::new(HashMap::new()),
         note_color: RefCell::new(note_color),
         undo_stack: RefCell::new(Vec::new()),
-        active_filter: RefCell::new(ActiveNoteFilter::All),
+        active_filter: RefCell::new(initial_filter),
         note_id: RefCell::new(initial_note.as_ref().map(|note| note.id.clone())),
         note_windows: RefCell::new(HashMap::new()),
+        note_window_editors: RefCell::new(HashMap::new()),
+        suppress_detached_editor_events: Cell::new(false),
         note_list: note_list.clone(),
         note_list_focus: list_scroll.clone(),
         pinned_separator_row,
         search: search.clone(),
-        title: title.clone(),
         content: content.clone(),
         pin_button: pin_button.clone(),
         archive_button: archive_button.clone(),
+        delete_button: delete_button.clone(),
         folder_button: folder_button.clone(),
         folder_popover,
         folder_picker: folder_picker.clone(),
         folder_options: RefCell::new(folder_options),
-        folder_count_labels: RefCell::new(Vec::new()),
+        sidebar: gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::Single)
+            .css_classes(["navigation-sidebar"])
+            .build(),
+        sidebar_entries: RefCell::new(Vec::new()),
         note_rows: RefCell::new(HashMap::new()),
         note_surfaces: RefCell::new(Vec::new()),
         selection_anchor: RefCell::new(initial_note.as_ref().map(|note| note.id.clone())),
@@ -269,6 +322,42 @@ fn build_window(application: &Application) -> Result<()> {
         .default_width(1180)
         .default_height(780)
         .build();
+    window.set_icon_name(Some("icon"));
+    install_pinned_separator_style(&window);
+    install_account_error_style(&window);
+    install_note_detail_style(&window);
+    let weak_state = Rc::downgrade(&state);
+    window.connect_destroy(move |window| {
+        if let Some(state) = weak_state.upgrade() {
+            for (_, source) in state.api_sources.borrow_mut().drain() {
+                source.remove();
+            }
+            let handlers = state.signal_handlers.take();
+            for (object, handler) in handlers {
+                if let Some(object) = object.upgrade() {
+                    object.disconnect(handler);
+                }
+            }
+            for action in window.list_actions() {
+                window.remove_action(&action);
+            }
+            if let Some(toast) = state.api_toast.borrow_mut().take() {
+                toast.dismiss();
+            }
+            let note_windows = state.note_windows.take();
+            for (_, note_window) in note_windows {
+                note_window.destroy();
+            }
+            state.sidebar_entries.borrow_mut().clear();
+            state.note_rows.borrow_mut().clear();
+            for list in [&state.sidebar, &state.note_list] {
+                while let Some(child) = list.first_child() {
+                    list.remove(&child);
+                }
+            }
+            state.folder_popover.unparent();
+        }
+    });
     let add_folder = icon_button("folder-new-symbolic", "Map toevoegen");
     let sidebar = build_sidebar(&state, &window, &add_folder)?;
     let list_column = gtk::Box::new(gtk::Orientation::Vertical, 8);
@@ -285,18 +374,14 @@ fn build_window(application: &Application) -> Result<()> {
     editor.set_margin_bottom(24);
     editor.set_margin_start(32);
     editor.set_margin_end(32);
-    let title_row = gtk::Overlay::new();
-    title.set_hexpand(true);
-    title.set_margin_end(124);
-    title_row.set_child(Some(&title));
     let editor_actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     editor_actions.append(&pin_button);
     editor_actions.append(&archive_button);
+    editor_actions.append(&delete_button);
     editor_actions.append(&folder_button);
     editor_actions.set_halign(gtk::Align::End);
     editor_actions.set_valign(gtk::Align::Center);
-    title_row.add_overlay(&editor_actions);
-    editor.append(&title_row);
+    editor.append(&editor_actions);
     let editor_scroll = gtk::ScrolledWindow::builder()
         .vexpand(true)
         .child(&content)
@@ -380,7 +465,8 @@ fn build_window(application: &Application) -> Result<()> {
     install_app_menu(&window, &more_button, &state);
     let toolbar = ToolbarView::new();
     toolbar.set_content(Some(&layout));
-    window.set_content(Some(&toolbar));
+    state.toast_overlay.set_child(Some(&toolbar));
+    window.set_content(Some(&state.toast_overlay));
     let layout_for_map = navigation_layout.clone();
     window.connect_map(move |_| {
         layout_for_map.set_position(225);
@@ -399,7 +485,464 @@ fn build_window(application: &Application) -> Result<()> {
         show_note(&state, &note);
     }
     window.present();
+    watch_backend_network(&state, &window);
+    load_backend_accounts(&state, &window);
+    start_backend_refresh(&state, &window);
+    start_backend_uploads(&state, &window);
     Ok(())
+}
+
+fn track_signal(
+    state: &WindowState,
+    object: &impl IsA<gtk::glib::Object>,
+    handler: gtk::glib::SignalHandlerId,
+) {
+    state.signal_handlers.borrow_mut().push((object.as_ref().downgrade(), handler));
+}
+
+fn api_timeout(
+    state: &Rc<WindowState>,
+    interval: Duration,
+    mut callback: impl FnMut() -> gtk::glib::ControlFlow + 'static,
+) {
+    let weak_state = Rc::downgrade(state);
+    let source_number = Rc::new(Cell::new(0));
+    let number_for_callback = Rc::clone(&source_number);
+    let source = gtk::glib::timeout_add_local(interval, move || {
+        let result = callback();
+        if result == gtk::glib::ControlFlow::Break {
+            if let Some(state) = weak_state.upgrade() {
+                state.api_sources.borrow_mut().remove(&number_for_callback.get());
+            }
+        }
+        result
+    });
+    source_number.set(source.as_raw());
+    state.api_sources.borrow_mut().insert(source.as_raw(), source);
+}
+
+fn show_api_error(state: &WindowState, key: &str, message: &str) {
+    if state.api_errors.borrow().get(key).is_some_and(|previous| previous == message) {
+        return;
+    }
+    state.api_errors.borrow_mut().insert(key.to_owned(), message.to_owned());
+    if let Some(previous) = state.api_toast.borrow_mut().take() {
+        previous.dismiss();
+    }
+    let toast = adw::Toast::new(message);
+    toast.set_use_markup(false);
+    toast.set_timeout(8);
+    state.toast_overlay.add_toast(toast.clone());
+    *state.api_toast.borrow_mut() = Some(toast);
+}
+
+fn backend_available(state: &WindowState, account_id: &str) -> bool {
+    adw::gio::NetworkMonitor::default().is_network_available()
+        && !state.upload_retry_at.borrow().get(account_id)
+            .is_some_and(|deadline| *deadline > Instant::now())
+}
+
+fn handle_backend_error(state: &WindowState, account_id: &str, key: &str, message: &str, error: &anyhow::Error) {
+    if !adw::gio::NetworkMonitor::default().is_network_available()
+        || memonotes::memos::is_connection_error(error)
+    {
+        state.upload_retry_at.borrow_mut().insert(account_id.to_owned(), Instant::now() + Duration::from_secs(30));
+        state.refresh_after_upload.borrow_mut().insert(account_id.to_owned());
+        return;
+    }
+    show_api_error(state, key, message);
+}
+
+fn watch_backend_network(state: &Rc<WindowState>, window: &ApplicationWindow) {
+    let monitor = adw::gio::NetworkMonitor::default();
+    let weak_state = Rc::downgrade(state);
+    let weak_window = window.downgrade();
+    let handler = monitor.connect_network_changed(move |_, available| {
+        if !available {
+            return;
+        }
+        let (Some(state), Some(window)) = (weak_state.upgrade(), weak_window.upgrade()) else {
+            return;
+        };
+        state.upload_retry_at.borrow_mut().clear();
+        state.upload_after.borrow_mut().clear();
+        if let Err(error) = upload_backend_events(&state) {
+            show_api_error(&state, "uploads", &format!("Memos synchroniseren mislukt: {error:#}"));
+        }
+        load_backend_accounts(&state, &window);
+    });
+    track_signal(state, &monitor, handler);
+}
+
+fn start_backend_uploads(state: &Rc<WindowState>, window: &ApplicationWindow) {
+    let weak_state = Rc::downgrade(state);
+    let weak_window = window.downgrade();
+    api_timeout(state, Duration::from_secs(1), move || {
+        let (Some(state), Some(window)) = (weak_state.upgrade(), weak_window.upgrade()) else {
+            return gtk::glib::ControlFlow::Break;
+        };
+        if !window.is_visible() {
+            return gtk::glib::ControlFlow::Break;
+        }
+        if let Err(error) = upload_backend_events(&state) {
+            show_api_error(&state, "uploads", &format!("Memos opslaan mislukt: {error:#}"));
+        } else {
+            state.api_errors.borrow_mut().remove("uploads");
+        }
+        let retry_due = state.upload_retry_at.borrow().values()
+            .any(|deadline| *deadline <= Instant::now());
+        if retry_due {
+            load_backend_accounts(&state, &window);
+        }
+        gtk::glib::ControlFlow::Continue
+    });
+}
+
+fn start_backend_refresh(state: &Rc<WindowState>, window: &ApplicationWindow) {
+    let weak_state = Rc::downgrade(state);
+    let weak_window = window.downgrade();
+    api_timeout(state, Duration::from_secs(60), move || {
+        let (Some(state), Some(window)) = (weak_state.upgrade(), weak_window.upgrade()) else {
+            return gtk::glib::ControlFlow::Break;
+        };
+        if window.is_visible() {
+            load_backend_accounts(&state, &window);
+        }
+        gtk::glib::ControlFlow::Continue
+    });
+}
+
+fn upload_backend_events(state: &Rc<WindowState>) -> Result<()> {
+    let accounts = state.store.borrow().backend_accounts()?;
+    for account in accounts.into_iter().filter(|account| account.enabled && account.provider == "memos") {
+        if !backend_available(state, &account.id)
+            || state.loading_accounts.borrow().contains(&account.id)
+            || state.loading_folders.borrow().iter().any(|(account_id, _)| account_id == &account.id)
+            || state.uploading_accounts.borrow().contains(&account.id)
+            || state.upload_retry_at.borrow().get(&account.id).is_some_and(|retry_at| *retry_at > Instant::now())
+            || state.upload_after.borrow().get(&account.id).is_some_and(|deadline| *deadline > Instant::now())
+            || !state.store.borrow().has_backend_events(&account.id)?
+        {
+            continue;
+        }
+        let path = database_path()?;
+        state.upload_after.borrow_mut().remove(&account.id);
+        state.uploading_accounts.borrow_mut().insert(account.id.clone());
+        let (sender, receiver) = mpsc::channel();
+        let worker_account = account.clone();
+        thread::spawn(move || {
+            let result = (|| -> Result<usize> {
+                let token = memonotes::credentials::lookup_token(&worker_account.id)?
+                    .context("Geen PAT in GNOME Keyring; vul een PAT in bij Instellingen")?;
+                let adapter = MemosAdapter::new(&worker_account.server_url, &token)?;
+                let store = Store::open(path)?;
+                store.sync_backend_events(&worker_account, &adapter)
+            })();
+            let _ = sender.send(result);
+        });
+        let weak_state = Rc::downgrade(state);
+        api_timeout(state, Duration::from_millis(50), move || {
+            let Some(state) = weak_state.upgrade() else {
+                return gtk::glib::ControlFlow::Break;
+            };
+            let result = match receiver.try_recv() {
+                Ok(result) => result,
+                Err(mpsc::TryRecvError::Empty) => return gtk::glib::ControlFlow::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => Err(anyhow::anyhow!("Memos opslaan is onverwacht gestopt")),
+            };
+            state.uploading_accounts.borrow_mut().remove(&account.id);
+            match result {
+                Ok(_) => {
+                    state.upload_retry_at.borrow_mut().remove(&account.id);
+                    state.api_errors.borrow_mut().remove(&format!("upload:{}", account.id));
+                    if state.refresh_after_upload.borrow_mut().remove(&account.id) {
+                        if let Some(window) = state.note_list.root().and_downcast::<ApplicationWindow>() {
+                            load_backend_accounts(&state, &window);
+                        }
+                    }
+                }
+                Err(error) => {
+                    state.upload_retry_at.borrow_mut().insert(account.id.clone(), Instant::now() + Duration::from_secs(30));
+                    handle_backend_error(&state, &account.id, &format!("upload:{}", account.id), &format!(
+                        "Memos opslaan voor {} mislukt: {error:#}. Wijzigingen blijven lokaal bewaard.", account.label
+                    ), &error);
+                }
+            }
+            gtk::glib::ControlFlow::Break
+        });
+    }
+    Ok(())
+}
+
+fn load_backend_accounts(state: &Rc<WindowState>, window: &ApplicationWindow) {
+    let accounts = match state.store.borrow().backend_accounts() {
+        Ok(accounts) => accounts,
+        Err(error) => {
+            show_api_error(state, "accounts", &format!("Accounts ophalen mislukt: {error:#}"));
+            return;
+        }
+    };
+    state.api_errors.borrow_mut().remove("accounts");
+    for account in accounts.into_iter().filter(|account| account.enabled && account.provider == "memos") {
+        if !backend_available(state, &account.id) {
+            continue;
+        }
+        match state.store.borrow().has_backend_events(&account.id) {
+            Ok(true) => {
+                state.refresh_after_upload.borrow_mut().insert(account.id.clone());
+                continue;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                show_api_error(state, "accounts", &format!("Synchronisatiestatus lezen mislukt: {error:#}"));
+                continue;
+            }
+        }
+        if state.uploading_accounts.borrow().contains(&account.id) {
+            state.refresh_after_upload.borrow_mut().insert(account.id.clone());
+            continue;
+        }
+        if !state.loading_accounts.borrow_mut().insert(account.id.clone()) {
+            continue;
+        }
+        let (sender, receiver) = mpsc::channel();
+        let worker_account = account.clone();
+        thread::spawn(move || {
+            let result = (|| -> Result<_> {
+                let token = memonotes::credentials::lookup_token(&worker_account.id)?
+                    .context("Geen PAT in GNOME Keyring; vul een PAT in bij Instellingen")?;
+                let adapter = MemosAdapter::new(&worker_account.server_url, &token)?;
+                let folders = adapter.list_folders()?;
+                let memos = adapter.list_memos()?;
+                Ok((folders, memos))
+            })();
+            let _ = sender.send(result);
+        });
+        let weak_state = Rc::downgrade(state);
+        let weak_window = window.downgrade();
+        api_timeout(state, Duration::from_millis(50), move || {
+            let (Some(state), Some(window)) = (weak_state.upgrade(), weak_window.upgrade()) else {
+                return gtk::glib::ControlFlow::Break;
+            };
+            let result = match receiver.try_recv() {
+                Ok(result) => result,
+                Err(mpsc::TryRecvError::Empty) => return gtk::glib::ControlFlow::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => Err(anyhow::anyhow!("Memos ophalen is onverwacht gestopt")),
+            };
+            state.loading_accounts.borrow_mut().remove(&account.id);
+            let result = (|| -> Result<()> {
+                let current = state.store.borrow().backend_accounts()?;
+                if !current.iter().any(|current| current == &account) {
+                    return Ok(());
+                }
+                let (folders, memos) = result?;
+                state.store.borrow().import_backend_snapshot(&account.id, &folders, &memos)?;
+                populate_sidebar(&state, &window)?;
+                refresh_notes(&state)?;
+                let selected_id = state.note_id.borrow().clone();
+                if let Some(id) = selected_id {
+                    let note = state.store.borrow().note(&id)?;
+                    if let Some(note) = note {
+                        show_note(&state, &note);
+                    }
+                } else {
+                    let filter = state.active_filter.borrow().to_note_filter(state.search.text().to_string());
+                    let notes = state.store.borrow().notes(&filter)?;
+                    if let Some(note) = notes.first() {
+                        show_note(&state, note);
+                        refresh_notes(&state)?;
+                    }
+                }
+                refresh_open_note_windows(&state);
+                Ok(())
+            })();
+            if let Err(error) = result {
+                handle_backend_error(&state, &account.id, &format!("fetch:{}", account.id), &format!("Memos ophalen voor {} mislukt: {error:#}", account.label), &error);
+            } else {
+                state.upload_retry_at.borrow_mut().remove(&account.id);
+                state.refresh_after_upload.borrow_mut().remove(&account.id);
+                state.api_errors.borrow_mut().remove(&format!("fetch:{}", account.id));
+            }
+            gtk::glib::ControlFlow::Break
+        });
+    }
+}
+
+fn refresh_backend_folder(state: &Rc<WindowState>, window: &ApplicationWindow, account_id: &str, folder_id: &str) {
+    if !backend_available(state, account_id) {
+        return;
+    }
+    let key = (account_id.to_owned(), folder_id.to_owned());
+    let preparation = (|| -> Result<_> {
+        let account = state.store.borrow().backend_accounts()?.into_iter()
+            .find(|account| account.id == account_id && account.enabled && account.provider == "memos");
+        let Some(account) = account else {
+            return Ok(None);
+        };
+        let remote_name = state.store.borrow().backend_folder_name(account_id, folder_id)?;
+        Ok(Some((account, remote_name)))
+    })();
+    let (account, remote_name) = match preparation {
+        Ok(Some(prepared)) => prepared,
+        Ok(None) => return,
+        Err(error) => {
+            show_api_error(state, &format!("fetch:folder:{folder_id}"), &format!("Memos-map ophalen mislukt: {error:#}"));
+            return;
+        }
+    };
+    if !state.loading_folders.borrow_mut().insert(key.clone()) {
+        return;
+    }
+    let (sender, receiver) = mpsc::channel();
+    let worker_account = account.clone();
+    thread::spawn(move || {
+        let result = (|| -> Result<_> {
+            let token = memonotes::credentials::lookup_token(&worker_account.id)?
+                .context("Geen PAT in GNOME Keyring; vul een PAT in bij Instellingen")?;
+            let adapter = MemosAdapter::new(&worker_account.server_url, &token)?;
+            let folder = adapter.get_folder(&remote_name)?;
+            let memos = adapter.list_folder_memos(&remote_name)?;
+            Ok((folder, memos))
+        })();
+        let _ = sender.send(result);
+    });
+    let weak_state = Rc::downgrade(state);
+    let weak_window = window.downgrade();
+    let folder_id = folder_id.to_owned();
+    api_timeout(state, Duration::from_millis(50), move || {
+        let Some(state) = weak_state.upgrade() else {
+            return gtk::glib::ControlFlow::Break;
+        };
+        let Some(window) = weak_window.upgrade() else {
+            state.loading_folders.borrow_mut().remove(&key);
+            return gtk::glib::ControlFlow::Break;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return gtk::glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => Err(anyhow::anyhow!("Memos-map ophalen is onverwacht gestopt")),
+        };
+        state.loading_folders.borrow_mut().remove(&key);
+        let result = result.and_then(|(folder, memos)| {
+            let accounts = state.store.borrow().backend_accounts()?;
+            if !accounts.iter().any(|current| current == &account)
+                || !state.store.borrow().folders()?.iter().any(|current| current.id == folder_id)
+            {
+                return Ok(());
+            }
+            state.store.borrow().import_backend_snapshot(&account.id, &[folder], &memos)?;
+            populate_sidebar(&state, &window)?;
+            refresh_notes(&state)?;
+            let selected_id = state.note_id.borrow().clone();
+            if let Some(note_id) = selected_id {
+                let note = state.store.borrow().note(&note_id)?;
+                if let Some(note) = note {
+                    show_note(&state, &note);
+                }
+            }
+            refresh_open_note_windows(&state);
+            Ok(())
+        });
+        let error_key = format!("fetch:folder:{folder_id}");
+        if let Err(error) = result {
+            handle_backend_error(&state, &account.id, &error_key, &format!("Memos-map ophalen mislukt: {error:#}"), &error);
+        } else {
+            state.api_errors.borrow_mut().remove(&error_key);
+        }
+        gtk::glib::ControlFlow::Break
+    });
+}
+
+fn refresh_backend_note(state: &Rc<WindowState>, window: &ApplicationWindow, note: &Note) {
+    let Some(account_id) = note.account_id.as_deref() else {
+        return;
+    };
+    if !backend_available(state, account_id) {
+        return;
+    }
+    let account = match state.store.borrow().backend_accounts() {
+        Ok(accounts) => accounts
+            .into_iter()
+            .find(|account| account.id == account_id && account.enabled && account.provider == "memos"),
+        Err(error) => {
+            show_api_error(state, "accounts", &format!("Accounts ophalen mislukt: {error:#}"));
+            return;
+        }
+    };
+    let Some(account) = account else {
+        return;
+    };
+    match state.store.borrow().has_pending_note_events(&note.id) {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            show_api_error(state, &format!("fetch:{}", note.id), &format!("Lokale synchronisatiestatus lezen mislukt: {error:#}"));
+            return;
+        }
+    }
+    if state.loading_accounts.borrow().contains(account_id)
+        || !state.loading_memos.borrow_mut().insert(note.id.clone())
+    {
+        return;
+    }
+    let remote_name = match state.store.borrow().backend_memo_name(account_id, &note.id) {
+        Ok(name) => name,
+        Err(error) => {
+            state.loading_memos.borrow_mut().remove(&note.id);
+            show_api_error(state, &format!("fetch:{}", note.id), &format!("Memos-notitie ophalen mislukt: {error:#}"));
+            return;
+        }
+    };
+    let (sender, receiver) = mpsc::channel();
+    let worker_account = account.clone();
+    thread::spawn(move || {
+        let result = (|| -> Result<_> {
+            let token = memonotes::credentials::lookup_token(&worker_account.id)?
+                .context("Geen PAT in GNOME Keyring; vul een PAT in bij Instellingen")?;
+            let adapter = MemosAdapter::new(&worker_account.server_url, &token)?;
+            adapter.get_memo(&remote_name)
+        })();
+        let _ = sender.send(result);
+    });
+    let weak_state = Rc::downgrade(state);
+    let weak_window = window.downgrade();
+    let note_id = note.id.clone();
+    api_timeout(state, Duration::from_millis(50), move || {
+        let Some(state) = weak_state.upgrade() else {
+            return gtk::glib::ControlFlow::Break;
+        };
+        if weak_window.upgrade().is_none() {
+            state.loading_memos.borrow_mut().remove(&note_id);
+            return gtk::glib::ControlFlow::Break;
+        }
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return gtk::glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => Err(anyhow::anyhow!("Memos ophalen is onverwacht gestopt")),
+        };
+        state.loading_memos.borrow_mut().remove(&note_id);
+        let result = result.and_then(|memo| {
+            let current_accounts = state.store.borrow().backend_accounts()?;
+            if !current_accounts.iter().any(|current| current == &account) {
+                return Ok(());
+            }
+            state.store.borrow().import_backend_memo(&account.id, &memo)?;
+            refresh_notes(&state)?;
+            if state.note_id.borrow().as_deref() == Some(note_id.as_str()) {
+                if let Some(note) = state.store.borrow().note(&note_id)? {
+                    show_note(&state, &note);
+                }
+            }
+            refresh_open_note_windows(&state);
+            Ok(())
+        });
+        if let Err(error) = result {
+            handle_backend_error(&state, &account.id, &format!("fetch:{note_id}"), &format!("Memos-notitie ophalen mislukt: {error:#}"), &error);
+        } else {
+            state.api_errors.borrow_mut().remove(&format!("fetch:{note_id}"));
+        }
+        gtk::glib::ControlFlow::Break
+    });
 }
 
 fn install_app_menu(
@@ -516,7 +1059,7 @@ fn show_about_window(parent: &ApplicationWindow) {
     header.pack_end(&close_controls);
 
     let about_content = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    let app_icon = gtk::Image::from_icon_name("accessories-text-editor-symbolic");
+    let app_icon = gtk::Image::from_file(concat!(env!("CARGO_MANIFEST_DIR"), "/icon.svg"));
     app_icon.set_pixel_size(128);
     app_icon.add_css_class("icon-dropshadow");
     app_icon.set_halign(gtk::Align::Center);
@@ -735,6 +1278,7 @@ fn append_backend_account(
         .build();
 
     let state_for_toggle = Rc::clone(state);
+    let parent_for_toggle = rows.parent.clone();
     let account_id_for_toggle = account.id.clone();
     let status_for_toggle = status.clone();
     let restoring = Rc::new(Cell::new(false));
@@ -756,6 +1300,11 @@ fn append_backend_account(
             restoring_for_toggle.set(false);
         } else {
             status_for_toggle.set_visible(false);
+            if enabled {
+                if let Some(window) = parent_for_toggle.upgrade() {
+                    load_backend_accounts(&state_for_toggle, &window);
+                }
+            }
         }
     });
 
@@ -921,8 +1470,13 @@ fn open_account_editor(
     form_group.add(&token_info);
     form_group.add(&token_row);
     form_group.add(&advanced_row);
-    dialog.content_area().append(&error_banner);
-    dialog.content_area().append(&form_group);
+    let form = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    form.append(&error_banner);
+    form.append(&form_group);
+    let account_toast_overlay = adw::ToastOverlay::new();
+    account_toast_overlay.set_vexpand(true);
+    account_toast_overlay.set_child(Some(&form));
+    dialog.content_area().append(&account_toast_overlay);
 
     set_account_editor_editable(
         &dialog,
@@ -989,6 +1543,9 @@ fn open_account_editor(
         let enabled = current_account.as_ref().is_none_or(|account| account.enabled);
         let allow_http = allow_http_row.is_active();
         error_banner.set_revealed(false);
+        let connection_toast = adw::Toast::new("Accountverbinding controleren...");
+        connection_toast.set_timeout(0);
+        account_toast_overlay.add_toast(connection_toast.clone());
         if let Some(button) = dialog.widget_for_response(gtk::ResponseType::Accept) {
             button.set_sensitive(false);
         }
@@ -1046,10 +1603,12 @@ fn open_account_editor(
         let list_status_for_save = list_status.clone();
         let dialog_for_save = dialog.clone();
         let error_banner_for_save = error_banner.clone();
+        let toast_overlay_for_save = account_toast_overlay.clone();
         let account_id_for_save = account_id.clone();
-        gtk::glib::timeout_add_local(Duration::from_millis(50), move || {
+        api_timeout(&state, Duration::from_millis(50), move || {
             match receiver.try_recv() {
                 Ok(worker_result) => {
+                    connection_toast.dismiss();
                     if !dialog_for_save.is_visible() {
                         if let Ok(previous_token) = worker_result {
                             rollback_account_token(
@@ -1081,6 +1640,10 @@ fn open_account_editor(
                             match save_result {
                                 Ok(()) => {
                                     refresh_backend_accounts(&rows_for_save, &state_for_save, &list_status_for_save);
+                                    if let Some(window) = rows_for_save.parent.upgrade() {
+                                        let _ = populate_sidebar(&state_for_save, &window);
+                                        load_backend_accounts(&state_for_save, &window);
+                                    }
                                     dialog_for_save.close();
                                 }
                                 Err(error) => {
@@ -1096,8 +1659,11 @@ fn open_account_editor(
                             }
                         }
                         Err(error) => {
-                            error_banner_for_save.set_title(&format!("Accountverbinding mislukt: {error:#}"));
-                            error_banner_for_save.set_revealed(true);
+                            toast_overlay_for_save.add_toast(adw::Toast::builder()
+                                .title(format!("Accountverbinding mislukt: {error:#}"))
+                                .use_markup(false)
+                                .timeout(8)
+                                .build());
                         }
                     }
                     if let Some(button) = dialog_for_save.widget_for_response(gtk::ResponseType::Accept) {
@@ -1110,8 +1676,8 @@ fn open_account_editor(
                 }
                 Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    error_banner_for_save.set_title("Account opslaan is onverwacht gestopt.");
-                    error_banner_for_save.set_revealed(true);
+                    connection_toast.dismiss();
+                    toast_overlay_for_save.add_toast(adw::Toast::new("Account opslaan is onverwacht gestopt."));
                     gtk::glib::ControlFlow::Break
                 }
             }
@@ -1189,11 +1755,15 @@ fn remove_backend_account(
     let state = Rc::clone(state);
     let rows = rows.clone();
     let status = status.clone();
-    gtk::glib::timeout_add_local(Duration::from_millis(50), move || {
+    let timeout_state = Rc::clone(&state);
+    api_timeout(&timeout_state, Duration::from_millis(50), move || {
         match receiver.try_recv() {
             Ok(Ok(())) => match state.store.borrow().remove_backend_account(&account.id) {
                 Ok(()) => {
                     refresh_backend_accounts(&rows, &state, &status);
+                    if let Some(window) = rows.parent.upgrade() {
+                        let _ = populate_sidebar(&state, &window);
+                    }
                     gtk::glib::ControlFlow::Break
                 }
                 Err(error) => {
@@ -1247,30 +1817,13 @@ fn build_sidebar(
     add_folder: &gtk::Button,
 ) -> Result<gtk::ScrolledWindow> {
     install_folder_menu_style();
-    let items = gtk::ListBox::builder()
-        .selection_mode(gtk::SelectionMode::Single)
-        .css_classes(["navigation-sidebar"])
-        .build();
+    let items = state.sidebar.clone();
     items.set_activate_on_single_click(true);
-    append_sidebar_item(&items, state, "Alle notities", "all");
-    append_sidebar_item(&items, state, "Zonder map", "unfiled");
-    append_sidebar_item(&items, state, "Archief", "archive");
-    for (index, folder) in state.store.borrow().folders()?.into_iter().enumerate() {
-        append_folder_row(
-            &items,
-            state,
-            window,
-            &folder.id,
-            &folder.name,
-            folder.count,
-            index as i32 + 3,
-        );
-    }
+    populate_sidebar(state, window)?;
 
     let state_for_create = Rc::clone(state);
-    let items_for_create = items.clone();
     let parent_window = window.clone();
-    add_folder.connect_clicked(move |_| {
+    let handler = add_folder.connect_clicked(move |_| {
         let dialog = gtk::Dialog::builder()
             .title("Nieuwe folder")
             .modal(true)
@@ -1309,7 +1862,6 @@ fn build_sidebar(
         });
 
         let state_for_response = Rc::clone(&state_for_create);
-        let items_for_response = items_for_create.clone();
         let parent_window_for_response = parent_window.clone();
         let name_for_response = name.clone();
         let error_for_response = error.clone();
@@ -1320,42 +1872,18 @@ fn build_sidebar(
             }
 
             let folder_name = name_for_response.text();
-            let create_result = {
-                let store = state_for_response.store.borrow();
-                store.create_folder(folder_name.as_str()).and_then(|folder_id| {
-                    store.folders().map(|folders| (folder_id, folders))
-                })
-            };
+            let account_id = state_for_response.active_filter.borrow().account_id();
+            let create_result = state_for_response
+                .store
+                .borrow()
+                .create_folder(account_id.as_deref(), folder_name.as_str());
             match create_result {
-                Ok((folder_id, folders)) => {
-                    let folder_index = folders
-                        .iter()
-                        .position(|folder| folder.id == folder_id)
-                        .unwrap_or(folders.len());
-                    let folder_row = append_folder_row(
-                        &items_for_response,
-                        &state_for_response,
-                        &parent_window_for_response,
-                        &folder_id,
-                        folder_name.trim(),
-                        0,
-                        folder_index as i32 + 3,
-                    );
-                    items_for_response.select_row(Some(&folder_row));
-                    state_for_response
-                        .folder_picker
-                        .model()
-                        .and_downcast::<gtk::StringList>()
-                        .expect("folder dropdown uses a GtkStringList")
-                        .splice(folder_index as u32 + 1, 0, &[folder_name.trim()]);
-                    state_for_response.folder_options.borrow_mut().insert(
-                        folder_index + 1,
-                        Some(folder_id.clone()),
-                    );
+                Ok(folder_id) => {
                     *state_for_response.active_filter.borrow_mut() =
-                        ActiveNoteFilter::Folder(folder_id);
+                        ActiveNoteFilter::Folder(account_id, folder_id);
                     *state_for_response.note_id.borrow_mut() = None;
-                    set_editor_text(&state_for_response, "", "");
+                    set_editor_text(&state_for_response, "");
+                    let _ = populate_sidebar(&state_for_response, &parent_window_for_response);
                     let _ = refresh_notes(&state_for_response);
                     dialog.close();
                 }
@@ -1367,40 +1895,40 @@ fn build_sidebar(
         });
         dialog.present();
     });
+    track_signal(state, add_folder, handler);
 
     let state_for_selection = Rc::clone(state);
-    items.connect_row_activated(move |_, row| {
-        let item = row.widget_name();
-        match item.as_str() {
-            "all" => {
-                *state_for_selection.active_filter.borrow_mut() = ActiveNoteFilter::All;
-            }
-            "unfiled" => {
-                *state_for_selection.active_filter.borrow_mut() = ActiveNoteFilter::Unfiled;
-            }
-            "archive" => {
-                *state_for_selection.active_filter.borrow_mut() = ActiveNoteFilter::Archive;
-            }
-            "heading" => return,
-            _ => {
-                if let Some(folder_id) = item.strip_prefix("folder:") {
-                    *state_for_selection.active_filter.borrow_mut() =
-                        ActiveNoteFilter::Folder(folder_id.to_owned());
-                }
-            }
-        }
+    let handler = items.connect_row_activated(move |_, row| {
+        let filter = state_for_selection
+            .sidebar_entries
+            .borrow()
+            .iter()
+            .find(|entry| &entry.row == row)
+            .map(|entry| entry.filter.clone());
+        let Some(filter) = filter else {
+            return;
+        };
+        *state_for_selection.active_filter.borrow_mut() = filter;
         *state_for_selection.note_id.borrow_mut() = None;
         state_for_selection.pin_button.set_sensitive(false);
         state_for_selection.archive_button.set_sensitive(false);
+        state_for_selection.delete_button.set_visible(false);
         state_for_selection.folder_button.set_sensitive(false);
         state_for_selection.folder_picker.set_sensitive(false);
         update_archive_button(
             &state_for_selection.archive_button,
             state_for_selection.active_filter.borrow().is_archived(),
         );
-        set_editor_text(&state_for_selection, "", "");
+        set_editor_text(&state_for_selection, "");
         let _ = refresh_notes(&state_for_selection);
+        let active = state_for_selection.active_filter.borrow().clone();
+        if let ActiveNoteFilter::Folder(Some(account_id), folder_id) = active {
+            if let Some(window) = row.root().and_downcast::<ApplicationWindow>() {
+                refresh_backend_folder(&state_for_selection, &window, &account_id, &folder_id);
+            }
+        }
     });
+    track_signal(state, &items, handler);
 
     let sidebar = gtk::ScrolledWindow::builder().child(&items).build();
     sidebar.add_css_class("memonotes-sidebar");
@@ -1408,16 +1936,102 @@ fn build_sidebar(
     Ok(sidebar)
 }
 
-fn append_sidebar_item(list: &gtk::ListBox, state: &Rc<WindowState>, label: &str, id: &str) {
+/// Accounts first (sorted by label), then notes kept only on this device.
+fn sidebar_sections(store: &Store) -> Result<Vec<(Option<String>, String)>> {
+    let accounts = store.backend_accounts()?;
+    let show_local = accounts.is_empty() || store.has_local_data()?;
+    let mut sections: Vec<_> = accounts
+        .into_iter()
+        .map(|account| (Some(account.id), account.label))
+        .collect();
+    if show_local {
+        sections.push((None, "Op dit apparaat".to_owned()));
+    }
+    Ok(sections)
+}
+
+fn populate_sidebar(state: &Rc<WindowState>, window: &ApplicationWindow) -> Result<()> {
+    let (sections, folders) = {
+        let store = state.store.borrow();
+        (sidebar_sections(&store)?, store.folders()?)
+    };
+    let items = &state.sidebar;
+    while let Some(child) = items.first_child() {
+        items.remove(&child);
+    }
+    state.sidebar_entries.borrow_mut().clear();
+
+    let show_headings = sections.iter().any(|(account_id, _)| account_id.is_some());
+    for (account_id, label) in sections {
+        if show_headings {
+            append_sidebar_heading(items, &label);
+        }
+        append_sidebar_item(items, state, "Alle notities", ActiveNoteFilter::All(account_id.clone()));
+        append_sidebar_item(items, state, "Zonder map", ActiveNoteFilter::Unfiled(account_id.clone()));
+        append_sidebar_item(items, state, "Archief", ActiveNoteFilter::Archive(account_id.clone()));
+        for folder in folders.iter().filter(|folder| folder.account_id == account_id) {
+            append_folder_row(items, state, window, &account_id, &folder.id, &folder.name, folder.count);
+        }
+    }
+
+    let active = state.active_filter.borrow().clone();
+    let (selected_row, active_missing) = {
+        let entries = state.sidebar_entries.borrow();
+        match entries.iter().find(|entry| entry.filter == active) {
+            Some(entry) => (Some(entry.row.clone()), false),
+            None => (entries.first().map(|entry| entry.row.clone()), true),
+        }
+    };
+    if let Some(row) = &selected_row {
+        items.select_row(Some(row));
+    }
+    if active_missing {
+        let fallback = state.sidebar_entries.borrow().first().map(|entry| entry.filter.clone());
+        if let Some(fallback) = fallback {
+            *state.active_filter.borrow_mut() = fallback;
+        }
+        clear_note_selection(state);
+        return refresh_notes(state);
+    }
+    refresh_folder_counts(state)
+}
+
+fn append_sidebar_heading(list: &gtk::ListBox, title: &str) {
+    let label = gtk::Label::builder()
+        .label(title)
+        .xalign(0.0)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .margin_start(12)
+        .margin_top(12)
+        .margin_bottom(2)
+        .build();
+    label.add_css_class("caption");
+    label.add_css_class("dim-label");
+    let row = gtk::ListBoxRow::builder()
+        .child(&label)
+        .selectable(false)
+        .activatable(false)
+        .focusable(false)
+        .build();
+    row.add_css_class("sidebar-account-heading");
+    list.append(&row);
+}
+
+fn append_sidebar_item(
+    list: &gtk::ListBox,
+    state: &Rc<WindowState>,
+    label: &str,
+    filter: ActiveNoteFilter,
+) {
     let row = gtk::ListBoxRow::new();
-    row.set_widget_name(id);
     let count_label = folder_count_label(0);
-    state
-        .folder_count_labels
-        .borrow_mut()
-        .push((id.to_owned(), count_label.clone()));
     row.set_child(Some(&folder_row_content(label, &count_label)));
     list.append(&row);
+    state.sidebar_entries.borrow_mut().push(SidebarEntry {
+        row,
+        filter,
+        count_label,
+    });
 }
 
 fn folder_count_label(count: i64) -> gtk::Label {
@@ -1437,26 +2051,29 @@ fn append_folder_row(
     list: &gtk::ListBox,
     state: &Rc<WindowState>,
     window: &ApplicationWindow,
+    account_id: &Option<String>,
     id: &str,
     name: &str,
     count: i64,
-    position: i32,
 ) -> gtk::ListBoxRow {
     let row = gtk::ListBoxRow::new();
-    row.set_widget_name(&format!("folder:{id}"));
     let count_label = folder_count_label(count);
-    state
-        .folder_count_labels
-        .borrow_mut()
-        .push((id.to_owned(), count_label.clone()));
+    state.sidebar_entries.borrow_mut().push(SidebarEntry {
+        row: row.clone(),
+        filter: ActiveNoteFilter::Folder(account_id.clone(), id.to_owned()),
+        count_label: count_label.clone(),
+    });
     row.set_child(Some(&folder_row_content(name, &count_label)));
     let drop_target = gtk::DropTarget::new(
         String::static_type(),
         gtk::gdk::DragAction::MOVE,
     );
-    let state_for_drop = Rc::clone(state);
+    let state_for_drop = Rc::downgrade(state);
     let folder_id_for_drop = id.to_owned();
     drop_target.connect_drop(move |_, value, _, _| {
+        let Some(state_for_drop) = state_for_drop.upgrade() else {
+            return false;
+        };
         let Ok(note_ids) = value.get::<String>() else {
             return false;
         };
@@ -1464,7 +2081,7 @@ fn append_folder_row(
         move_notes_to_folder(&state_for_drop, &note_ids, &folder_id_for_drop)
     });
     row.add_controller(drop_target);
-    list.insert(&row, position);
+    list.append(&row);
 
     let popover = gtk::Popover::new();
     popover.set_has_arrow(false);
@@ -1495,21 +2112,24 @@ fn append_folder_row(
     popover.set_child(Some(&menu));
     popover.set_parent(&row);
 
-    let state_for_rename = Rc::clone(state);
-    let row_for_rename = row.clone();
-    let list_for_menu = list.clone();
-    let window_for_menu = window.clone();
+    let state_for_rename = Rc::downgrade(state);
+    let row_for_rename = row.downgrade();
+    let list_for_menu = list.downgrade();
+    let window_for_menu = window.downgrade();
     let folder_id = id.to_owned();
     let old_name = name.to_owned();
     let count_label = count_label.clone();
-    let state_for_delete = Rc::clone(&state_for_rename);
+    let state_for_delete = state_for_rename.clone();
     let row_for_delete = row_for_rename.clone();
     let list_for_delete = list_for_menu.clone();
     let window_for_delete = window_for_menu.clone();
     let folder_id_for_delete = folder_id.clone();
     let folder_name_for_delete = old_name.clone();
-    let popover_for_rename = popover.clone();
+    let popover_for_rename = popover.downgrade();
     rename_list.connect_row_activated(move |_, _| {
+        let (Some(state_for_rename), Some(row_for_rename), Some(popover_for_rename)) = (
+            state_for_rename.upgrade(), row_for_rename.upgrade(), popover_for_rename.upgrade(),
+        ) else { return; };
         let current_name = row_for_rename
             .child()
             .and_downcast::<gtk::Box>()
@@ -1527,8 +2147,12 @@ fn append_folder_row(
         );
     });
 
-    let popover_for_delete = popover.clone();
+    let popover_for_delete = popover.downgrade();
     delete_list.connect_row_activated(move |_, _| {
+        let (Some(state_for_delete), Some(list_for_delete), Some(window_for_delete), Some(row_for_delete), Some(popover_for_delete)) = (
+            state_for_delete.upgrade(), list_for_delete.upgrade(), window_for_delete.upgrade(),
+            row_for_delete.upgrade(), popover_for_delete.upgrade(),
+        ) else { return; };
         popover_for_delete.popdown();
         confirm_delete_folder(
             &state_for_delete,
@@ -1542,13 +2166,20 @@ fn append_folder_row(
 
     let right_click = gtk::GestureClick::new();
     right_click.set_button(3);
-    let popover_for_click = popover.clone();
+    let popover_for_click = popover.downgrade();
     right_click.connect_pressed(move |_, _, x, y| {
+        let Some(popover_for_click) = popover_for_click.upgrade() else { return; };
         popover_for_click
             .set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
         popover_for_click.popup();
     });
     row.add_controller(right_click);
+    let popover_for_destroy = popover.downgrade();
+    row.connect_destroy(move |_| {
+        if let Some(popover) = popover_for_destroy.upgrade() {
+            popover.unparent();
+        }
+    });
     row
 }
 
@@ -1599,7 +2230,7 @@ fn install_folder_menu_style() {
     );
 }
 
-fn install_account_error_style() {
+fn install_account_error_style(window: &ApplicationWindow) {
     let Some(display) = gtk::gdk::Display::default() else {
         return;
     };
@@ -1630,9 +2261,12 @@ fn install_account_error_style() {
         &provider,
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
     );
+    window.connect_destroy(move |_| {
+        gtk::style_context_remove_provider_for_display(&display, &provider);
+    });
 }
 
-fn install_note_detail_style() {
+fn install_note_detail_style(window: &ApplicationWindow) {
     let Some(display) = gtk::gdk::Display::default() else {
         return;
     };
@@ -1645,8 +2279,15 @@ fn install_note_detail_style() {
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
     let provider_for_theme = provider.clone();
-    style_manager.connect_dark_notify(move |style_manager| {
+    let theme_handler = style_manager.connect_dark_notify(move |style_manager| {
         provider_for_theme.load_from_data(&note_detail_css(style_manager.is_dark()));
+    });
+    let theme_handler = RefCell::new(Some(theme_handler));
+    window.connect_destroy(move |_| {
+        if let Some(handler) = theme_handler.borrow_mut().take() {
+            style_manager.disconnect(handler);
+            gtk::style_context_remove_provider_for_display(&display, &provider);
+        }
     });
 }
 
@@ -1654,6 +2295,7 @@ fn note_detail_css(dark: bool) -> String {
     let default = note_color_value("default", dark);
     let mut css = format!(
         ".note-detail-surface {{ background-color: {default}; background-image: none; }} \
+         textview.empty-note-heading {{ font-size: 1.65em; font-weight: 700; }} \
          .note-detail-pane {{ background-image: linear-gradient(to right, alpha(black, 0.05), transparent 8px); }} \
          .note-color-option {{ padding: 5px; }} \
          .note-color-swatch {{ border-radius: 50px; border: 1px solid alpha(@theme_fg_color, 0.18); }} "
@@ -1791,34 +2433,28 @@ fn confirm_delete_folder(
                 .set(true);
             list_for_response.remove(&row_for_response);
             state_for_response
-                .folder_count_labels
+                .sidebar_entries
                 .borrow_mut()
-                .retain(|(id, _)| id != &folder_id);
-
-            let folder_option_index = {
-                state_for_response
-                    .folder_options
-                    .borrow()
-                    .iter()
-                    .position(|id| id.as_deref() == Some(folder_id.as_str()))
-            };
-            if let Some(index) = folder_option_index {
-                state_for_response.folder_options.borrow_mut().remove(index);
-                state_for_response
-                    .folder_picker
-                    .model()
-                    .and_downcast::<gtk::StringList>()
-                    .expect("folder dropdown uses a GtkStringList")
-                    .splice(index as u32, 1, &[]);
-            }
+                .retain(|entry| entry.row != row_for_response);
 
             let deleted_folder_is_active = {
-                *state_for_response.active_filter.borrow()
-                    == ActiveNoteFilter::Folder(folder_id.clone())
+                state_for_response.active_filter.borrow().folder_id().as_deref()
+                    == Some(folder_id.as_str())
             };
             if deleted_folder_is_active {
-                *state_for_response.active_filter.borrow_mut() = ActiveNoteFilter::Unfiled;
+                let account_id = state_for_response.active_filter.borrow().account_id();
+                *state_for_response.active_filter.borrow_mut() =
+                    ActiveNoteFilter::Unfiled(account_id.clone());
+                if let Some(entry) = state_for_response
+                    .sidebar_entries
+                    .borrow()
+                    .iter()
+                    .find(|entry| entry.filter == ActiveNoteFilter::Unfiled(account_id.clone()))
+                {
+                    list_for_response.select_row(Some(&entry.row));
+                }
             }
+            resync_folder_picker(&state_for_response);
             if let Some(note_id) = selected_note_id {
                 let note = {
                     state_for_response
@@ -1894,20 +2530,8 @@ fn begin_folder_rename(
                 new_name.trim(),
                 &count_label_for_save,
             )));
-            if let Some(index) = state_for_save
-                .folder_options
-                .borrow()
-                .iter()
-                .position(|id| id.as_deref() == Some(&folder_id_for_save))
-            {
-                state_for_save
-                    .folder_picker
-                    .model()
-                    .and_downcast::<gtk::StringList>()
-                    .expect("folder dropdown uses a GtkStringList")
-                    .splice(index as u32, 1, &[new_name.trim()]);
-            }
-                    let _ = refresh_notes(&state_for_save);
+            resync_folder_picker(&state_for_save);
+            let _ = refresh_notes(&state_for_save);
         }
     });
 
@@ -1994,10 +2618,12 @@ fn install_shortcuts(
     application.set_accels_for_action("win.undo", &["<Control>z"]);
 
     let search_keys = gtk::EventControllerKey::new();
-    let search_for_escape = state.search.clone();
+    let search_for_escape = state.search.downgrade();
     search_keys.connect_key_pressed(move |_, key, _, _| {
         if key == gtk::gdk::Key::Escape {
-            search_for_escape.set_text("");
+            if let Some(search) = search_for_escape.upgrade() {
+                search.set_text("");
+            }
             gtk::glib::Propagation::Stop
         } else {
             gtk::glib::Propagation::Proceed
@@ -2019,12 +2645,11 @@ fn install_close_shortcut(window: &ApplicationWindow) {
 
 fn connect_events(state: &Rc<WindowState>, new_note: &gtk::Button) {
     let state_for_activation = Rc::clone(state);
-    state.note_list.connect_row_activated(move |_, row| {
-        let Some(application) = row
-            .root()
-            .and_downcast::<ApplicationWindow>()
-            .and_then(|window| window.application())
-        else {
+    let handler = state.note_list.connect_row_activated(move |_, row| {
+        let Some(window) = row.root().and_downcast::<ApplicationWindow>() else {
+            return;
+        };
+        let Some(application) = window.application() else {
             return;
         };
         let note_id = row.widget_name();
@@ -2038,16 +2663,18 @@ fn connect_events(state: &Rc<WindowState>, new_note: &gtk::Button) {
             });
         }
     });
+    track_signal(state, &state.note_list, handler);
 
     let state_for_search = Rc::clone(state);
-    state.search.connect_search_changed(move |_| {
+    let handler = state.search.connect_search_changed(move |_| {
         let _ = refresh_notes(&state_for_search);
     });
+    track_signal(state, &state.search, handler);
 
     let delete_keys = gtk::EventControllerKey::new();
     delete_keys.set_propagation_phase(gtk::PropagationPhase::Capture);
     let state_for_delete = Rc::clone(state);
-    delete_keys.connect_key_pressed(move |_, key, _, modifiers| match key {
+    let handler = delete_keys.connect_key_pressed(move |_, key, _, modifiers| match key {
         gtk::gdk::Key::Delete => {
             if state_for_delete.active_filter.borrow().is_archived() {
                 delete_current_note(&state_for_delete);
@@ -2059,21 +2686,17 @@ fn connect_events(state: &Rc<WindowState>, new_note: &gtk::Button) {
         gtk::gdk::Key::Up => move_note_selection(&state_for_delete, -1),
         gtk::gdk::Key::Down => move_note_selection(&state_for_delete, 1),
         gtk::gdk::Key::Tab if !modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK) => {
-            state_for_delete.title.grab_focus();
+            state_for_delete.content.grab_focus();
             gtk::glib::Propagation::Stop
         }
         _ => gtk::glib::Propagation::Proceed,
     });
+    track_signal(state, &delete_keys, handler);
     state.note_list_focus.add_controller(delete_keys);
-    connect_tab_navigation(
-        &state.title,
-        state.content.clone().upcast(),
-        state.note_list_focus.clone().upcast(),
-    );
     connect_tab_navigation(
         &state.content,
         state.pin_button.clone().upcast(),
-        state.title.clone().upcast(),
+        state.note_list_focus.clone().upcast(),
     );
     connect_tab_navigation(
         &state.pin_button,
@@ -2082,60 +2705,60 @@ fn connect_events(state: &Rc<WindowState>, new_note: &gtk::Button) {
     );
     connect_tab_navigation(
         &state.archive_button,
-        state.folder_button.clone().upcast(),
+        state.delete_button.clone().upcast(),
         state.pin_button.clone().upcast(),
+    );
+    connect_tab_navigation(
+        &state.delete_button,
+        state.folder_button.clone().upcast(),
+        state.archive_button.clone().upcast(),
     );
     connect_tab_navigation(
         &state.folder_button,
         state.search.clone().upcast(),
-        state.archive_button.clone().upcast(),
+        state.delete_button.clone().upcast(),
     );
 
     let state_for_new = Rc::clone(state);
-    new_note.connect_clicked(move |_| {
+    let handler = new_note.connect_clicked(move |_| {
         if state_for_new.active_filter.borrow().is_archived() {
             return;
         }
         *state_for_new.note_id.borrow_mut() = None;
         state_for_new.note_list.unselect_all();
-        set_editor_text(&state_for_new, "", "");
+        set_editor_text(&state_for_new, "");
         set_note_surfaces_color(
             &state_for_new.note_surfaces.borrow(),
             &state_for_new.note_color.borrow(),
         );
         state_for_new.pin_button.set_sensitive(false);
         state_for_new.archive_button.set_sensitive(false);
+        state_for_new.delete_button.set_visible(false);
         state_for_new.folder_button.set_sensitive(true);
         state_for_new.folder_picker.set_sensitive(true);
 
-        let target_folder = state_for_new.active_filter.borrow().folder_id();
-        let target_index = state_for_new
-            .folder_options
-            .borrow()
-            .iter()
-            .position(|option| option.as_deref() == target_folder.as_deref());
-        if let Some(index) = target_index {
-            state_for_new.folder_picker.set_selected(index as u32);
-        }
-        state_for_new.title.grab_focus();
-        state_for_new.title.set_position(0);
+        let active = state_for_new.active_filter.borrow().clone();
+        sync_folder_picker(
+            &state_for_new,
+            active.account_id().as_deref(),
+            active.folder_id().as_deref(),
+        );
+        state_for_new.content.grab_focus();
     });
-
-    let state_for_title = Rc::clone(state);
-    state.title.connect_changed(move |entry| {
-        save_current(&state_for_title, entry.text().as_str(), None);
-    });
+    track_signal(state, new_note, handler);
 
     let state_for_content = Rc::clone(state);
-    state.content.buffer().connect_changed(move |buffer| {
+    let buffer = state.content.buffer();
+    let handler = buffer.connect_changed(move |buffer| {
+        style_note_heading(buffer);
         let (start, end) = buffer.bounds();
         let body = buffer.text(&start, &end, true);
-        let title = state_for_content.title.text();
-        save_current(&state_for_content, title.as_str(), Some(body.as_str()));
+        save_current(&state_for_content, body.as_str());
     });
+    track_signal(state, &buffer, handler);
 
     let state_for_pin = Rc::clone(state);
-    state.pin_button.connect_clicked(move |_| {
+    let handler = state.pin_button.connect_clicked(move |_| {
         let Some(note_id) = state_for_pin.note_id.borrow().clone() else {
             return;
         };
@@ -2154,15 +2777,23 @@ fn connect_events(state: &Rc<WindowState>, new_note: &gtk::Button) {
             let _ = refresh_notes(&state_for_pin);
         }
     });
+    track_signal(state, &state.pin_button, handler);
 
     let state_for_archive = Rc::clone(state);
-    state.archive_button.connect_clicked(move |_| {
+    let handler = state.archive_button.connect_clicked(move |_| {
         let archived = !state_for_archive.active_filter.borrow().is_archived();
         set_current_note_archived(&state_for_archive, archived);
     });
+    track_signal(state, &state.archive_button, handler);
+
+    let state_for_delete = Rc::clone(state);
+    let handler = state.delete_button.connect_clicked(move |_| {
+        delete_current_note(&state_for_delete);
+    });
+    track_signal(state, &state.delete_button, handler);
 
     let state_for_move = Rc::clone(state);
-    state.folder_picker.connect_selected_notify(move |picker| {
+    let handler = state.folder_picker.connect_selected_notify(move |picker| {
         if state_for_move.suppress_folder_picker_events.get() {
             return;
         }
@@ -2179,8 +2810,9 @@ fn connect_events(state: &Rc<WindowState>, new_note: &gtk::Button) {
             return;
         };
         let Some(note_id) = state_for_move.note_id.borrow().clone() else {
+            let account_id = state_for_move.active_filter.borrow().account_id();
             *state_for_move.active_filter.borrow_mut() =
-                ActiveNoteFilter::for_folder_picker(folder_id);
+                ActiveNoteFilter::for_folder_picker(account_id, folder_id);
             return;
         };
         let current_folder = state_for_move
@@ -2202,6 +2834,7 @@ fn connect_events(state: &Rc<WindowState>, new_note: &gtk::Button) {
             let _ = refresh_notes(&state_for_move);
         }
     });
+    track_signal(state, &state.folder_picker, handler);
 }
 
 fn connect_tab_navigation(
@@ -2209,6 +2842,8 @@ fn connect_tab_navigation(
     next: gtk::Widget,
     previous: gtk::Widget,
 ) {
+    let next = next.downgrade();
+    let previous = previous.downgrade();
     let keys = gtk::EventControllerKey::new();
     keys.set_propagation_phase(gtk::PropagationPhase::Capture);
     keys.connect_key_pressed(move |_, key, _, modifiers| {
@@ -2220,8 +2855,12 @@ fn connect_tab_navigation(
         } else {
             &next
         };
-        target.grab_focus();
-        gtk::glib::Propagation::Stop
+        if let Some(target) = target.upgrade() {
+            if target.is_visible() && target.is_sensitive() && target.grab_focus() {
+                return gtk::glib::Propagation::Stop;
+            }
+        }
+        gtk::glib::Propagation::Proceed
     });
     widget.add_controller(keys);
 }
@@ -2314,7 +2953,7 @@ fn build_pinned_separator_row() -> gtk::ListBoxRow {
     row
 }
 
-fn install_pinned_separator_style() {
+fn install_pinned_separator_style(window: &ApplicationWindow) {
     let Some(display) = gtk::gdk::Display::default() else {
         return;
     };
@@ -2365,6 +3004,9 @@ fn install_pinned_separator_style() {
         &provider,
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
+    window.connect_destroy(move |_| {
+        gtk::style_context_remove_provider_for_display(&display, &provider);
+    });
 }
 
 fn place_note_list_row(list: &gtk::ListBox, row: &gtk::ListBoxRow, position: usize) {
@@ -2415,7 +3057,7 @@ fn build_note_row(state: &Rc<WindowState>, note: &Note) -> gtk::ListBoxRow {
     heading_row.append(&heading);
     heading_row.append(&metadata);
     let preview = gtk::Label::builder()
-        .label(note.content.lines().next().unwrap_or(""))
+        .label(note.editor_parts().1.lines().find(|line| !line.trim().is_empty()).unwrap_or(""))
         .xalign(0.0)
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .build();
@@ -2436,12 +3078,15 @@ fn build_note_row(state: &Rc<WindowState>, note: &Note) -> gtk::ListBoxRow {
     item.append(&preview_row);
     row.set_child(Some(&item));
 
-    let state_for_click = Rc::clone(state);
-    let row_for_click = row.clone();
+    let state_for_click = Rc::downgrade(state);
+    let row_for_click = row.downgrade();
     let click = gtk::GestureClick::new();
     click.set_button(1);
     click.set_propagation_phase(gtk::PropagationPhase::Capture);
     click.connect_pressed(move |gesture, _, _, _| {
+        let (Some(state_for_click), Some(row_for_click)) = (state_for_click.upgrade(), row_for_click.upgrade()) else {
+            return;
+        };
         let modifiers = gesture.current_event_state();
         if modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
             let note_id = row_for_click.widget_name().to_string();
@@ -2475,8 +3120,9 @@ fn build_note_row(state: &Rc<WindowState>, note: &Note) -> gtk::ListBoxRow {
     let drag_source = gtk::DragSource::new();
     drag_source.set_actions(gtk::gdk::DragAction::MOVE);
     let note_id = note.id.clone();
-    let state_for_drag = Rc::clone(state);
+    let state_for_drag = Rc::downgrade(state);
     drag_source.connect_prepare(move |_, _, _| {
+        let state_for_drag = state_for_drag.upgrade()?;
         let selected_ids: Vec<String> = state_for_drag
             .note_list
             .selected_rows()
@@ -2493,8 +3139,11 @@ fn build_note_row(state: &Rc<WindowState>, note: &Note) -> gtk::ListBoxRow {
         Some(gtk::gdk::ContentProvider::for_value(&value))
     });
     let drag_icon_note_id = note.id.clone();
-    let state_for_drag_icon = Rc::clone(state);
+    let state_for_drag_icon = Rc::downgrade(state);
     drag_source.connect_drag_begin(move |_, drag| {
+        let Some(state_for_drag_icon) = state_for_drag_icon.upgrade() else {
+            return;
+        };
         let selected_ids: Vec<String> = state_for_drag_icon
             .note_list
             .selected_rows()
@@ -2609,6 +3258,11 @@ fn show_note_from_row(state: &Rc<WindowState>, row: &gtk::ListBoxRow) {
     let note_id = row.widget_name();
     let note = { state.store.borrow().note(&note_id).ok().flatten() };
     if let Some(note) = note {
+        if note.account_id.is_some()
+            && let Some(window) = row.root().and_downcast::<ApplicationWindow>()
+        {
+            refresh_backend_note(state, &window, &note);
+        }
         show_note(state, &note);
     }
 }
@@ -2684,30 +3338,56 @@ fn move_note_selection(state: &Rc<WindowState>, direction: i32) -> gtk::glib::Pr
 
 fn refresh_folder_counts(state: &Rc<WindowState>) -> Result<()> {
     let store = state.store.borrow();
-    let all_count = store.count_notes(&NoteFilter::default())?;
-    let unfiled_count = store.count_notes(&NoteFilter {
-        unfiled: true,
-        ..Default::default()
-    })?;
-    let archive_count = store.count_notes(&NoteFilter {
-        archived: true,
-        ..Default::default()
-    })?;
-    let folders = store.folders()?;
-    for (folder_id, label) in state.folder_count_labels.borrow().iter() {
-        let count = match folder_id.as_str() {
-            "all" => all_count,
-            "unfiled" => unfiled_count,
-            "archive" => archive_count,
-            _ => folders
-                .iter()
-                .find(|folder| folder.id == *folder_id)
-                .map(|folder| folder.count)
-                .unwrap_or(0),
-        };
-        label.set_text(&count.to_string());
+    for entry in state.sidebar_entries.borrow().iter() {
+        let count = store.count_notes(&entry.filter.to_note_filter(String::new()))?;
+        entry.count_label.set_text(&count.to_string());
     }
     Ok(())
+}
+
+/// Fills the "move to folder" picker with the folders of one account only.
+fn sync_folder_picker(state: &WindowState, account_id: Option<&str>, selected_folder: Option<&str>) {
+    let Ok(folders) = state.store.borrow().folders() else {
+        return;
+    };
+    let mut names = vec!["Zonder map".to_owned()];
+    let mut options = vec![None];
+    for folder in folders
+        .into_iter()
+        .filter(|folder| folder.account_id.as_deref() == account_id)
+    {
+        names.push(folder.name);
+        options.push(Some(folder.id));
+    }
+    let index = options
+        .iter()
+        .position(|option| option.as_deref() == selected_folder)
+        .unwrap_or(0);
+    let previous_suppress = state.suppress_folder_picker_events.replace(true);
+    let model = state
+        .folder_picker
+        .model()
+        .and_downcast::<gtk::StringList>()
+        .expect("folder dropdown uses a GtkStringList");
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    model.splice(0, model.n_items(), &names);
+    *state.folder_options.borrow_mut() = options;
+    state.folder_picker.set_selected(index as u32);
+    state.suppress_folder_picker_events.set(previous_suppress);
+}
+
+fn resync_folder_picker(state: &WindowState) {
+    let note_id = state.note_id.borrow().clone();
+    let note = note_id.and_then(|id| state.store.borrow().note(&id).ok().flatten());
+    match note {
+        Some(note) => {
+            sync_folder_picker(state, note.account_id.as_deref(), note.folder_id.as_deref())
+        }
+        None => {
+            let active = state.active_filter.borrow().clone();
+            sync_folder_picker(state, active.account_id().as_deref(), active.folder_id().as_deref());
+        }
+    }
 }
 
 fn format_updated_at(timestamp: i64) -> String {
@@ -2767,7 +3447,7 @@ fn update_note_row_widgets(row: &gtk::ListBoxRow, note: &Note, folder_name: &str
     }
     if let Some(preview_row) = heading_row.next_sibling().and_downcast::<gtk::Box>() {
         if let Some(preview) = preview_row.first_child().and_downcast::<gtk::Label>() {
-            preview.set_text(note.content.lines().next().unwrap_or(""));
+            preview.set_text(note.editor_parts().1.lines().find(|line| !line.trim().is_empty()).unwrap_or(""));
         }
         if let Some(folder) = preview_row.last_child().and_downcast::<gtk::Label>() {
             folder.set_text(folder_name);
@@ -2791,17 +3471,9 @@ fn show_note(state: &Rc<WindowState>, note: &Note) {
     );
     state.archive_button.set_sensitive(true);
     update_archive_button(&state.archive_button, note.archived);
-    let folder_index = {
-        state
-            .folder_options
-            .borrow()
-            .iter()
-            .position(|folder_id| folder_id == &note.folder_id)
-    };
-    if let Some(index) = folder_index {
-        state.folder_picker.set_selected(index as u32);
-    }
-    set_editor_text(state, &note.title, &note.content);
+    state.delete_button.set_visible(note.archived);
+    sync_folder_picker(state, note.account_id.as_deref(), note.folder_id.as_deref());
+    set_editor_text(state, &note.editor_document());
     set_note_surfaces_color(&state.note_surfaces.borrow(), &state.note_color.borrow());
 }
 
@@ -2821,12 +3493,8 @@ fn open_note_window(application: &gtk::Application, state: &Rc<WindowState>, not
         .default_width(720)
         .default_height(560)
         .build();
+    window.set_icon_name(Some("icon"));
 
-    let title = gtk::Entry::builder()
-        .text(&note.title)
-        .placeholder_text("Nieuwe notities")
-        .css_classes(["title-1", "note-detail-surface"])
-        .build();
     let content = gtk::TextView::builder()
         .wrap_mode(gtk::WrapMode::WordChar)
         .top_margin(12)
@@ -2835,7 +3503,9 @@ fn open_note_window(application: &gtk::Application, state: &Rc<WindowState>, not
         .right_margin(12)
         .build();
     content.add_css_class("note-detail-surface");
-    content.buffer().set_text(&note.content);
+    prepare_empty_heading(&content);
+    content.buffer().set_text(&note.editor_document());
+    style_note_heading(&content.buffer());
 
     let editor = gtk::Box::new(gtk::Orientation::Vertical, 12);
     editor.add_css_class("note-detail-surface");
@@ -2843,7 +3513,6 @@ fn open_note_window(application: &gtk::Application, state: &Rc<WindowState>, not
     editor.set_margin_bottom(24);
     editor.set_margin_start(32);
     editor.set_margin_end(32);
-    editor.append(&title);
     let content_scroll = gtk::ScrolledWindow::builder()
         .vexpand(true)
         .child(&content)
@@ -2866,69 +3535,120 @@ fn open_note_window(application: &gtk::Application, state: &Rc<WindowState>, not
     window.connect_close_request(move |_| {
         if let Some(state) = state_for_close.upgrade() {
             state.note_windows.borrow_mut().remove(&note_id);
+            state.note_window_editors.borrow_mut().remove(&note_id);
         }
         gtk::glib::Propagation::Proceed
     });
 
+    let buffer = content.buffer();
     let note_id = note.id.clone();
-    let state_for_title = Rc::clone(state);
-    let buffer_for_title = content.buffer();
-    title.connect_changed(move |entry| {
-        save_detached_note(
-            &state_for_title,
-            &note_id,
-            entry.text().as_str(),
-            &buffer_for_title,
-        );
+    let state_for_content = Rc::downgrade(state);
+    let content_handler = buffer.connect_changed(move |buffer| {
+        style_note_heading(buffer);
+        let Some(state) = state_for_content.upgrade() else {
+            return;
+        };
+        save_detached_note(&state, &note_id, buffer);
     });
-
-    let note_id = note.id.clone();
-    let state_for_content = Rc::clone(state);
-    let title_for_content = title.clone();
-    content.buffer().connect_changed(move |buffer| {
-        save_detached_note(
-            &state_for_content,
-            &note_id,
-            title_for_content.text().as_str(),
-            buffer,
-        );
+    let handlers = RefCell::new(Some(content_handler));
+    let buffer_for_destroy = buffer.downgrade();
+    let state_for_destroy = Rc::downgrade(state);
+    let note_id_for_destroy = note.id.clone();
+    window.connect_destroy(move |window| {
+        if let Some(content_handler) = handlers.borrow_mut().take() {
+            if let Some(buffer) = buffer_for_destroy.upgrade() {
+                buffer.disconnect(content_handler);
+            }
+        }
+        for action in window.list_actions() {
+            window.remove_action(&action);
+        }
+        if let Some(state) = state_for_destroy.upgrade() {
+            state.note_windows.borrow_mut().remove(&note_id_for_destroy);
+            state
+                .note_window_editors
+                .borrow_mut()
+                .remove(&note_id_for_destroy);
+        }
     });
 
     state
         .note_windows
         .borrow_mut()
         .insert(note.id.clone(), window.clone());
+    state.note_window_editors.borrow_mut().insert(
+        note.id.clone(),
+        buffer.downgrade(),
+    );
     window.present();
-    title.grab_focus();
+    content.grab_focus();
+}
+
+fn refresh_open_note_windows(state: &Rc<WindowState>) {
+    let note_ids: Vec<_> = state.note_window_editors.borrow().keys().cloned().collect();
+    for note_id in note_ids {
+        let Some(note) = state.store.borrow().note(&note_id).ok().flatten() else {
+            continue;
+        };
+        let editors = state.note_window_editors.borrow().get(&note_id).cloned();
+        let Some(buffer) = editors.and_then(|buffer| buffer.upgrade())
+        else {
+            state.note_window_editors.borrow_mut().remove(&note_id);
+            continue;
+        };
+        if let Some(window) = state.note_windows.borrow().get(&note_id) {
+            window.set_title(Some(if note.title.is_empty() {
+                "Nieuwe notitie"
+            } else {
+                &note.title
+            }));
+        }
+        let previous_suppress = state.suppress_detached_editor_events.replace(true);
+        buffer.set_text(&note.editor_document());
+        style_note_heading(&buffer);
+        state.suppress_detached_editor_events.set(previous_suppress);
+    }
+}
+
+fn debounce_backend_save(state: &WindowState, account_id: Option<&str>) {
+    if let Some(account_id) = account_id {
+        state.upload_after.borrow_mut().insert(account_id.to_owned(), Instant::now() + SAVE_DEBOUNCE);
+    }
 }
 
 fn save_detached_note(
     state: &Rc<WindowState>,
     note_id: &str,
-    title: &str,
     buffer: &gtk::TextBuffer,
 ) {
+    if state.suppress_detached_editor_events.get() {
+        return;
+    }
     let (start, end) = buffer.bounds();
     let content = buffer.text(&start, &end, true);
+    let (title, body) = memonotes::memo::editor_parts(content.as_str());
+    let Some(current) = state.store.borrow().note(note_id).ok().flatten() else {
+        return;
+    };
+    if current.content == memonotes::memo::editor_content(title, body) {
+        return;
+    }
     if state
         .store
         .borrow()
-        .save_note(note_id, content.as_str(), title)
+        .save_note_editor(note_id, title, body)
         .is_ok()
     {
+        debounce_backend_save(state, current.account_id.as_deref());
         let _ = refresh_notes(state);
     }
 }
 
-fn save_current(state: &Rc<WindowState>, title: &str, content: Option<&str>) {
+fn save_current(state: &Rc<WindowState>, content: &str) {
     if state.suppress_editor_events.get() {
         return;
     }
-    let body = content.map(str::to_owned).unwrap_or_else(|| {
-        let buffer = state.content.buffer();
-        let (start, end) = buffer.bounds();
-        buffer.text(&start, &end, true).to_string()
-    });
+    let (title, body) = memonotes::memo::editor_parts(content);
 
     let (note_id, created_now) = if let Some(note_id) = state.note_id.borrow().clone() {
         (note_id, false)
@@ -2938,8 +3658,13 @@ fn save_current(state: &Rc<WindowState>, title: &str, content: Option<&str>) {
         {
             return;
         }
-        let folder_id = state.active_filter.borrow().folder_id();
-        let create_result = { state.store.borrow().create_note(folder_id.as_deref()) };
+        let active = state.active_filter.borrow().clone();
+        let create_result = {
+            state
+                .store
+                .borrow()
+                .create_note(active.account_id().as_deref(), active.folder_id().as_deref())
+        };
         let Ok(note_id) = create_result else {
             return;
         };
@@ -2949,15 +3674,16 @@ fn save_current(state: &Rc<WindowState>, title: &str, content: Option<&str>) {
 
     let current = state.store.borrow().note(&note_id).ok().flatten();
     if let Some(current) = current {
-        if current.title == title.trim() && current.content == body {
+        if current.content == memonotes::memo::editor_content(title, body) {
             return;
         }
         if state
             .store
             .borrow()
-            .save_note(&note_id, &body, title)
+            .save_note_editor(&note_id, title, body)
             .is_ok()
         {
+            debounce_backend_save(state, current.account_id.as_deref());
             if created_now {
                 state.pin_button.set_sensitive(true);
                 set_icon_button(&state.pin_button, "view-pin-symbolic", "Vastpinnen");
@@ -2965,31 +3691,52 @@ fn save_current(state: &Rc<WindowState>, title: &str, content: Option<&str>) {
                 update_archive_button(&state.archive_button, false);
                 state.folder_button.set_sensitive(true);
                 state.folder_picker.set_sensitive(true);
-                let note_folder = state
-                    .store
-                    .borrow()
-                    .note(&note_id)
-                    .ok()
-                    .flatten()
-                    .and_then(|note| note.folder_id);
-                if let Some(index) = state
-                    .folder_options
-                    .borrow()
-                    .iter()
-                    .position(|folder_id| folder_id == &note_folder)
-                {
-                    state.folder_picker.set_selected(index as u32);
-                }
+                resync_folder_picker(state);
             }
             let _ = refresh_notes(state);
         }
     }
 }
 
-fn set_editor_text(state: &WindowState, title: &str, content: &str) {
+fn prepare_empty_heading(content: &gtk::TextView) {
+    content.add_css_class("empty-note-heading");
+    let editor = content.downgrade();
+    content.buffer().connect_changed(move |buffer| {
+        let Some(editor) = editor.upgrade() else {
+            return;
+        };
+        if buffer.char_count() == 0 {
+            editor.add_css_class("empty-note-heading");
+        } else {
+            editor.remove_css_class("empty-note-heading");
+        }
+    });
+}
+
+fn style_note_heading(buffer: &gtk::TextBuffer) {
+    let table = buffer.tag_table();
+    let tag = table.lookup("note-h1").unwrap_or_else(|| {
+        let tag = gtk::TextTag::builder()
+            .name("note-h1")
+            .weight(700)
+            .scale(1.65)
+            .pixels_above_lines(8)
+            .pixels_below_lines(8)
+            .build();
+        table.add(&tag);
+        tag
+    });
+    let (start, end) = buffer.bounds();
+    buffer.remove_tag(&tag, &start, &end);
+    let mut heading_end = start;
+    heading_end.forward_to_line_end();
+    buffer.apply_tag(&tag, &start, &heading_end);
+}
+
+fn set_editor_text(state: &WindowState, content: &str) {
     state.suppress_editor_events.set(true);
-    state.title.set_text(title);
     state.content.buffer().set_text(content);
+    style_note_heading(&state.content.buffer());
     state.suppress_editor_events.set(false);
 }
 
@@ -2998,9 +3745,10 @@ fn clear_note_selection(state: &WindowState) {
     state.note_list.unselect_all();
     state.pin_button.set_sensitive(false);
     state.archive_button.set_sensitive(false);
+    state.delete_button.set_visible(false);
     state.folder_button.set_sensitive(false);
     state.folder_picker.set_sensitive(false);
-    set_editor_text(state, "", "");
+    set_editor_text(state, "");
 }
 
 fn archive_current_note(state: &Rc<WindowState>) {
@@ -3015,14 +3763,54 @@ fn delete_current_note(state: &Rc<WindowState>) {
     let Some(note) = note else {
         return;
     };
-    if state.store.borrow().delete_note(&note_id).is_ok() {
-        state
-            .undo_stack
-            .borrow_mut()
-            .push(UndoOperation::Delete(note));
-        clear_note_selection(state);
-        let _ = refresh_notes(state);
+    if !note.archived {
+        return;
     }
+    let Some(parent) = state.note_list.root().and_downcast::<gtk::Window>() else {
+        return;
+    };
+    let alert = adw::AlertDialog::builder()
+        .heading("Notitie definitief wissen?")
+        .body(if note.account_id.is_some() {
+            "Deze notitie wordt definitief gewist, ook op de Memos-server zodra het account synchroniseert. Dit kan niet ongedaan worden gemaakt."
+        } else {
+            "Deze notitie wordt definitief van dit apparaat gewist. Dit kan niet ongedaan worden gemaakt."
+        })
+        .build();
+    alert.add_responses(&[("cancel", "Annuleren"), ("delete", "Definitief wissen")]);
+    alert.set_default_response(Some("cancel"));
+    alert.set_close_response("cancel");
+    alert.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+
+    let state = Rc::clone(state);
+    alert.choose(Some(&parent), None::<&adw::gio::Cancellable>, move |response| {
+        if response != "delete" {
+            return;
+        }
+        let current = state.store.borrow().note(&note_id).ok().flatten();
+        let Some(current) = current.filter(|note| note.archived) else {
+            return;
+        };
+        let result = state.store.borrow().delete_note(&note_id);
+        if let Err(error) = result {
+            state.toast_overlay.add_toast(adw::Toast::new(&format!(
+                "Notitie wissen mislukt: {error:#}"
+            )));
+            return;
+        }
+        state.undo_stack.borrow_mut().retain(|operation| match operation {
+            UndoOperation::Archive(note) => note.id != note_id,
+        });
+        let note_window = state.note_windows.borrow().get(&note_id).cloned();
+        if let Some(window) = note_window {
+            window.close();
+        }
+        debounce_backend_save(&state, current.account_id.as_deref());
+        if state.note_id.borrow().as_deref() == Some(note_id.as_str()) {
+            clear_note_selection(&state);
+        }
+        let _ = refresh_notes(&state);
+    });
 }
 
 fn set_current_note_archived(state: &Rc<WindowState>, archived: bool) {
@@ -3056,7 +3844,6 @@ fn undo_last_operation(state: &Rc<WindowState>) {
         let store = state.store.borrow();
         match &operation {
             UndoOperation::Archive(note) => store.set_archived(&note.id, note.archived),
-            UndoOperation::Delete(note) => store.restore_note(note),
         }
     };
     if undo_result.is_err() {
@@ -3065,7 +3852,7 @@ fn undo_last_operation(state: &Rc<WindowState>) {
     state.undo_stack.borrow_mut().pop();
 
     let note_id = match operation {
-        UndoOperation::Archive(note) | UndoOperation::Delete(note) => note.id,
+        UndoOperation::Archive(note) => note.id,
     };
     let note = state.store.borrow().note(&note_id).ok().flatten();
     let Some(note) = note else {

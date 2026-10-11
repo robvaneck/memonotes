@@ -1,11 +1,57 @@
 # Memonotes - product- en implementatieplan
 
-Datum: 2026-10-05
-Status: lokale desktop-shell in ontwikkeling; backend/editor zijn nog niet gebouwd.
-Projectmap: /home/fedora/repos/memonote (bestaande map behouden; appnaam is Memonotes).
-Scope: lokale SQLite-shell met drie panelen, folders, notities, zoeken, verplaatsen,
-vastpinnen en archiveren. De editor is nog platte tekst; WYSIWYG, afbeeldingen en
-Memos-sync zijn nog niet gebouwd.
+Oorspronkelijk plan: 2026-10-05. Stand bijgewerkt: 2026-10-10.
+Status: GTK-desktopapp met SQLite, meerdere Memos-accounts, achtergrondophalen en
+automatische outbox-uploads. De editor is nog platte tekst; WYSIWYG en afbeeldingen
+zijn nog niet gebouwd. Conflictafhandeling en robuuste sync zijn nog niet afgerond.
+Projectmap: /home/fedora/repos/memonotes.
+De onderstaande productafspraken beschrijven het doel; de checklist geeft aan wat
+daadwerkelijk in de huidige code is gerealiseerd. Zie ook [README.md](README.md).
+
+## Huidige stand en todo's
+
+### Gerealiseerd
+
+- [x] Rust/GTK4/libadwaita-app met drie verstelbare panelen en inklapbare zijbalk.
+- [x] SQLite-opslag, lokale autosave, folders, zoeken, pinnen en archief/terugzetten.
+- [x] Gearchiveerde notities definitief wissen met bevestigingsdialoog en `NoteDeleted` via de adapter naar de Memos DELETE-API; geen undo voor definitief wissen.
+- [x] Undo voor archiveeracties; undo is niet persistent.
+- [x] Meervoudige notitieselectie en slepen naar een map.
+- [x] Losse bewerkbare notitievensters en toetsenbordnavigatie/sneltoetsen.
+- [x] 32 notitiekleuren met licht/donker-varianten en een Over-venster.
+- [x] Meerdere accounts beheren, inschakelen/uitschakelen, verbinding testen en PAT in GNOME Keyring bewaren.
+- [x] Memos-adapter met backend-onafhankelijke notitie- en foldermodellen; IMAP/Joplin zijn alleen keuzemogelijkheden, niet geimplementeerd.
+- [x] Memos-notities/spaces gepagineerd ophalen en transactioneel cachen per account (schema v9).
+- [x] Ophalen bij opstart, accountopslaan/inschakelen en elke 60 seconden bij zichtbaar hoofdvenster.
+- [x] Geselecteerde backendnotitie apart ophalen wanneer geen lokale notitie-events pending zijn.
+- [x] Bij openen van een Memos-map de space via GET en actieve notities met space-filter gepagineerd ophalen; pending lokale wijzigingen blijven beschermd.
+- [x] Duurzame outbox, accountrouting, remote-ID-links en bevestiging na succesvolle upload.
+- [x] Automatische uploads, een seconde debounce na tekstbewerking, opeenvolgende updates samenvoegen en 30 seconden retry na uploadfout.
+- [x] Automatische netwerkdetectie zonder handmatige modus: offline API-calls pauzeren, verbindingsfouten stil uitstellen en bij reconnect eerst de outbox-batch versturen en daarna verversen.
+- [x] API-mapping voor notitie-CRUD/herstel, pinnen, archiveren, verplaatsen en mapaanmaak/hernoemen.
+- [x] API-fouttoasts met deduplicatie; achtergrondophalen/autosave zonder voortgangstoasts.
+- [x] Opslag/sync-tests en HTTP-mocktests; API-probe beschikbaar.
+
+### Nog te doen
+
+- [ ] Live integratieproef tegen de doelinstallatie van Memos 0.31.0; mocks bewijzen geen servercompatibiliteit.
+- [ ] Veilige mapverwijdering ontwerpen: lokale verwijdering werkt, maar remote `FolderDeleted` is geblokkeerd en kan latere accountuploads ophouden.
+- [ ] Losse notitietitel en Markdown-H1 consistent synchroniseren zonder bestaande inhoud stilzwijgend te herschrijven.
+- [ ] Conflicten detecteren en beide versies bewaren; remote deletions reconciliëren zonder pending wijzigingen te verliezen.
+- [ ] Onzekere create-uitkomsten en HTTP 409 afhandelen zonder duplicaten of permanent vastgelopen events.
+- [ ] Serverfilters/sortering expliciet kiezen en archiefdekking op de echte server toetsen.
+- [ ] Zichtbaarheid en space-rollen lokaal behouden; gedeelde spaces herkenbaar tonen.
+- [ ] WYSIWYG-engine kiezen en opmaak/checklists/undo-redo roundtrips testen.
+- [ ] Attachment-API onderzoeken; afbeeldingen invoegen, uploaden, koppelen en offline cachen.
+- [ ] Markdown-export met folders, metadata en afbeeldingen.
+- [ ] Expliciete onboarding/lokale import en veilig ontkoppelen met pending wijzigingen/export.
+- [ ] Smalle-vensternavigatie, onthouden paneelbreedtes/selectie, toegankelijkheid en zichtbare sync/conflictstatus.
+- [ ] Handmatig verversen en uitgebreidere retry/backoff-afhandeling.
+- [ ] Fedora/Flatpak-verpakking en netwerk/keyringtests in de sandbox.
+
+Niet gebouwd en buiten de huidige versie 1-scope: space-leden/uitnodigingen,
+publiceren, PAT-beheer via de API, mobiel en React Native. De precieze
+attachment-functionaliteit moet nog worden onderzocht.
 
 ## 1. Bevestigde conclusies
 
@@ -78,7 +124,8 @@ Eerste start bevat een expliciete keuze:
 2. Memos verbinden: serveradres en persoonlijke app key invoeren, verbinding testen.
 
 In Instellingen > Opslag blijft het mogelijk later Memos te koppelen of los te koppelen.
-Voorgesteld: maximaal een Memos-account in versie 1; lokale notities blijven een aparte collectie.
+Huidige implementatie: meerdere Memos-accounts met aparte collecties; lokale notities
+blijven apart. De oorspronkelijke beperking tot een account is niet toegepast.
 Koppelen uploadt bestaande lokale notities nooit stilzwijgend. Een expliciete kopieer/importactie
 toont selectie en bestemming en bewaart de lokale originelen tot succes bevestigd is.
 Ontkoppelen waarschuwt voor niet-gesynchroniseerde wijzigingen en biedt export aan.
@@ -140,8 +187,11 @@ en geen geneste mappen: de geraadpleegde Space-definitie biedt geen parent-veld.
 - Bestaande gedeelde spaces herkenbaar tonen; niet stilzwijgend als persoonlijk behandelen.
 - Uitnodigingen, ledenbeheer en publiceren vallen buiten versie 1.
 - Space verwijderen wist volgens de API ook alle geplaatste notities.
-  Daarom voorlopig geen space-verwijderactie in Memonotes; eerst een expliciet veilig
-  ontwerp voor verplaatsen, bevestiging en gelijktijdige serverwijzigingen bepalen.
+  Daarom is de remote space-verwijderactie in de adapter geblokkeerd. De huidige UI
+  biedt lokale mapverwijdering wel aan en verplaatst lokale notities naar Zonder map.
+  Deze mismatch moet worden opgelost: een geblokkeerd remote delete-event kan de
+  outbox van het account ophouden. Eerst een expliciet veilig ontwerp voor
+  verplaatsen, bevestiging en gelijktijdige serverwijzigingen bepalen.
 - Discriminerende integratieproef: PAT gebruiken om een eigen space te maken, een PRIVATE
   notitie eraan te koppelen, te hernoemen en vanuit een tweede client te lezen/verplaatsen.
 - Bij ongeschikte space-semantiek een alternatief voorstellen en opnieuw afstemmen;
@@ -183,7 +233,10 @@ is dus geen volledige racebescherming. Dit onderzoeken in de integratieproef en 
 testen met meerdere desktopclients en de Memos-webclient.
 Ontbrekende items in een gedeeltelijke lijst betekenen nooit automatisch verwijdering.
 Remote deletions met pending lokale edits leiden tot herstel/conflict, niet dataverlies.
-Versie 1 gebruikt archiveren als omkeerbare actie; harde verwijdering en prullenbak later ontwerpen.
+De huidige app biedt archiveren en harde verwijdering vanuit het archief, met een
+undo-stack in het geheugen. `NoteRestored` maakt een verwijderde snapshot opnieuw
+aan; attachments, relaties en shares worden niet hersteld. Een robuust ontwerp
+voor verwijdering/herstel en een eventuele prullenbak blijft nodig.
 
 ## 7. Linux/GNOME-architectuur
 
@@ -225,7 +278,7 @@ UI-checks omvatten leegte/fout/offline-staten, paneelresizing, toetsenbordbedien
 - Een optionele Markdown-brontab toevoegen of uitsluitend WYSIWYG aanbieden?
 - Hoe dicht moet de vormgeving bij Apple Notes komen versus standaard libadwaita?
 - Naast bevestigde afbeeldingen ook andere bestandsbijlagen in versie 1?
-- Akkoord met maximaal een gekoppeld account en aparte lokale collectie in versie 1?
+- Meerdere gekoppelde accounts, zoals nu gebouwd, definitief opnemen in versie 1?
 
 Technische proeven, geen nog open productkeuzes: editor-engine,
 persoonlijke space-semantiek en veilige offline afbeeldingssync. Mobiel is buiten scope.
@@ -237,6 +290,8 @@ persoonlijke space-semantiek en veilige offline afbeeldingssync. Mobiel is buite
 - https://raw.githubusercontent.com/usememos/memos/v0.31.0/proto/api/v1/space_service.proto
 - https://raw.githubusercontent.com/usememos/memos/v0.31.0/proto/api/v1/user_service.proto
 
-De workspace-aanmaaktool was niet beschikbaar in deze sessie. De projectmap met dit
-plan is aangemaakt via bestandsbewerking; er is nog geen VS Code-workspace geopend,
-app gegenereerd, echte server benaderd of app-test uitgevoerd.
+De app en lokale opslag/API-mocktests bestaan inmiddels in deze workspace.
+De huidige code is leidend voor de gerealiseerde checklist; de overige secties
+blijven productdoelen en acceptatiecriteria. Live servercompatibiliteit,
+concurrente updates, attachment-gedrag en release/sandboxtests zijn nog niet
+aangetoond door de mocktests.
