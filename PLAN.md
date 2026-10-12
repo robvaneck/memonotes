@@ -43,8 +43,9 @@ daadwerkelijk in de huidige code is gerealiseerd. Zie ook [README.md](README.md)
 
 ### Nog te doen
 
-- [ ] Serverfilters/sortering expliciet kiezen en archiefdekking op de echte server toetsen.
-- [ ] Zichtbaarheid en space-rollen lokaal behouden; gedeelde spaces herkenbaar tonen.
+- [x] Alle 2.700 notities gepagineerd ophalen en correct sorteren; live bevestigd.
+- [x] Archiveren/terugzetten werkt remote; end-to-end getest op de echte server.
+- [x] Gedeelde Memos-spaces en niet-private notities uit de UI filteren; gedeelde data alleen in de sync-cache behouden.
 - [ ] WYSIWYG-engine kiezen en opmaak/checklists/undo-redo roundtrips testen.
 - [ ] Attachment-API onderzoeken; afbeeldingen invoegen, uploaden, koppelen en offline cachen.
 - [ ] Markdown-export met folders, metadata en afbeeldingen.
@@ -187,7 +188,7 @@ en geen geneste mappen: de geraadpleegde Space-definitie biedt geen parent-veld.
 
 - Nieuwe Memonotes-notities standaard `PRIVATE`, ook wanneer ze in een space staan.
 - Mapverplaatsing verandert zichtbaarheid niet impliciet.
-- Bestaande gedeelde spaces herkenbaar tonen; niet stilzwijgend als persoonlijk behandelen.
+- Gedeelde spaces en niet-private notities vallen buiten scope en worden niet in Memonotes getoond; de cache bewaart ze alleen voor sync-administratie.
 - Uitnodigingen, ledenbeheer en publiceren vallen buiten versie 1.
 - Space verwijderen kan volgens de API ook alle geplaatste notities wissen.
   De bevestigingsdialoog biedt daarom drie keuzes: annuleren, de map verwijderen

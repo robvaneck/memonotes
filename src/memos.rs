@@ -56,6 +56,8 @@ pub struct RemoteSpace {
     pub title: String,
     #[serde(default)]
     pub current_user_role: String,
+    #[serde(default)]
+    pub member_count: u32,
 }
 
 impl MemosClient {
@@ -401,7 +403,8 @@ mod tests {
         let address = listener.local_addr()?;
         let server = thread::spawn(move || -> Result<Vec<String>> {
             let responses = [
-                r#"{"name":"spaces/work","title":"Nieuwe mapnaam"}"#,
+                r#"{"name":"spaces/work","title":"Nieuwe mapnaam","memberCount":1}"#,
+                r#"{"name":"spaces/work","title":"Nieuwe mapnaam","memberCount":1}"#,
                 r#"{"memos":[{"name":"memos/one","content":"Nieuwste inhoud","state":"NORMAL","space":"spaces/work"}],"nextPageToken":"next-page"}"#,
                 r#"{"memos":[{"name":"memos/two","content":"Tweede notitie","state":"NORMAL","space":"spaces/work"}]}"#,
             ];
@@ -437,6 +440,7 @@ mod tests {
         let memos = adapter.list_folder_memos("spaces/work")?;
         let requests = server.join().expect("mock server thread panicked")?;
         assert!(requests[0].starts_with("GET /server/api/v1/spaces/work HTTP/1.1"));
+        assert!(requests[1].starts_with("GET /server/api/v1/spaces/work HTTP/1.1"));
         assert_eq!(folder.id, "spaces/work");
         assert_eq!(folder.name, "Nieuwe mapnaam");
         assert_eq!(memos.len(), 2);
@@ -447,7 +451,7 @@ mod tests {
                     .to_ascii_lowercase()
                     .contains("authorization: bearer probe-token")
             );
-            if index == 0 {
+            if index < 2 {
                 continue;
             }
             let path = request.split_whitespace().nth(1).unwrap();
@@ -468,7 +472,7 @@ mod tests {
             );
             assert_eq!(
                 query.get("pageToken").map(|value| value.as_ref()),
-                if index == 2 { Some("next-page") } else { None }
+                if index == 3 { Some("next-page") } else { None }
             );
         }
         Ok(())
@@ -524,9 +528,10 @@ mod tests {
         let address = listener.local_addr()?;
         let server = thread::spawn(move || -> Result<Vec<String>> {
             let responses = [
-                r##"{"memos":[{"name":"memos/one","content":"# Title","state":"NORMAL","visibility":"PRIVATE","space":"spaces/work","property":{"title":"Title"}}],"nextPageToken":"second-page"}"##,
+                r#"{"spaces":[{"name":"spaces/work","title":"Work","currentUserRole":"ADMIN","memberCount":1},{"name":"spaces/team","title":"Team","currentUserRole":"USER","memberCount":3}]}"#,
+                r##"{"memos":[{"name":"memos/one","content":"# Title","state":"NORMAL","visibility":"PRIVATE","space":"spaces/work","property":{"title":"Title"}},{"name":"memos/shared-space","content":"Shared space note","state":"NORMAL","visibility":"PRIVATE","space":"spaces/team"},{"name":"memos/protected","content":"Protected note","state":"NORMAL","visibility":"PROTECTED"}],"nextPageToken":"second-page"}"##,
                 r#"{"memos":[{"name":"memos/two","content":"Another","state":"ARCHIVED","visibility":"PRIVATE","pinned":true,"updateTime":"2026-10-10T12:00:00Z"}]}"#,
-                r#"{"spaces":[{"name":"spaces/work","title":"Work","currentUserRole":"ADMIN"}]}"#,
+                r#"{"spaces":[{"name":"spaces/work","title":"Work","currentUserRole":"ADMIN","memberCount":1},{"name":"spaces/team","title":"Team","currentUserRole":"USER","memberCount":3}]}"#,
             ];
             let mut requests = Vec::new();
             for body in responses {
@@ -561,19 +566,25 @@ mod tests {
         let folders = backend.list_folders()?;
         let requests = server.join().expect("mock server thread panicked")?;
 
-        assert_eq!(memos.len(), 2);
+        assert_eq!(memos.len(), 4);
         assert_eq!(memos[0].id, "memos/one");
         assert_eq!(memos[0].content, "# Title");
         assert_eq!(memos[0].title.as_deref(), Some("Title"));
         assert_eq!(memos[0].folder_id.as_deref(), Some("spaces/work"));
         assert!(!memos[0].archived);
-        assert!(memos[1].archived);
-        assert!(memos[1].pinned);
-        assert_eq!(memos[1].title.as_deref(), Some("Another"));
-        assert_eq!(memos[1].folder_id, None);
-        assert_eq!(memos[1].updated_at, Some(1791633600000));
+        assert!(!memos[0].is_shared);
+        assert!(memos[1].is_shared);
+        assert!(memos[2].is_shared);
+        assert!(!memos[1].archived);
+        assert!(memos[3].archived);
+        assert!(memos[3].pinned);
+        assert_eq!(memos[3].title.as_deref(), Some("Another"));
+        assert_eq!(memos[3].folder_id, None);
+        assert_eq!(memos[3].updated_at, Some(1791633600000));
         assert_eq!(folders[0].id, "spaces/work");
         assert_eq!(folders[0].name, "Work");
+        assert!(!folders[0].is_shared);
+        assert!(folders[1].is_shared);
         let store = crate::Store::open(":memory:")?;
         store.add_backend_account(
             "mock-account",
@@ -600,12 +611,13 @@ mod tests {
         })?;
         assert_eq!(archived.len(), 1);
         assert!(store.pending_sync_events(100)?.is_empty());
-        assert!(requests[0].starts_with("GET /api/v1/memos?pageSize=1000 HTTP/1.1"));
+        assert!(requests[0].starts_with("GET /api/v1/spaces?pageSize=1000 HTTP/1.1"));
+        assert!(requests[1].starts_with("GET /api/v1/memos?pageSize=1000 HTTP/1.1"));
         assert!(
-            requests[1]
+            requests[2]
                 .starts_with("GET /api/v1/memos?pageSize=1000&pageToken=second-page HTTP/1.1")
         );
-        assert!(requests[2].starts_with("GET /api/v1/spaces?pageSize=1000 HTTP/1.1"));
+        assert!(requests[3].starts_with("GET /api/v1/spaces?pageSize=1000 HTTP/1.1"));
         assert!(requests.iter().all(|request| {
             request
                 .to_ascii_lowercase()

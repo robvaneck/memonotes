@@ -39,6 +39,7 @@ pub struct Memo {
     pub folder_id: Option<String>,
     pub pinned: bool,
     pub archived: bool,
+    pub is_shared: bool,
     pub updated_at: Option<TimestampMillis>,
 }
 
@@ -46,6 +47,7 @@ pub struct Memo {
 pub struct MemoFolder {
     pub id: String,
     pub name: String,
+    pub is_shared: bool,
 }
 
 #[cfg(test)]

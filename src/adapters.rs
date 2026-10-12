@@ -2,6 +2,7 @@ use crate::i18n::tr;
 use anyhow::{Context, Result, bail, ensure};
 use reqwest::Method;
 use serde_json::{Value, json};
+use std::collections::HashSet;
 
 use crate::memo::{Memo, MemoFolder, TimestampMillis};
 use crate::memos::{MemosClient, RemoteMemo};
@@ -174,15 +175,18 @@ impl MemosAdapter {
 
     pub fn get_memo(&self, name: &str) -> Result<Memo> {
         let id = resource_id(name, "memos")?;
-        memo_from_remote(self.client.get_memo(id)?)
+        let remote = self.client.get_memo(id)?;
+        let shared_space = self.remote_space_is_shared(remote.space.as_deref())?;
+        memo_from_remote(remote, shared_space)
     }
 
     pub fn get_memo_if_exists(&self, name: &str) -> Result<Option<Memo>> {
         let id = resource_id(name, "memos")?;
-        self.client
-            .get_memo_if_exists(id)?
-            .map(memo_from_remote)
-            .transpose()
+        let Some(remote) = self.client.get_memo_if_exists(id)? else {
+            return Ok(None);
+        };
+        let shared_space = self.remote_space_is_shared(remote.space.as_deref())?;
+        Ok(Some(memo_from_remote(remote, shared_space)?))
     }
 
     pub fn get_folder(&self, name: &str) -> Result<MemoFolder> {
@@ -191,16 +195,26 @@ impl MemosAdapter {
         Ok(MemoFolder {
             id: space.name,
             name: space.title,
+            is_shared: space.member_count != 1,
         })
     }
 
     pub fn list_folder_memos(&self, name: &str) -> Result<Vec<Memo>> {
         let id = resource_id(name, "spaces")?;
+        let is_shared = self.client.get_space(id)?.member_count != 1;
         self.client
             .list_space_memos(id)?
             .into_iter()
-            .map(memo_from_remote)
+            .map(|remote| memo_from_remote(remote, is_shared))
             .collect()
+    }
+
+    fn remote_space_is_shared(&self, name: Option<&str>) -> Result<bool> {
+        let Some(name) = name.filter(|name| !name.is_empty()) else {
+            return Ok(false);
+        };
+        let id = resource_id(name, "spaces")?;
+        Ok(self.client.get_space(id)?.member_count != 1)
     }
 }
 
@@ -242,10 +256,23 @@ impl BackendAdapter for MemosAdapter {
     }
 
     fn list_memos(&self) -> Result<Vec<Memo>> {
+        let personal_spaces: HashSet<_> = self
+            .client
+            .list_spaces()?
+            .into_iter()
+            .filter(|space| space.member_count == 1)
+            .map(|space| space.name)
+            .collect();
         self.client
             .list_memos()?
             .into_iter()
-            .map(memo_from_remote)
+            .map(|remote| {
+                let shared_space = remote
+                    .space
+                    .as_ref()
+                    .is_some_and(|space| !personal_spaces.contains(space));
+                memo_from_remote(remote, shared_space)
+            })
             .collect()
     }
 
@@ -257,6 +284,7 @@ impl BackendAdapter for MemosAdapter {
             .map(|space| MemoFolder {
                 id: space.name,
                 name: space.title,
+                is_shared: space.member_count != 1,
             })
             .collect())
     }
@@ -283,7 +311,7 @@ fn remote_matches_note(remote: &RemoteMemo, note: &NoteSnapshot) -> bool {
         && (remote.visibility.is_empty() || remote.visibility == "PRIVATE")
 }
 
-fn memo_from_remote(remote: RemoteMemo) -> Result<Memo> {
+fn memo_from_remote(remote: RemoteMemo, shared_space: bool) -> Result<Memo> {
     let archived = match remote.state.as_str() {
         "" | "NORMAL" => false,
         "ARCHIVED" => true,
@@ -299,6 +327,7 @@ fn memo_from_remote(remote: RemoteMemo) -> Result<Memo> {
         folder_id: remote.space.filter(|space| !space.is_empty()),
         pinned: remote.pinned,
         archived,
+        is_shared: shared_space || remote.visibility != "PRIVATE",
         updated_at: remote
             .update_time
             .as_deref()
@@ -487,12 +516,12 @@ mod tests {
 
     #[test]
     fn memos_adapter_normalizes_its_update_time_format() -> Result<()> {
-        let memo = memo_from_remote(remote_memo(Some("2026-10-10T12:00:00Z")))?;
+        let memo = memo_from_remote(remote_memo(Some("2026-10-10T12:00:00Z")), false)?;
         assert_eq!(memo.updated_at, Some(1791633600000));
 
-        let offset_memo = memo_from_remote(remote_memo(Some("2026-10-10T14:00:00+02:00")))?;
+        let offset_memo = memo_from_remote(remote_memo(Some("2026-10-10T14:00:00+02:00")), false)?;
         assert_eq!(offset_memo.updated_at, Some(1791633600000));
-        assert!(memo_from_remote(remote_memo(Some("not a timestamp"))).is_err());
+        assert!(memo_from_remote(remote_memo(Some("not a timestamp")), false).is_err());
         Ok(())
     }
 
@@ -660,6 +689,7 @@ mod tests {
         let folder = MemoFolder {
             id: "spaces/remote-folder".to_owned(),
             name: "Werk".to_owned(),
+            is_shared: false,
         };
         let memo = Memo {
             id: "memos/remote-memo".to_owned(),
@@ -668,6 +698,7 @@ mod tests {
             folder_id: Some(folder.id.clone()),
             pinned: false,
             archived: false,
+            is_shared: false,
             updated_at: None,
         };
         store.import_backend_snapshot("one", &[folder], &[memo])?;
@@ -747,6 +778,7 @@ mod tests {
             folder_id: None,
             pinned: false,
             archived: true,
+            is_shared: false,
             updated_at: None,
         };
         store.import_backend_snapshot("one", &[], std::slice::from_ref(&memo))?;

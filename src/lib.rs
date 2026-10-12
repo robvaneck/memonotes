@@ -174,7 +174,7 @@ impl Store {
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version > 11 {
+        if version > 12 {
             bail!(tr("storage.error.newer_schema_version"));
         }
         if version == 0 {
@@ -270,6 +270,13 @@ impl Store {
                  PRAGMA user_version = 11;",
             )?;
         }
+        if version < 12 {
+            connection.execute_batch(
+                "ALTER TABLE folders ADD COLUMN is_shared INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE notes ADD COLUMN is_shared INTEGER NOT NULL DEFAULT 0;
+                 PRAGMA user_version = 12;",
+            )?;
+        }
         if !has_column(&connection, "backend_accounts", "enabled")? {
             connection.execute_batch(
                 "ALTER TABLE backend_accounts ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1;",
@@ -294,7 +301,9 @@ impl Store {
     pub fn folders(&self) -> Result<Vec<Folder>> {
         let mut statement = self.connection.prepare(
             "SELECT folders.id, folders.account_id, folders.name, count(notes.id)
-             FROM folders LEFT JOIN notes ON notes.folder_id = folders.id AND notes.archived = 0
+             FROM folders LEFT JOIN notes ON notes.folder_id = folders.id
+                 AND notes.archived = 0 AND notes.is_shared = 0
+             WHERE folders.is_shared = 0
              GROUP BY folders.id ORDER BY folders.name COLLATE NOCASE, folders.id",
         )?;
         let folders = statement.query_map([], |row| {
@@ -346,6 +355,7 @@ impl Store {
             bail!(tr("storage.error.folder_name_required"));
         }
         let transaction = self.connection.unchecked_transaction()?;
+        ensure_folder_not_shared(&transaction, id)?;
         let changed = transaction.execute(
             "UPDATE folders SET name = ?2 WHERE id = ?1",
             params![id, name.trim()],
@@ -369,6 +379,7 @@ impl Store {
 
     pub fn delete_folder(&mut self, id: &str, mode: FolderDeleteMode) -> Result<()> {
         let transaction = self.connection.unchecked_transaction()?;
+        ensure_folder_not_shared(&transaction, id)?;
         let mut statement = transaction.prepare(
             "SELECT id, folder_id, content, title, updated_at, pinned, archived, account_id
              FROM notes WHERE folder_id = ?1 ORDER BY id",
@@ -931,7 +942,7 @@ impl Store {
              WHERE archived = ?1 AND (?2 IS NULL OR folder_id = ?2)
              AND (?3 = 0 OR folder_id IS NULL)
              AND (?4 = '' OR instr(lower(title || char(10) || content), lower(?4)) > 0)
-             AND account_id IS ?5
+             AND account_id IS ?5 AND is_shared = 0
              ORDER BY pinned DESC, updated_at DESC, id",
         )?;
         let notes = statement.query_map(
@@ -953,7 +964,7 @@ impl Store {
              WHERE archived = ?1 AND (?2 IS NULL OR folder_id = ?2)
              AND (?3 = 0 OR folder_id IS NULL)
              AND (?4 = '' OR instr(lower(title || char(10) || content), lower(?4)) > 0)
-             AND account_id IS ?5",
+             AND account_id IS ?5 AND is_shared = 0",
             params![
                 filter.archived,
                 filter.folder_id,
@@ -970,7 +981,7 @@ impl Store {
             .connection
             .query_row(
                 "SELECT id, folder_id, content, title, updated_at, pinned, archived, account_id
-             FROM notes WHERE id = ?1",
+             FROM notes WHERE id = ?1 AND is_shared = 0",
                 [id],
                 note_from_row,
             )
@@ -1066,11 +1077,16 @@ impl Store {
             )?;
             if !protected.contains(&id) {
                 transaction.execute(
-                    "INSERT INTO folders (id, account_id, name) VALUES (?1, ?2, ?3)
-                     ON CONFLICT(id) DO UPDATE SET name = excluded.name",
-                    params![id, account_id, folder.name],
+                    "INSERT INTO folders (id, account_id, name, is_shared) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(id) DO UPDATE SET name = excluded.name,
+                         is_shared = excluded.is_shared",
+                    params![id, account_id, folder.name, folder.is_shared],
                 )?;
             }
+            transaction.execute(
+                "UPDATE folders SET is_shared = ?3 WHERE id = ?1 AND account_id = ?2",
+                params![id, account_id, folder.is_shared],
+            )?;
             let exists: bool = transaction.query_row(
                 "SELECT EXISTS(SELECT 1 FROM folders WHERE id = ?1 AND account_id = ?2)",
                 params![id, account_id],
@@ -1102,6 +1118,10 @@ impl Store {
                 },
                 None => None,
             };
+            transaction.execute(
+                "UPDATE notes SET is_shared = ?3 WHERE id = ?1 AND account_id = ?2",
+                params![id, account_id, memo.is_shared],
+            )?;
             let remote_state = SyncedNoteState {
                 content: memo.content.clone(),
                 folder_id: folder_id.clone(),
@@ -1170,13 +1190,14 @@ impl Store {
             }
             let updated_at = memo.updated_at.unwrap_or_default();
             transaction.execute(
-                "INSERT INTO notes (id, account_id, folder_id, content, title, updated_at, pinned, archived)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "INSERT INTO notes (id, account_id, folder_id, content, title, updated_at, pinned, archived, is_shared)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(id) DO UPDATE SET folder_id = excluded.folder_id,
                      content = excluded.content, title = excluded.title,
-                     updated_at = excluded.updated_at, pinned = excluded.pinned, archived = excluded.archived",
+                     updated_at = excluded.updated_at, pinned = excluded.pinned,
+                     archived = excluded.archived, is_shared = excluded.is_shared",
                 params![id, account_id, folder_id, memo.content, memo::editor_parts(&memo.content).0,
-                    updated_at, memo.pinned, memo.archived],
+                    updated_at, memo.pinned, memo.archived, memo.is_shared],
             )?;
             save_note_sync_base(&transaction, account_id, &id, &remote_state)?;
         }
@@ -1622,26 +1643,41 @@ fn ensure_folder_in_account(
     folder_id: &str,
     account_id: Option<&str>,
 ) -> Result<()> {
-    let folder_account: Option<Option<String>> = connection
+    let folder_account: Option<(Option<String>, bool)> = connection
         .query_row(
-            "SELECT account_id FROM folders WHERE id = ?1",
+            "SELECT account_id, is_shared FROM folders WHERE id = ?1",
             [folder_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
     match folder_account {
         None => bail!(tr("storage.error.folder_missing")),
-        Some(folder_account) if folder_account.as_deref() != account_id => {
+        Some((folder_account, _)) if folder_account.as_deref() != account_id => {
             bail!(tr("storage.error.folder_account_mismatch"))
         }
-        Some(_) => Ok(()),
+        Some((_, true)) => bail!(tr("storage.error.folder_missing")),
+        Some((_, false)) => Ok(()),
     }
+}
+
+fn ensure_folder_not_shared(connection: &Connection, folder_id: &str) -> Result<()> {
+    let is_shared: Option<bool> = connection
+        .query_row(
+            "SELECT is_shared FROM folders WHERE id = ?1",
+            [folder_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if is_shared.unwrap_or(true) {
+        bail!(tr("storage.error.folder_missing"));
+    }
+    Ok(())
 }
 
 fn load_note(connection: &Connection, id: &str) -> Result<Note> {
     Ok(connection.query_row(
         "SELECT id, folder_id, content, title, updated_at, pinned, archived, account_id
-         FROM notes WHERE id = ?1",
+         FROM notes WHERE id = ?1 AND is_shared = 0",
         [id],
         note_from_row,
     )?)
@@ -1737,6 +1773,7 @@ mod tests {
             folder_id: None,
             pinned: false,
             archived: false,
+            is_shared: false,
             updated_at: None,
         };
         store.import_backend_memo("one", &remote)?;
@@ -1770,6 +1807,7 @@ mod tests {
             folder_id: None,
             pinned: false,
             archived: false,
+            is_shared: false,
             updated_at: Some(1),
         };
         store.import_backend_memo("one", &remote)?;
@@ -1804,6 +1842,7 @@ mod tests {
             folder_id: None,
             pinned: false,
             archived: false,
+            is_shared: false,
             updated_at: Some(1),
         };
         store.import_backend_memo("one", &remote)?;
@@ -1872,6 +1911,7 @@ mod tests {
             folder_id: None,
             pinned: false,
             archived: false,
+            is_shared: false,
             updated_at: Some(1),
         };
         store.import_backend_memo("one", &remote)?;
@@ -1916,6 +1956,7 @@ mod tests {
             folder_id: None,
             pinned: false,
             archived: false,
+            is_shared: false,
             updated_at: Some(1),
         };
         store.import_backend_memo("one", &remote)?;
@@ -1949,6 +1990,7 @@ mod tests {
             folder_id: None,
             pinned: false,
             archived: false,
+            is_shared: false,
             updated_at: Some(1),
         };
         store.import_backend_memo("one", &remote)?;
@@ -1989,6 +2031,7 @@ mod tests {
             folder_id: None,
             pinned: false,
             archived: true,
+            is_shared: false,
             updated_at: Some(1),
         };
         store.import_backend_memo("one", &remote)?;
@@ -2033,6 +2076,7 @@ mod tests {
             folder_id: None,
             pinned: false,
             archived: true,
+            is_shared: false,
             updated_at: Some(1),
         };
         store.import_backend_memo("one", &remote)?;
@@ -2072,6 +2116,7 @@ mod tests {
             folder_id: None,
             pinned: false,
             archived: true,
+            is_shared: false,
             updated_at: Some(1),
         };
         store.import_backend_memo("one", &remote)?;
@@ -2120,7 +2165,7 @@ mod tests {
             store
                 .connection
                 .pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(schema_version, 11);
+        assert_eq!(schema_version, 12);
         assert_eq!(store.folders()?[0].count, 1);
         let note = store.note(&id)?.unwrap();
         assert_eq!(note.content, content);
@@ -2134,9 +2179,11 @@ mod tests {
         let path = directory.path().join("notes.sqlite3");
         {
             let store = Store::open(&path)?;
-            store
-                .connection
-                .execute_batch("ALTER TABLE sync_conflicts DROP COLUMN local_deleted;")?;
+            store.connection.execute_batch(
+                "ALTER TABLE sync_conflicts DROP COLUMN local_deleted;
+                     ALTER TABLE folders DROP COLUMN is_shared;
+                     ALTER TABLE notes DROP COLUMN is_shared;",
+            )?;
             store.connection.pragma_update(None, "user_version", 10)?;
         }
 
@@ -2146,7 +2193,7 @@ mod tests {
             store
                 .connection
                 .pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(schema_version, 11);
+        assert_eq!(schema_version, 12);
         assert!(has_column(
             &store.connection,
             "sync_conflicts",
@@ -2171,6 +2218,7 @@ mod tests {
         let folders = vec![memo::MemoFolder {
             id: "spaces/work".to_owned(),
             name: "Werk".to_owned(),
+            is_shared: false,
         }];
         let mut memos = vec![memo::Memo {
             id: "memos/remote-one".to_owned(),
@@ -2179,6 +2227,7 @@ mod tests {
             folder_id: Some("spaces/work".to_owned()),
             pinned: true,
             archived: false,
+            is_shared: false,
             updated_at: Some(1791633600000),
         }];
         for account_id in ["one", "two"] {
@@ -2266,12 +2315,99 @@ mod tests {
     }
 
     #[test]
+    fn shared_memos_resources_are_hidden_without_deleting_cached_data() -> Result<()> {
+        let mut store = Store::open(":memory:")?;
+        store.add_backend_account("one", "Werk", "memos", "https://memos.example.com")?;
+        let folders = [
+            memo::MemoFolder {
+                id: "spaces/personal".to_owned(),
+                name: "Persoonlijk".to_owned(),
+                is_shared: false,
+            },
+            memo::MemoFolder {
+                id: "spaces/team".to_owned(),
+                name: "Team".to_owned(),
+                is_shared: true,
+            },
+        ];
+        let memos = [
+            memo::Memo {
+                id: "memos/private".to_owned(),
+                content: "Privé".to_owned(),
+                title: None,
+                folder_id: Some("spaces/personal".to_owned()),
+                pinned: false,
+                archived: false,
+                is_shared: false,
+                updated_at: None,
+            },
+            memo::Memo {
+                id: "memos/team-private".to_owned(),
+                content: "Notitie in gedeelde space".to_owned(),
+                title: None,
+                folder_id: Some("spaces/team".to_owned()),
+                pinned: false,
+                archived: false,
+                is_shared: true,
+                updated_at: None,
+            },
+            memo::Memo {
+                id: "memos/protected".to_owned(),
+                content: "Beschermde notitie".to_owned(),
+                title: None,
+                folder_id: None,
+                pinned: false,
+                archived: false,
+                is_shared: true,
+                updated_at: None,
+            },
+        ];
+        store.import_backend_snapshot("one", &folders, &memos)?;
+
+        let visible_folders = store.folders()?;
+        assert_eq!(visible_folders.len(), 1);
+        assert_eq!(visible_folders[0].name, "Persoonlijk");
+        let visible_notes = store.notes(&NoteFilter {
+            account_id: Some("one".to_owned()),
+            ..Default::default()
+        })?;
+        assert_eq!(visible_notes.len(), 1);
+        assert_eq!(visible_notes[0].content, "Privé");
+        assert!(store.note("memos/team-private")?.is_none());
+        assert!(store.note("memos/protected")?.is_none());
+        let shared_folder_id: String = store.connection.query_row(
+            "SELECT id FROM folders WHERE account_id = 'one' AND is_shared = 1 LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(
+            store
+                .rename_folder(&shared_folder_id, "Niet wijzigen")
+                .is_err()
+        );
+        assert!(
+            store
+                .delete_folder(&shared_folder_id, FolderDeleteMode::DeleteNotes)
+                .is_err()
+        );
+        let cached_count: i64 = store.connection.query_row(
+            "SELECT count(*) FROM notes WHERE account_id = 'one'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(cached_count, 3);
+        assert!(store.pending_sync_events(10)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn backend_import_rolls_back_invalid_data_and_rejects_disabled_accounts() -> Result<()> {
         let store = Store::open(":memory:")?;
         store.add_backend_account("one", "Werk", "memos", "https://memos.example.com")?;
         let folders = vec![memo::MemoFolder {
             id: "spaces/work".to_owned(),
             name: "Werk".to_owned(),
+            is_shared: false,
         }];
         let invalid = memo::Memo {
             id: "invalid".to_owned(),
@@ -2280,6 +2416,7 @@ mod tests {
             folder_id: None,
             pinned: false,
             archived: false,
+            is_shared: false,
             updated_at: None,
         };
         assert!(
@@ -2448,7 +2585,7 @@ mod tests {
         let version: i64 = store
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
         Ok(())
     }
 
@@ -2471,6 +2608,8 @@ mod tests {
             "DROP TABLE sync_conflicts;
              DROP TABLE backend_note_bases;
              DROP TABLE backend_resource_links;
+             ALTER TABLE folders DROP COLUMN is_shared;
+             ALTER TABLE notes DROP COLUMN is_shared;
              PRAGMA user_version = 6;",
         )?;
         drop(connection);
@@ -2481,7 +2620,7 @@ mod tests {
         let version: i64 = store
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
         Ok(())
     }
 

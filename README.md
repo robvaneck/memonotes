@@ -17,6 +17,11 @@ overwriting pending local changes or deletions. Local-only folders make no
 network requests. Results are cached in SQLite and displayed under the account; offline starts retain
 cached notes. Background fetching and autosaves are silent. API failures appear
 as libadwaita toasts; identical failures are not repeated until recovery.
+Only personal spaces with one member and `PRIVATE` notes are shown in Memonotes.
+Shared spaces and notes with `PROTECTED`, `PUBLIC`, or `SPACE` visibility are
+hidden from the folder and note lists. They remain in the local sync cache for
+reconciliation, but filtering them does not delete anything on the Memos server;
+Memonotes does not support managing shared content.
 Local edits are uploaded automatically in ordered batches through a durable
 outbox. The scheduler runs once per second; text edits delay uploads for the
 account until one second after the last edit. GNOME/GIO network detection
@@ -103,7 +108,7 @@ Background fetching, outbox uploads, and the API probe use this adapter. Cache i
 is transactional and does not enqueue outgoing events. Partial imports never
 infer deletion from a missing item. Full account refreshes directly GET missing
 previously synced memo IDs and reconcile only confirmed 404s; pending changes
-become conflicts instead of being discarded. Schema version 11 stores
+become conflicts instead of being discarded. Schema version 12 stores
 per-account remote-resource links, sync baselines and durable conflicts so the
 same remote name on two servers cannot mix notes or folders. The adapter also
 accepts existing `SyncEvent` values through `apply_event`:
@@ -139,8 +144,9 @@ live validation.
 ### Remaining API and sync gaps
 
 - Attachment upload/download/linking/deletion and offline image caching are missing.
-- Visibility is not retained in the local note model or editable; updates leave
-	server visibility unchanged. Space roles are not mapped into the folder model.
+- Full note visibility and space roles are not retained or editable. The cache
+	stores only whether a note or space is shared, for filtering. Updates leave
+	server visibility unchanged.
 - Space membership/invitations and API-based PAT management are not implemented
 	and are outside the current version 1 scope.
 - Explicit server list filters/sorting and live multi-client conflict testing remain open.
