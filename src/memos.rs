@@ -124,6 +124,30 @@ impl MemosClient {
             .context(tr("api.memos.error.invalid_note_response"))
     }
 
+    pub fn get_memo_if_exists(&self, id: &str) -> Result<Option<RemoteMemo>> {
+        let response = self
+            .client
+            .get(self.endpoint(&format!("memos/{id}"))?)
+            .bearer_auth(&self.token)
+            .send()
+            .context(tr("api.memos.error.server_unreachable"))?;
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            bail!(crate::tr_format!(
+                "api.memos.error.request_http_status",
+                status = status
+            ));
+        }
+        Ok(Some(
+            response
+                .json()
+                .context(tr("api.memos.error.invalid_note_response"))?,
+        ))
+    }
+
     pub fn list_spaces(&self) -> Result<Vec<RemoteSpace>> {
         self.list_pages("spaces", "spaces")
     }
@@ -447,6 +471,48 @@ mod tests {
                 if index == 2 { Some("next-page") } else { None }
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn get_memo_if_exists_only_treats_not_found_as_absence() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let server = thread::spawn(move || -> Result<Vec<String>> {
+            let mut requests = Vec::new();
+            for status in [404, 503] {
+                let (mut stream, _) = listener.accept()?;
+                let mut reader = BufReader::new(stream.try_clone()?);
+                let mut request = String::new();
+                reader.read_line(&mut request)?;
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header)?;
+                    if header == "\r\n" || header.is_empty() {
+                        break;
+                    }
+                }
+                requests.push(request);
+                stream.write_all(
+                    format!(
+                        "HTTP/1.1 {status} Mock\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )?;
+            }
+            Ok(requests)
+        });
+        let client = MemosClient::new(&format!("http://{address}"), "probe-token")?;
+
+        assert!(client.get_memo_if_exists("note-id")?.is_none());
+        assert!(client.get_memo_if_exists("note-id").is_err());
+
+        let requests = server.join().expect("mock server thread panicked")?;
+        assert!(
+            requests
+                .iter()
+                .all(|request| { request.starts_with("GET /api/v1/memos/note-id HTTP/1.1") })
+        );
         Ok(())
     }
 

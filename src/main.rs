@@ -5,7 +5,10 @@ use anyhow::{Context, Result};
 use libadwaita as adw;
 use memonotes::adapters::{BackendAdapter, MemosAdapter};
 use memonotes::i18n::tr;
-use memonotes::{BackendAccount, FolderDeleteMode, Note, NoteFilter, Store};
+use memonotes::{
+    BackendAccount, FolderDeleteMode, Note, NoteFilter, Store, SyncConflictResolution,
+    SyncedNoteState,
+};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -141,8 +144,11 @@ struct WindowState {
     loading_folders: RefCell<HashSet<(String, String)>>,
     uploading_accounts: RefCell<HashSet<String>>,
     upload_retry_at: RefCell<HashMap<String, Instant>>,
+    upload_retry_attempts: RefCell<HashMap<String, u32>>,
     refresh_after_upload: RefCell<HashSet<String>>,
     upload_after: RefCell<HashMap<String, Instant>>,
+    checked_outbox_revision: RefCell<HashMap<String, i64>>,
+    shown_sync_conflicts: RefCell<HashSet<String>>,
     note_color: RefCell<String>,
     undo_stack: RefCell<Vec<UndoOperation>>,
     active_filter: RefCell<ActiveNoteFilter>,
@@ -306,8 +312,11 @@ fn build_window(application: &Application) -> Result<()> {
         loading_folders: RefCell::new(HashSet::new()),
         uploading_accounts: RefCell::new(HashSet::new()),
         upload_retry_at: RefCell::new(HashMap::new()),
+        upload_retry_attempts: RefCell::new(HashMap::new()),
         refresh_after_upload: RefCell::new(HashSet::new()),
         upload_after: RefCell::new(HashMap::new()),
+        checked_outbox_revision: RefCell::new(HashMap::new()),
+        shown_sync_conflicts: RefCell::new(HashSet::new()),
         note_color: RefCell::new(note_color),
         undo_stack: RefCell::new(Vec::new()),
         active_filter: RefCell::new(initial_filter),
@@ -475,6 +484,39 @@ fn build_window(application: &Application) -> Result<()> {
     more_button.set_tooltip_text(Some(tr("menu.more")));
     let titlebar_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     titlebar_actions.append(&new_note);
+    let sync_button = icon_button("view-refresh-symbolic", tr("sync.refresh_now"));
+    sync_button.set_size_request(36, 36);
+    let sync_icon = gtk::Image::from_icon_name("view-refresh-symbolic");
+    sync_icon.set_pixel_size(16);
+    sync_icon.set_halign(gtk::Align::Center);
+    sync_icon.set_valign(gtk::Align::Center);
+    let sync_spinner = gtk::Spinner::new();
+    sync_spinner.set_size_request(16, 16);
+    sync_spinner.set_halign(gtk::Align::Center);
+    sync_spinner.set_valign(gtk::Align::Center);
+    sync_spinner.set_visible(false);
+    let sync_visual = gtk::Overlay::new();
+    sync_visual.set_size_request(16, 16);
+    sync_visual.set_halign(gtk::Align::Center);
+    sync_visual.set_valign(gtk::Align::Center);
+    sync_visual.set_child(Some(&sync_icon));
+    sync_visual.add_overlay(&sync_spinner);
+    sync_button.set_child(Some(&sync_visual));
+    let state_for_sync = Rc::clone(&state);
+    let window_for_sync = window.clone();
+    let button_for_sync = sync_button.clone();
+    let icon_for_sync = sync_icon.clone();
+    let spinner_for_sync = sync_spinner.clone();
+    sync_button.connect_clicked(move |_| {
+        request_manual_sync(
+            &state_for_sync,
+            &window_for_sync,
+            &button_for_sync,
+            &icon_for_sync,
+            &spinner_for_sync,
+        );
+    });
+    titlebar_actions.append(&sync_button);
     titlebar_actions.append(&more_button);
     navigation_header.pack_end(&titlebar_actions);
     install_app_menu(&window, &more_button, &state);
@@ -571,6 +613,87 @@ fn backend_available(state: &WindowState, account_id: &str) -> bool {
             .is_some_and(|deadline| *deadline > Instant::now())
 }
 
+fn sync_retry_delay(attempt: u32) -> Duration {
+    Duration::from_secs(30_u64.saturating_mul(1_u64 << attempt.min(5)).min(900))
+}
+
+fn outbox_revision_needs_refresh(checked: Option<i64>, current: i64) -> bool {
+    checked.is_none_or(|checked| checked < current)
+}
+
+fn next_sync_retry_delay(state: &WindowState, account_id: &str) -> Duration {
+    let mut attempts = state.upload_retry_attempts.borrow_mut();
+    let attempt = attempts.entry(account_id.to_owned()).or_default();
+    let delay = sync_retry_delay(*attempt);
+    *attempt = attempt.saturating_add(1);
+    delay
+}
+
+fn request_manual_sync(
+    state: &Rc<WindowState>,
+    window: &ApplicationWindow,
+    button: &gtk::Button,
+    icon: &gtk::Image,
+    spinner: &gtk::Spinner,
+) {
+    state.upload_retry_at.borrow_mut().clear();
+    state.upload_retry_attempts.borrow_mut().clear();
+    state.upload_after.borrow_mut().clear();
+    state.shown_sync_conflicts.borrow_mut().clear();
+    state.api_errors.borrow_mut().retain(|key, _| {
+        !key.starts_with("fetch:") && !key.starts_with("upload:") && key != "uploads"
+    });
+    spinner.start();
+    icon.set_visible(false);
+    spinner.set_visible(true);
+    button.set_sensitive(false);
+    load_backend_accounts(state, window);
+
+    let weak_state = Rc::downgrade(state);
+    let weak_button = button.downgrade();
+    let icon = icon.clone();
+    let spinner = spinner.clone();
+    api_timeout(state, Duration::from_millis(100), move || {
+        let (Some(state), Some(button)) = (weak_state.upgrade(), weak_button.upgrade()) else {
+            return gtk::glib::ControlFlow::Break;
+        };
+        let accounts = state.store.borrow().backend_accounts().unwrap_or_default();
+        let mut pending_events = false;
+        let mut status_error = false;
+        for account in accounts
+            .iter()
+            .filter(|account| account.enabled && account.provider == "memos")
+        {
+            match state.store.borrow().has_backend_events(&account.id) {
+                Ok(has_events) => pending_events |= has_events,
+                Err(_) => status_error = true,
+            }
+        }
+        let busy = !state.loading_accounts.borrow().is_empty()
+            || !state.loading_folders.borrow().is_empty()
+            || !state.uploading_accounts.borrow().is_empty();
+        let retry_waiting = state
+            .upload_retry_at
+            .borrow()
+            .values()
+            .chain(state.upload_after.borrow().values())
+            .any(|deadline| *deadline > Instant::now());
+        let api_error =
+            state.api_errors.borrow().keys().any(|key| {
+                key.starts_with("fetch:") || key.starts_with("upload:") || key == "uploads"
+            });
+        let online = adw::gio::NetworkMonitor::default().is_network_available();
+        if busy || (pending_events && online && !retry_waiting && !api_error && !status_error) {
+            return gtk::glib::ControlFlow::Continue;
+        }
+        spinner.stop();
+        spinner.set_visible(false);
+        icon.set_visible(true);
+        button.set_sensitive(true);
+        gtk::glib::ControlFlow::Break
+    });
+}
+
 fn handle_backend_error(
     state: &WindowState,
     account_id: &str,
@@ -584,7 +707,7 @@ fn handle_backend_error(
     {
         state.upload_retry_at.borrow_mut().insert(
             account_id.to_owned(),
-            Instant::now() + Duration::from_secs(30),
+            Instant::now() + next_sync_retry_delay(state, account_id),
         );
         state
             .refresh_after_upload
@@ -614,6 +737,8 @@ fn watch_backend_network(state: &Rc<WindowState>, window: &ApplicationWindow) {
             return;
         }
         state.upload_retry_at.borrow_mut().clear();
+        state.upload_retry_attempts.borrow_mut().clear();
+        state.checked_outbox_revision.borrow_mut().clear();
         state.upload_after.borrow_mut().clear();
         if let Err(error) = upload_backend_events(&state) {
             show_api_error(
@@ -696,8 +821,27 @@ fn upload_backend_events(state: &Rc<WindowState>) -> Result<()> {
                 .borrow()
                 .get(&account.id)
                 .is_some_and(|deadline| *deadline > Instant::now())
-            || !state.store.borrow().has_backend_events(&account.id)?
         {
+            continue;
+        }
+        if !state.store.borrow().has_backend_events(&account.id)? {
+            continue;
+        }
+        let current_revision = state.store.borrow().outbox_revision()?;
+        let checked_revision = state
+            .checked_outbox_revision
+            .borrow()
+            .get(&account.id)
+            .copied();
+        if outbox_revision_needs_refresh(checked_revision, current_revision) {
+            if let Some(window) = state
+                .note_list
+                .view
+                .root()
+                .and_downcast::<ApplicationWindow>()
+            {
+                load_backend_accounts(state, &window);
+            }
             continue;
         }
         let path = database_path()?;
@@ -737,6 +881,7 @@ fn upload_backend_events(state: &Rc<WindowState>) -> Result<()> {
                         set_account_online(&state, &account.id, true);
                     }
                     state.upload_retry_at.borrow_mut().remove(&account.id);
+                    state.upload_retry_attempts.borrow_mut().remove(&account.id);
                     state
                         .api_errors
                         .borrow_mut()
@@ -754,9 +899,19 @@ fn upload_backend_events(state: &Rc<WindowState>) -> Result<()> {
                 }
                 Err(error) => {
                     state
-                        .upload_retry_at
+                        .checked_outbox_revision
                         .borrow_mut()
-                        .insert(account.id.clone(), Instant::now() + Duration::from_secs(30));
+                        .remove(&account.id);
+                    let connection_error = !adw::gio::NetworkMonitor::default()
+                        .is_network_available()
+                        || memonotes::memos::is_connection_error(&error);
+                    if !connection_error {
+                        let retry_delay = next_sync_retry_delay(&state, &account.id);
+                        state
+                            .upload_after
+                            .borrow_mut()
+                            .insert(account.id.clone(), Instant::now() + retry_delay);
+                    }
                     handle_backend_error(
                         &state,
                         &account.id,
@@ -768,6 +923,16 @@ fn upload_backend_events(state: &Rc<WindowState>) -> Result<()> {
                         ),
                         &error,
                     );
+                    if !connection_error {
+                        if let Some(window) = state
+                            .note_list
+                            .view
+                            .root()
+                            .and_downcast::<ApplicationWindow>()
+                        {
+                            load_backend_accounts(&state, &window);
+                        }
+                    }
                 }
             }
             gtk::glib::ControlFlow::Break
@@ -796,27 +961,6 @@ fn load_backend_accounts(state: &Rc<WindowState>, window: &ApplicationWindow) {
         if !backend_available(state, &account.id) {
             continue;
         }
-        match state.store.borrow().has_backend_events(&account.id) {
-            Ok(true) => {
-                state
-                    .refresh_after_upload
-                    .borrow_mut()
-                    .insert(account.id.clone());
-                continue;
-            }
-            Ok(false) => {}
-            Err(error) => {
-                show_api_error(
-                    state,
-                    "accounts",
-                    &memonotes::tr_format!(
-                        "sync.error.read_status_failed",
-                        error = format!("{error:#}")
-                    ),
-                );
-                continue;
-            }
-        }
         if state.uploading_accounts.borrow().contains(&account.id) {
             state
                 .refresh_after_upload
@@ -831,6 +975,21 @@ fn load_backend_accounts(state: &Rc<WindowState>, window: &ApplicationWindow) {
         {
             continue;
         }
+        let refresh_outbox_revision = match state.store.borrow().outbox_revision() {
+            Ok(revision) => revision,
+            Err(error) => {
+                state.loading_accounts.borrow_mut().remove(&account.id);
+                show_api_error(
+                    state,
+                    "accounts",
+                    &memonotes::tr_format!(
+                        "sync.error.read_status_failed",
+                        error = format!("{error:#}")
+                    ),
+                );
+                continue;
+            }
+        };
         let (sender, receiver) = mpsc::channel();
         let worker_account = account.clone();
         thread::spawn(move || {
@@ -840,7 +999,17 @@ fn load_backend_accounts(state: &Rc<WindowState>, window: &ApplicationWindow) {
                 let adapter = MemosAdapter::new(&worker_account.server_url, &token)?;
                 let folders = adapter.list_folders()?;
                 let memos = adapter.list_memos()?;
-                Ok((folders, memos))
+                let store = Store::open(database_path()?)?;
+                let listed_names: Vec<_> = memos.iter().map(|memo| memo.id.clone()).collect();
+                let missing = store
+                    .note_resources_missing_from_snapshot(&worker_account.id, &listed_names)?;
+                let mut confirmed_deletions = Vec::new();
+                for (note_id, remote_name) in missing {
+                    if adapter.get_memo_if_exists(&remote_name)?.is_none() {
+                        confirmed_deletions.push(note_id);
+                    }
+                }
+                Ok((folders, memos, confirmed_deletions))
             })();
             let _ = sender.send(result);
         });
@@ -858,17 +1027,33 @@ fn load_backend_accounts(state: &Rc<WindowState>, window: &ApplicationWindow) {
                 }
             };
             state.loading_accounts.borrow_mut().remove(&account.id);
+            let mut outbox_changed_during_refresh = false;
             let result = (|| -> Result<()> {
                 let current = state.store.borrow().backend_accounts()?;
                 if !current.iter().any(|current| current == &account) {
                     return Ok(());
                 }
-                let (folders, memos) = result?;
+                let (folders, memos, confirmed_deletions) = result?;
                 set_account_online(&state, &account.id, true);
-                state
-                    .store
-                    .borrow()
-                    .import_backend_snapshot(&account.id, &folders, &memos)?;
+                state.store.borrow().import_complete_backend_snapshot(
+                    &account.id,
+                    &folders,
+                    &memos,
+                    &confirmed_deletions,
+                )?;
+                let current_revision = state.store.borrow().outbox_revision()?;
+                if current_revision == refresh_outbox_revision {
+                    state
+                        .checked_outbox_revision
+                        .borrow_mut()
+                        .insert(account.id.clone(), current_revision);
+                } else {
+                    state
+                        .checked_outbox_revision
+                        .borrow_mut()
+                        .remove(&account.id);
+                    outbox_changed_during_refresh = true;
+                }
                 populate_sidebar(&state, &window)?;
                 refresh_notes(&state)?;
                 let selected_id = state.note_id.borrow().clone();
@@ -889,9 +1074,25 @@ fn load_backend_accounts(state: &Rc<WindowState>, window: &ApplicationWindow) {
                     }
                 }
                 refresh_open_note_windows(&state);
+                show_next_sync_conflict(&state, &window, &account.id);
                 Ok(())
             })();
             if let Err(error) = result {
+                let connection_error = !adw::gio::NetworkMonitor::default().is_network_available()
+                    || memonotes::memos::is_connection_error(&error);
+                if !connection_error
+                    && state
+                        .store
+                        .borrow()
+                        .has_backend_events(&account.id)
+                        .unwrap_or(false)
+                {
+                    let retry_delay = next_sync_retry_delay(&state, &account.id);
+                    state
+                        .upload_after
+                        .borrow_mut()
+                        .insert(account.id.clone(), Instant::now() + retry_delay);
+                }
                 handle_backend_error(
                     &state,
                     &account.id,
@@ -905,11 +1106,17 @@ fn load_backend_accounts(state: &Rc<WindowState>, window: &ApplicationWindow) {
                 );
             } else {
                 state.upload_retry_at.borrow_mut().remove(&account.id);
+                if !state.upload_after.borrow().contains_key(&account.id) {
+                    state.upload_retry_attempts.borrow_mut().remove(&account.id);
+                }
                 state.refresh_after_upload.borrow_mut().remove(&account.id);
                 state
                     .api_errors
                     .borrow_mut()
                     .remove(&format!("fetch:{}", account.id));
+                if outbox_changed_during_refresh {
+                    load_backend_accounts(&state, &window);
+                }
             }
             gtk::glib::ControlFlow::Break
         });
@@ -1021,6 +1228,7 @@ fn refresh_backend_folder(
                 }
             }
             refresh_open_note_windows(&state);
+            show_next_sync_conflict(&state, &window, &account.id);
             Ok(())
         });
         let error_key = format!("fetch:folder:{folder_id}");
@@ -1147,6 +1355,9 @@ fn refresh_backend_note(state: &Rc<WindowState>, window: &ApplicationWindow, not
                 }
             }
             refresh_open_note_windows(&state);
+            if let Some(window) = weak_window.upgrade() {
+                show_next_sync_conflict(&state, &window, &account.id);
+            }
             Ok(())
         });
         if let Err(error) = result {
@@ -1168,6 +1379,142 @@ fn refresh_backend_note(state: &Rc<WindowState>, window: &ApplicationWindow, not
         }
         gtk::glib::ControlFlow::Break
     });
+}
+
+fn show_next_sync_conflict(state: &Rc<WindowState>, window: &ApplicationWindow, account_id: &str) {
+    let conflicts = match state.store.borrow().sync_conflicts(account_id) {
+        Ok(conflicts) => conflicts,
+        Err(error) => {
+            show_api_error(
+                state,
+                &format!("conflicts:{account_id}"),
+                &memonotes::tr_format!(
+                    "sync.error.read_local_status_failed",
+                    error = format!("{error:#}")
+                ),
+            );
+            return;
+        }
+    };
+    let Some(conflict) = conflicts.into_iter().find(|conflict| {
+        !state
+            .shown_sync_conflicts
+            .borrow()
+            .contains(&format!("{}:{}", conflict.account_id, conflict.note_id))
+    }) else {
+        return;
+    };
+    let conflict_key = format!("{}:{}", conflict.account_id, conflict.note_id);
+    state
+        .shown_sync_conflicts
+        .borrow_mut()
+        .insert(conflict_key.clone());
+
+    let local = if conflict.local_deleted {
+        tr("sync.conflict.local_deleted").to_owned()
+    } else {
+        conflict_version_text(state, &SyncedNoteState::from(&conflict.local))
+    };
+    let remote = match conflict.remote.as_ref() {
+        Some(version) => conflict_version_text(state, version),
+        None => tr("sync.conflict.remote_deleted").to_owned(),
+    };
+    let dialog = adw::AlertDialog::builder()
+        .heading(memonotes::tr_format!(
+            "sync.conflict.title",
+            note = conflict.local.title
+        ))
+        .body(memonotes::tr_format!(
+            "sync.conflict.body",
+            local = local,
+            remote = remote
+        ))
+        .build();
+    dialog.add_responses(&[
+        ("later", tr("action.cancel")),
+        ("keep_local", tr("sync.conflict.keep_local")),
+        ("keep_remote", tr("sync.conflict.keep_remote")),
+    ]);
+    dialog.set_default_response(Some("later"));
+    dialog.set_close_response("later");
+    dialog.set_response_appearance("keep_remote", adw::ResponseAppearance::Destructive);
+
+    let state = Rc::clone(state);
+    let dialog_window = window.clone();
+    let next_dialog_window = window.clone();
+    let account_id = conflict.account_id;
+    let note_id = conflict.note_id;
+    dialog.choose(
+        Some(&dialog_window),
+        None::<&adw::gio::Cancellable>,
+        move |response| {
+            let resolution = match response.as_str() {
+                "keep_local" => Some(SyncConflictResolution::KeepLocal),
+                "keep_remote" => Some(SyncConflictResolution::KeepRemote),
+                _ => None,
+            };
+            if let Some(resolution) = resolution {
+                let result =
+                    state
+                        .store
+                        .borrow()
+                        .resolve_sync_conflict(&account_id, &note_id, resolution);
+                if let Err(error) = result {
+                    show_api_error(
+                        &state,
+                        &format!("resolve-conflict:{conflict_key}"),
+                        &memonotes::tr_format!(
+                            "sync.error.resolve_conflict_failed",
+                            error = format!("{error:#}")
+                        ),
+                    );
+                } else {
+                    state
+                        .shown_sync_conflicts
+                        .borrow_mut()
+                        .remove(&conflict_key);
+                    let _ = refresh_notes(&state);
+                    refresh_open_note_windows(&state);
+                    if state.note_id.borrow().as_deref() == Some(note_id.as_str()) {
+                        if let Ok(Some(note)) = state.store.borrow().note(&note_id) {
+                            show_note(&state, &note);
+                        } else {
+                            *state.note_id.borrow_mut() = None;
+                            set_editor_text(&state, "");
+                        }
+                    }
+                }
+            }
+            show_next_sync_conflict(&state, &next_dialog_window, &account_id);
+        },
+    );
+}
+
+fn conflict_version_text(state: &WindowState, version: &SyncedNoteState) -> String {
+    let folders = state.store.borrow().folders().unwrap_or_default();
+    let folder = version
+        .folder_id
+        .as_deref()
+        .and_then(|folder_id| folders.iter().find(|folder| folder.id == folder_id))
+        .map_or_else(
+            || tr("folder.unfiled").to_owned(),
+            |folder| folder.name.clone(),
+        );
+    memonotes::tr_format!(
+        "sync.conflict.version",
+        content = version.content.clone(),
+        folder = folder,
+        pinned = tr(if version.pinned {
+            "sync.conflict.enabled"
+        } else {
+            "sync.conflict.disabled"
+        }),
+        archived = tr(if version.archived {
+            "sync.conflict.enabled"
+        } else {
+            "sync.conflict.disabled"
+        })
+    )
 }
 
 fn install_app_menu(
@@ -1403,6 +1750,23 @@ mod language_settings_tests {
         for (index, language) in memonotes::i18n::LANGUAGES.iter().enumerate() {
             assert_eq!(language_selection(Some(language)), index as u32 + 1);
         }
+    }
+
+    #[test]
+    fn retry_backoff_grows_and_caps_at_fifteen_minutes() {
+        assert_eq!(sync_retry_delay(0), Duration::from_secs(30));
+        assert_eq!(sync_retry_delay(1), Duration::from_secs(60));
+        assert_eq!(sync_retry_delay(2), Duration::from_secs(120));
+        assert_eq!(sync_retry_delay(5), Duration::from_secs(900));
+        assert_eq!(sync_retry_delay(20), Duration::from_secs(900));
+    }
+
+    #[test]
+    fn outbox_revision_must_be_compared_before_upload() {
+        assert!(outbox_revision_needs_refresh(None, 0));
+        assert!(outbox_revision_needs_refresh(Some(8), 9));
+        assert!(!outbox_revision_needs_refresh(Some(9), 9));
+        assert!(!outbox_revision_needs_refresh(Some(10), 9));
     }
 
     fn find_language_row(root: &gtk::Widget) -> Option<adw::ComboRow> {

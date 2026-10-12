@@ -1,7 +1,7 @@
 # Memonotes
 
 Memonotes is an early Linux/GNOME desktop app for local and Memos-backed notes.
-Status updated: 2026-10-10. The current GTK
+Status updated: 2026-10-12. The current GTK
 window has a three-pane layout, folder creation/navigation, note search, pinning,
 archive/restore, moving notes between folders, and pastel note colors backed by
 SQLite. Note colors adapt to light and dark appearance. Memos accounts can be
@@ -20,11 +20,14 @@ as libadwaita toasts; identical failures are not repeated until recovery.
 Local edits are uploaded automatically in ordered batches through a durable
 outbox. The scheduler runs once per second; text edits delay uploads for the
 account until one second after the last edit. GNOME/GIO network detection
-pauses automatic API calls while offline. Connection failures pause calls for
-that account and retry silently after 30 seconds; authentication and other API
-errors remain visible. When the network returns, synchronization resumes
-automatically: pending outbox events are sent before refreshing server content.
-There is no manual online/offline switch. Offline changes survive app restarts.
+pauses automatic API calls while offline. Temporary failures retry for that
+account with capped exponential backoff up to 15 minutes; authentication and
+other API errors remain visible. When the network returns, synchronization resumes
+automatically: full server state is fetched and compared before safe pending
+outbox events are uploaded. A **Sync now** control also starts a refresh and
+clears scheduled retry delays. Transient failures use capped exponential
+backoff. There is no manual online/offline switch. Offline changes survive app
+restarts.
 The editor shows the complete note without a separate title field. The first
 line uses H1 styling without displaying its Markdown heading marker.
 Saving normalizes the first line as a Markdown H1 (`# Title`), so the UI and
@@ -36,8 +39,10 @@ local notes with separate titles are combined on their next edit without
 discarding the body.
 The editor is currently plain text;
 WYSIWYG formatting and images are not implemented yet. Basic two-way text
-synchronization exists, but conflict handling and safe retries after uncertain
-create results are still missing.
+synchronization detects divergent local/server edits and keeps both versions
+until the user chooses which to keep. Stable-ID creates are reconciled after
+errors or HTTP 409 by fetching that ID and acknowledging only an exact match.
+Automatic merging and live multi-client race validation remain open.
 
 Notes can be opened in separate editable windows. Keyboard shortcuts include
 new note/folder, search, close, quit, and undo for archive operations.
@@ -45,6 +50,11 @@ Archived notes can be permanently deleted using the trash button or Delete key
 after confirmation. Permanent deletion cannot be undone. Memos-backed notes
 queue a `NoteDeleted` adapter event that deletes the remote memo; offline or
 failed requests remain queued until synchronization succeeds.
+Deleting a folder offers three choices: cancel, delete the folder while keeping
+its notes, or delete the folder and all its notes. Kept notes are moved out of
+the Memos space before its delete event is queued; when deleting notes too,
+their delete events are queued first. This prevents the remote space deletion
+from unexpectedly deleting notes the user chose to keep.
 The note list supports multiple selection and dragging notes into folders.
 It uses GTK's native virtualized `ListView`: only visible rows and an offscreen
 buffer have widgets, and sidebar resizing keeps text at its normal font size.
@@ -90,9 +100,11 @@ Backend calls go through `BackendAdapter`, implemented by `MemosAdapter`.
 The adapter returns backend-independent `Memo` and `MemoFolder` models;
 Memos spaces map to folders. HTTP and API response types stay in `MemosClient`.
 Background fetching, outbox uploads, and the API probe use this adapter. Cache import
-is transactional and does not enqueue outgoing events. Pending local edits,
-renames, and deletions are preserved; absent server items are not deleted from
-the cache. Schema version 9 stores per-account remote-resource links so the
+is transactional and does not enqueue outgoing events. Partial imports never
+infer deletion from a missing item. Full account refreshes directly GET missing
+previously synced memo IDs and reconcile only confirmed 404s; pending changes
+become conflicts instead of being discarded. Schema version 11 stores
+per-account remote-resource links, sync baselines and durable conflicts so the
 same remote name on two servers cannot mix notes or folders. The adapter also
 accepts existing `SyncEvent` values through `apply_event`:
 
@@ -100,7 +112,7 @@ accepts existing `SyncEvent` values through `apply_event`:
 | --- | --- |
 | `FolderCreated` | `POST /api/v1/spaces?spaceId={id}` |
 | `FolderUpdated` | `PATCH /api/v1/spaces/{id}`, mask `title` |
-| `FolderDeleted` | Blocked: deleting a space also deletes its memos |
+| `FolderDeleted` | `DELETE /api/v1/spaces/{id}`, after queued note moves/deletions |
 | `NoteCreated`, `NoteRestored` | `POST /api/v1/memos?memoId={id}`, visibility `PRIVATE` |
 | `NoteUpdated` | `PATCH /api/v1/memos/{id}`, mask `content,pinned,state,space` |
 | `NoteArchived`, `NoteUnarchived` | `PATCH /api/v1/memos/{id}`, mask `state` |
@@ -117,24 +129,21 @@ Local-only snapshots are rejected by the adapter and are not uploaded by the
 worker. The worker routes events by account, translates local IDs through the
 stored resource links, coalesces consecutive updates for the same note, and
 acknowledges only successfully sent batches. Failed requests leave events in
-the outbox. The UI retries failed uploads, but HTTP 409 is not treated as a
-successful create and uncertain create outcomes are not reconciled yet.
+the outbox. After a create error, the adapter fetches the stable ID and only
+acknowledges it when the existing note matches the requested content and state.
 `NoteRestored` recreates the snapshot, not deleted attachments, relations, or
-shares. This mapping is mock-server tested, not yet verified against a live
-Memos installation.
+shares. The Memos integration has been tested successfully against the target
+server. Attachment behavior and concurrent-update handling still need separate
+live validation.
 
 ### Remaining API and sync gaps
 
-- Server-side folder deletion is deliberately blocked. The local delete action
-	moves cached notes to Unfiled and queues a folder deletion; for linked remote
-	folders that event fails and can block later uploads for the account.
 - Attachment upload/download/linking/deletion and offline image caching are missing.
 - Visibility is not retained in the local note model or editable; updates leave
 	server visibility unchanged. Space roles are not mapped into the folder model.
 - Space membership/invitations and API-based PAT management are not implemented
 	and are outside the current version 1 scope.
-- Remote deletion reconciliation, conflict resolution, explicit server list
-	filters/sorting, and safe recovery from lost create responses remain open.
+- Explicit server list filters/sorting and live multi-client conflict testing remain open.
 
 ## Fedora build prerequisites
 

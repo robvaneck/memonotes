@@ -92,6 +92,41 @@ pub struct NoteSnapshot {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct SyncedNoteState {
+    pub content: String,
+    pub folder_id: Option<String>,
+    pub pinned: bool,
+    pub archived: bool,
+}
+
+impl From<&NoteSnapshot> for SyncedNoteState {
+    fn from(note: &NoteSnapshot) -> Self {
+        Self {
+            content: note.content.clone(),
+            folder_id: note.folder_id.clone(),
+            pinned: note.pinned,
+            archived: note.archived,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct SyncConflict {
+    pub account_id: String,
+    pub note_id: String,
+    pub base: Option<SyncedNoteState>,
+    pub local: NoteSnapshot,
+    pub local_deleted: bool,
+    pub remote: Option<SyncedNoteState>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncConflictResolution {
+    KeepLocal,
+    KeepRemote,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", content = "snapshot", rename_all = "snake_case")]
 pub enum SyncEvent {
     FolderCreated { folder: FolderSnapshot },
@@ -139,7 +174,7 @@ impl Store {
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version > 9 {
+        if version > 11 {
             bail!(tr("storage.error.newer_schema_version"));
         }
         if version == 0 {
@@ -208,6 +243,33 @@ impl Store {
                 PRIMARY KEY (account_id, remote_name)
             );",
         )?;
+        if version < 10 {
+            connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS backend_note_bases (
+                    account_id TEXT NOT NULL REFERENCES backend_accounts(id) ON DELETE CASCADE,
+                    note_id TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    PRIMARY KEY (account_id, note_id)
+                );
+                CREATE TABLE IF NOT EXISTS sync_conflicts (
+                    account_id TEXT NOT NULL REFERENCES backend_accounts(id) ON DELETE CASCADE,
+                    note_id TEXT NOT NULL,
+                    base_state TEXT,
+                    local_snapshot TEXT NOT NULL,
+                    remote_state TEXT,
+                    remote_deleted INTEGER NOT NULL DEFAULT 0,
+                    detected_at INTEGER NOT NULL,
+                    PRIMARY KEY (account_id, note_id)
+                );
+                PRAGMA user_version = 10;",
+            )?;
+        }
+        if version < 11 {
+            connection.execute_batch(
+                "ALTER TABLE sync_conflicts ADD COLUMN local_deleted INTEGER NOT NULL DEFAULT 0;
+                 PRAGMA user_version = 11;",
+            )?;
+        }
         if !has_column(&connection, "backend_accounts", "enabled")? {
             connection.execute_batch(
                 "ALTER TABLE backend_accounts ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1;",
@@ -226,9 +288,6 @@ impl Store {
             "CREATE INDEX IF NOT EXISTS folders_account ON folders(account_id);
              CREATE INDEX IF NOT EXISTS notes_account ON notes(account_id);",
         )?;
-        if version < 9 {
-            connection.pragma_update(None, "user_version", 9)?;
-        }
         Ok(Self { connection })
     }
 
@@ -593,6 +652,27 @@ impl Store {
             if owner.as_deref() != Some(account.id.as_str()) {
                 continue;
             }
+            let note_id = match &event {
+                SyncEvent::NoteCreated { note }
+                | SyncEvent::NoteRestored { note }
+                | SyncEvent::NoteUpdated { note }
+                | SyncEvent::NoteArchived { note }
+                | SyncEvent::NoteUnarchived { note }
+                | SyncEvent::NoteDeleted { note } => Some(note.id.as_str()),
+                SyncEvent::FolderCreated { .. }
+                | SyncEvent::FolderUpdated { .. }
+                | SyncEvent::FolderDeleted { .. } => None,
+            };
+            if let Some(note_id) = note_id {
+                let has_conflict: bool = self.connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sync_conflicts WHERE account_id = ?1 AND note_id = ?2)",
+                    params![account.id, note_id],
+                    |row| row.get(0),
+                )?;
+                if has_conflict {
+                    continue;
+                }
+            }
             if let Some((sequences, previous)) = batches.last_mut() {
                 if matches!((&*previous, &event),
                     (SyncEvent::NoteUpdated { note: before }, SyncEvent::NoteUpdated { note: after })
@@ -620,6 +700,19 @@ impl Store {
                 &event,
                 SyncEvent::NoteCreated { .. } | SyncEvent::NoteRestored { .. }
             );
+            let note_sync_state = match &event {
+                SyncEvent::NoteCreated { note }
+                | SyncEvent::NoteRestored { note }
+                | SyncEvent::NoteUpdated { note }
+                | SyncEvent::NoteArchived { note }
+                | SyncEvent::NoteUnarchived { note } => {
+                    Some((note.id.clone(), Some(SyncedNoteState::from(note))))
+                }
+                SyncEvent::NoteDeleted { note } => Some((note.id.clone(), None)),
+                SyncEvent::FolderCreated { .. }
+                | SyncEvent::FolderUpdated { .. }
+                | SyncEvent::FolderDeleted { .. } => None,
+            };
             let created_link = match &mut event {
                 SyncEvent::FolderCreated { folder } => {
                     let local_id = folder.id.clone();
@@ -655,6 +748,16 @@ impl Store {
             };
             adapter.apply_event(&event)?;
             let transaction = self.connection.unchecked_transaction()?;
+            if let Some((note_id, state)) = note_sync_state {
+                if let Some(state) = state {
+                    save_note_sync_base(&transaction, &account.id, &note_id, &state)?;
+                } else {
+                    transaction.execute(
+                        "DELETE FROM backend_note_bases WHERE account_id = ?1 AND note_id = ?2",
+                        params![account.id, note_id],
+                    )?;
+                }
+            }
             if let Some((local_id, remote_name)) = created_link {
                 transaction.execute(
                     "INSERT INTO backend_resource_links (account_id, remote_name, local_id) VALUES (?1, ?2, ?3)
@@ -677,7 +780,10 @@ impl Store {
     pub fn has_backend_events(&self, account_id: &str) -> Result<bool> {
         Ok(self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM sync_outbox
-             WHERE json_extract(payload, '$.snapshot.note.account_id') = ?1
+             WHERE (json_extract(payload, '$.snapshot.note.account_id') = ?1
+                AND NOT EXISTS(SELECT 1 FROM sync_conflicts
+                    WHERE account_id = ?1
+                    AND note_id = json_extract(sync_outbox.payload, '$.snapshot.note.id')))
                 OR json_extract(payload, '$.snapshot.folder.account_id') = ?1
                 OR (json_extract(payload, '$.type') = 'folder_deleted' AND EXISTS(
                     SELECT 1 FROM backend_resource_links WHERE account_id = ?1
@@ -877,6 +983,26 @@ impl Store {
         folders: &[memo::MemoFolder],
         memos: &[memo::Memo],
     ) -> Result<()> {
+        self.import_backend_snapshot_inner(account_id, folders, memos, &[])
+    }
+
+    pub fn import_complete_backend_snapshot(
+        &self,
+        account_id: &str,
+        folders: &[memo::MemoFolder],
+        memos: &[memo::Memo],
+        confirmed_remote_deletions: &[String],
+    ) -> Result<()> {
+        self.import_backend_snapshot_inner(account_id, folders, memos, confirmed_remote_deletions)
+    }
+
+    fn import_backend_snapshot_inner(
+        &self,
+        account_id: &str,
+        folders: &[memo::MemoFolder],
+        memos: &[memo::Memo],
+        confirmed_remote_deletions: &[String],
+    ) -> Result<()> {
         let transaction = self.connection.unchecked_transaction()?;
         let valid_account: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM backend_accounts WHERE id = ?1 AND enabled = 1 AND provider = 'memos')",
@@ -886,7 +1012,11 @@ impl Store {
             bail!(tr("api.memos.error.account_removed_or_disabled"));
         }
         let mut protected = HashSet::new();
-        let mut statement = transaction.prepare("SELECT payload FROM sync_outbox")?;
+        let mut pending_note_ids = HashSet::new();
+        let mut pending_note_deletions = HashSet::new();
+        let mut pending_note_deletion_snapshots = HashMap::new();
+        let mut statement =
+            transaction.prepare("SELECT payload FROM sync_outbox ORDER BY sequence")?;
         let payloads = statement.query_map([], |row| row.get::<_, String>(0))?;
         for payload in payloads {
             let event: SyncEvent = serde_json::from_str(&payload?)?;
@@ -902,11 +1032,22 @@ impl Store {
                 | SyncEvent::NoteUpdated { note }
                 | SyncEvent::NoteArchived { note }
                 | SyncEvent::NoteUnarchived { note }
-                | SyncEvent::NoteDeleted { note }
                 | SyncEvent::NoteRestored { note } => {
                     if note.account_id.as_deref() != Some(account_id) {
                         continue;
                     }
+                    pending_note_ids.insert(note.id.clone());
+                    pending_note_deletions.remove(&note.id);
+                    pending_note_deletion_snapshots.remove(&note.id);
+                    note.id
+                }
+                SyncEvent::NoteDeleted { note } => {
+                    if note.account_id.as_deref() != Some(account_id) {
+                        continue;
+                    }
+                    pending_note_ids.insert(note.id.clone());
+                    pending_note_deletions.insert(note.id.clone());
+                    pending_note_deletion_snapshots.insert(note.id.clone(), note.clone());
                     note.id
                 }
             };
@@ -948,9 +1089,6 @@ impl Store {
                 "memos",
                 &protected,
             )?;
-            if protected.contains(&id) {
-                continue;
-            }
             let folder_id = match memo.folder_id.as_deref() {
                 Some(name) => match folder_ids.get(name) {
                     Some(id) => Some(id.clone()),
@@ -964,6 +1102,72 @@ impl Store {
                 },
                 None => None,
             };
+            let remote_state = SyncedNoteState {
+                content: memo.content.clone(),
+                folder_id: folder_id.clone(),
+                pinned: memo.pinned,
+                archived: memo.archived,
+            };
+            let has_conflict: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sync_conflicts WHERE account_id = ?1 AND note_id = ?2)",
+                params![account_id, id],
+                |row| row.get(0),
+            )?;
+            if has_conflict {
+                update_sync_conflict_remote(&transaction, account_id, &id, Some(&remote_state))?;
+                continue;
+            }
+            if pending_note_deletions.contains(&id) {
+                let base = load_note_sync_base(&transaction, account_id, &id)?;
+                if base.as_ref() != Some(&remote_state) {
+                    if let Some(local_deletion) = pending_note_deletion_snapshots.get(&id) {
+                        save_sync_conflict(
+                            &transaction,
+                            account_id,
+                            &id,
+                            base.as_ref(),
+                            local_deletion,
+                            Some(&remote_state),
+                            true,
+                        )?;
+                    }
+                }
+                continue;
+            }
+            let existing = transaction
+                .query_row(
+                    "SELECT id, folder_id, content, title, updated_at, pinned, archived, account_id
+                     FROM notes WHERE id = ?1 AND account_id = ?2",
+                    params![id, account_id],
+                    note_from_row,
+                )
+                .optional()?;
+            let base = load_note_sync_base(&transaction, account_id, &id)?;
+            if pending_note_ids.contains(&id) {
+                if let Some(existing) = &existing {
+                    let local_snapshot = NoteSnapshot::from(existing.clone());
+                    let local_state = SyncedNoteState::from(&local_snapshot);
+                    if base.as_ref() == Some(&remote_state) {
+                        continue;
+                    }
+                    if local_state == remote_state {
+                        clear_note_sync_events(&transaction, account_id, &id)?;
+                    } else if base.as_ref() != Some(&local_state) {
+                        save_sync_conflict(
+                            &transaction,
+                            account_id,
+                            &id,
+                            base.as_ref(),
+                            &local_snapshot,
+                            Some(&remote_state),
+                            false,
+                        )?;
+                        continue;
+                    } else {
+                        clear_note_sync_events(&transaction, account_id, &id)?;
+                    }
+                }
+            }
             let updated_at = memo.updated_at.unwrap_or_default();
             transaction.execute(
                 "INSERT INTO notes (id, account_id, folder_id, content, title, updated_at, pinned, archived)
@@ -974,6 +1178,55 @@ impl Store {
                 params![id, account_id, folder_id, memo.content, memo::editor_parts(&memo.content).0,
                     updated_at, memo.pinned, memo.archived],
             )?;
+            save_note_sync_base(&transaction, account_id, &id, &remote_state)?;
+        }
+        for note_id in confirmed_remote_deletions {
+            let has_conflict: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sync_conflicts WHERE account_id = ?1 AND note_id = ?2)",
+                params![account_id, note_id],
+                |row| row.get(0),
+            )?;
+            if has_conflict {
+                update_sync_conflict_remote(&transaction, account_id, note_id, None)?;
+                continue;
+            }
+            let local = transaction
+                .query_row(
+                    "SELECT id, folder_id, content, title, updated_at, pinned, archived, account_id
+                     FROM notes WHERE id = ?1 AND account_id = ?2",
+                    params![note_id, account_id],
+                    note_from_row,
+                )
+                .optional()?;
+            let base = load_note_sync_base(&transaction, account_id, note_id)?;
+            if pending_note_ids.contains(note_id) {
+                if let Some(local) = local {
+                    save_sync_conflict(
+                        &transaction,
+                        account_id,
+                        note_id,
+                        base.as_ref(),
+                        &NoteSnapshot::from(local),
+                        None,
+                        false,
+                    )?;
+                } else {
+                    clear_note_sync_events(&transaction, account_id, note_id)?;
+                    transaction.execute(
+                        "DELETE FROM backend_note_bases WHERE account_id = ?1 AND note_id = ?2",
+                        params![account_id, note_id],
+                    )?;
+                }
+            } else {
+                transaction.execute(
+                    "DELETE FROM notes WHERE id = ?1 AND account_id = ?2",
+                    params![note_id, account_id],
+                )?;
+                transaction.execute(
+                    "DELETE FROM backend_note_bases WHERE account_id = ?1 AND note_id = ?2",
+                    params![account_id, note_id],
+                )?;
+            }
         }
         transaction.commit()?;
         Ok(())
@@ -983,12 +1236,287 @@ impl Store {
         self.import_backend_snapshot(account_id, &[], std::slice::from_ref(memo))
     }
 
+    pub fn sync_conflicts(&self, account_id: &str) -> Result<Vec<SyncConflict>> {
+        let mut statement = self.connection.prepare(
+            "SELECT note_id, base_state, local_snapshot, remote_state, local_deleted
+             FROM sync_conflicts WHERE account_id = ?1 ORDER BY detected_at, note_id",
+        )?;
+        let rows = statement.query_map([account_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, bool>(4)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (note_id, base, local, remote, local_deleted) = row?;
+            Ok(SyncConflict {
+                account_id: account_id.to_owned(),
+                note_id,
+                base: base.map(|value| serde_json::from_str(&value)).transpose()?,
+                local: serde_json::from_str(&local)?,
+                local_deleted,
+                remote: remote
+                    .map(|value| serde_json::from_str(&value))
+                    .transpose()?,
+            })
+        })
+        .collect()
+    }
+
+    pub fn note_resources_missing_from_snapshot(
+        &self,
+        account_id: &str,
+        listed_remote_names: &[String],
+    ) -> Result<Vec<(String, String)>> {
+        let listed: HashSet<_> = listed_remote_names.iter().map(String::as_str).collect();
+        let mut statement = self.connection.prepare(
+            "SELECT bases.note_id, links.remote_name
+             FROM backend_note_bases AS bases
+             JOIN backend_resource_links AS links
+               ON links.account_id = bases.account_id AND links.local_id = bases.note_id
+             WHERE bases.account_id = ?1 AND links.remote_name LIKE 'memos/%'",
+        )?;
+        let rows = statement.query_map([account_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.filter_map(|row| match row {
+            Ok((note_id, remote_name)) if !listed.contains(remote_name.as_str()) => {
+                Some(Ok((note_id, remote_name)))
+            }
+            Ok(_) => None,
+            Err(error) => Some(Err(error.into())),
+        })
+        .collect()
+    }
+
+    pub fn resolve_sync_conflict(
+        &self,
+        account_id: &str,
+        note_id: &str,
+        resolution: SyncConflictResolution,
+    ) -> Result<()> {
+        let conflict = self
+            .sync_conflicts(account_id)?
+            .into_iter()
+            .find(|conflict| conflict.note_id == note_id)
+            .context(tr("sync.error.conflict_missing"))?;
+        let transaction = self.connection.unchecked_transaction()?;
+        match resolution {
+            SyncConflictResolution::KeepLocal => {
+                if let Some(remote) = &conflict.remote {
+                    save_note_sync_base(&transaction, account_id, note_id, remote)?;
+                    if conflict.local_deleted {
+                        clear_note_sync_events(&transaction, account_id, note_id)?;
+                        append_sync_event(
+                            &transaction,
+                            SyncEvent::NoteDeleted {
+                                note: conflict.local.clone(),
+                            },
+                        )?;
+                    } else if let Some(note) = transaction
+                        .query_row(
+                            "SELECT id, folder_id, content, title, updated_at, pinned, archived, account_id
+                             FROM notes WHERE id = ?1 AND account_id = ?2",
+                            params![note_id, account_id],
+                            note_from_row,
+                        )
+                        .optional()?
+                    {
+                        ensure_note_sync_event(&transaction, account_id, &NoteSnapshot::from(note))?;
+                    }
+                } else {
+                    transaction.execute(
+                        "DELETE FROM backend_note_bases WHERE account_id = ?1 AND note_id = ?2",
+                        params![account_id, note_id],
+                    )?;
+                    let current = transaction
+                        .query_row(
+                            "SELECT id, folder_id, content, title, updated_at, pinned, archived, account_id
+                             FROM notes WHERE id = ?1 AND account_id = ?2",
+                            params![note_id, account_id],
+                            note_from_row,
+                        )
+                        .optional()?;
+                    if conflict.local_deleted {
+                        clear_note_sync_events(&transaction, account_id, note_id)?;
+                    } else if let Some(note) = current {
+                        clear_note_sync_events(&transaction, account_id, note_id)?;
+                        append_sync_event(
+                            &transaction,
+                            SyncEvent::NoteRestored {
+                                note: NoteSnapshot::from(note),
+                            },
+                        )?;
+                    } else {
+                        clear_note_sync_events(&transaction, account_id, note_id)?;
+                    }
+                }
+            }
+            SyncConflictResolution::KeepRemote => {
+                clear_note_sync_events(&transaction, account_id, note_id)?;
+                if let Some(remote) = &conflict.remote {
+                    let title = memo::editor_parts(&remote.content).0;
+                    let local_updated_at = timestamp()?;
+                    let changed = transaction.execute(
+                        "UPDATE notes SET folder_id = ?3, content = ?4, title = ?5,
+                            updated_at = ?6, pinned = ?7, archived = ?8
+                         WHERE id = ?1 AND account_id = ?2",
+                        params![
+                            note_id,
+                            account_id,
+                            remote.folder_id,
+                            remote.content,
+                            title,
+                            local_updated_at,
+                            remote.pinned,
+                            remote.archived
+                        ],
+                    )?;
+                    if changed == 0 {
+                        transaction.execute(
+                            "INSERT INTO notes (id, account_id, folder_id, content, title, updated_at, pinned, archived)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                            params![note_id, account_id, remote.folder_id, remote.content, title,
+                                local_updated_at, remote.pinned, remote.archived],
+                        )?;
+                    }
+                    save_note_sync_base(&transaction, account_id, note_id, remote)?;
+                } else {
+                    transaction.execute(
+                        "DELETE FROM notes WHERE id = ?1 AND account_id = ?2",
+                        params![note_id, account_id],
+                    )?;
+                    transaction.execute(
+                        "DELETE FROM backend_note_bases WHERE account_id = ?1 AND note_id = ?2",
+                        params![account_id, note_id],
+                    )?;
+                }
+            }
+        }
+        transaction.execute(
+            "DELETE FROM sync_conflicts WHERE account_id = ?1 AND note_id = ?2",
+            params![account_id, note_id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn changed(&self, count: usize) -> Result<()> {
         if count != 1 {
             bail!(tr("storage.error.note_or_folder_missing"));
         }
         Ok(())
     }
+}
+
+fn load_note_sync_base(
+    connection: &Connection,
+    account_id: &str,
+    note_id: &str,
+) -> Result<Option<SyncedNoteState>> {
+    connection
+        .query_row(
+            "SELECT state FROM backend_note_bases WHERE account_id = ?1 AND note_id = ?2",
+            params![account_id, note_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|state| serde_json::from_str(&state).map_err(Into::into))
+        .transpose()
+}
+
+fn save_note_sync_base(
+    connection: &Connection,
+    account_id: &str,
+    note_id: &str,
+    state: &SyncedNoteState,
+) -> Result<()> {
+    connection.execute(
+        "INSERT INTO backend_note_bases (account_id, note_id, state)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(account_id, note_id) DO UPDATE SET state = excluded.state",
+        params![account_id, note_id, serde_json::to_string(state)?],
+    )?;
+    Ok(())
+}
+
+fn save_sync_conflict(
+    connection: &Connection,
+    account_id: &str,
+    note_id: &str,
+    base: Option<&SyncedNoteState>,
+    local: &NoteSnapshot,
+    remote: Option<&SyncedNoteState>,
+    local_deleted: bool,
+) -> Result<()> {
+    connection.execute(
+        "INSERT INTO sync_conflicts
+            (account_id, note_id, base_state, local_snapshot, remote_state, remote_deleted, detected_at, local_deleted)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(account_id, note_id) DO NOTHING",
+        params![
+            account_id,
+            note_id,
+            base.map(serde_json::to_string).transpose()?,
+            serde_json::to_string(local)?,
+            remote.map(serde_json::to_string).transpose()?,
+            remote.is_none(),
+            timestamp()?,
+            local_deleted,
+        ],
+    )?;
+    Ok(())
+}
+
+fn update_sync_conflict_remote(
+    connection: &Connection,
+    account_id: &str,
+    note_id: &str,
+    remote: Option<&SyncedNoteState>,
+) -> Result<()> {
+    connection.execute(
+        "UPDATE sync_conflicts
+         SET remote_state = ?3, remote_deleted = ?4
+         WHERE account_id = ?1 AND note_id = ?2",
+        params![
+            account_id,
+            note_id,
+            remote.map(serde_json::to_string).transpose()?,
+            remote.is_none(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn clear_note_sync_events(connection: &Connection, account_id: &str, note_id: &str) -> Result<()> {
+    connection.execute(
+        "DELETE FROM sync_outbox
+         WHERE json_extract(payload, '$.snapshot.note.id') = ?1
+           AND json_extract(payload, '$.snapshot.note.account_id') = ?2",
+        params![note_id, account_id],
+    )?;
+    Ok(())
+}
+
+fn ensure_note_sync_event(
+    connection: &Connection,
+    account_id: &str,
+    note: &NoteSnapshot,
+) -> Result<()> {
+    let has_event: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sync_outbox
+         WHERE json_extract(payload, '$.snapshot.note.id') = ?1
+           AND json_extract(payload, '$.snapshot.note.account_id') = ?2)",
+        params![note.id, account_id],
+        |row| row.get(0),
+    )?;
+    if !has_event {
+        append_sync_event(connection, SyncEvent::NoteUpdated { note: note.clone() })?;
+    }
+    Ok(())
 }
 
 fn cached_resource_id(
@@ -1046,6 +1574,30 @@ impl From<Note> for NoteSnapshot {
 }
 
 fn append_sync_event(connection: &Connection, event: SyncEvent) -> Result<()> {
+    let note_snapshot = match &event {
+        SyncEvent::NoteCreated { note }
+        | SyncEvent::NoteUpdated { note }
+        | SyncEvent::NoteArchived { note }
+        | SyncEvent::NoteUnarchived { note }
+        | SyncEvent::NoteDeleted { note }
+        | SyncEvent::NoteRestored { note } => Some(note),
+        SyncEvent::FolderCreated { .. }
+        | SyncEvent::FolderUpdated { .. }
+        | SyncEvent::FolderDeleted { .. } => None,
+    };
+    if let Some(note) = note_snapshot {
+        let local_deleted = matches!(event, SyncEvent::NoteDeleted { .. });
+        connection.execute(
+            "UPDATE sync_conflicts SET local_snapshot = ?3, local_deleted = ?4
+             WHERE account_id = ?1 AND note_id = ?2",
+            params![
+                note.account_id,
+                note.id,
+                serde_json::to_string(note)?,
+                local_deleted
+            ],
+        )?;
+    }
     connection.execute(
         "INSERT INTO sync_outbox (event_id, payload, created_at) VALUES (?1, ?2, ?3)",
         params![
@@ -1208,6 +1760,349 @@ mod tests {
     }
 
     #[test]
+    fn pending_local_edit_is_preserved_when_remote_matches_base() -> Result<()> {
+        let store = Store::open(":memory:")?;
+        store.add_backend_account("one", "Werk", "memos", "https://memos.example.com")?;
+        let remote = memo::Memo {
+            id: "memos/note-one".to_owned(),
+            content: "# Basis\nBody".to_owned(),
+            title: Some("Basis".to_owned()),
+            folder_id: None,
+            pinned: false,
+            archived: false,
+            updated_at: Some(1),
+        };
+        store.import_backend_memo("one", &remote)?;
+        let note_id = store
+            .notes(&NoteFilter {
+                account_id: Some("one".to_owned()),
+                ..Default::default()
+            })?
+            .remove(0)
+            .id;
+        store.save_note_editor(&note_id, "Lokaal", "Gewijzigd")?;
+
+        store.import_backend_memo("one", &remote)?;
+
+        let note = store.note(&note_id)?.unwrap();
+        assert_eq!(note.content, "# Lokaal\nGewijzigd");
+        assert!(store.sync_conflicts("one")?.is_empty());
+        assert_eq!(store.pending_sync_events(10)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn divergent_local_and_remote_edits_are_preserved_as_conflict() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("notes.sqlite3");
+        let store = Store::open(&path)?;
+        store.add_backend_account("one", "Werk", "memos", "https://memos.example.com")?;
+        let mut remote = memo::Memo {
+            id: "memos/note-one".to_owned(),
+            content: "# Basis\nBody".to_owned(),
+            title: Some("Basis".to_owned()),
+            folder_id: None,
+            pinned: false,
+            archived: false,
+            updated_at: Some(1),
+        };
+        store.import_backend_memo("one", &remote)?;
+        let note_id = store
+            .notes(&NoteFilter {
+                account_id: Some("one".to_owned()),
+                ..Default::default()
+            })?
+            .remove(0)
+            .id;
+        store.save_note_editor(&note_id, "Lokaal", "Lokale versie")?;
+        let pending_before = store.pending_sync_events(10)?;
+        remote.content = "# Remote\nRemote versie".to_owned();
+        remote.title = Some("Remote".to_owned());
+        remote.updated_at = Some(2);
+
+        store.import_backend_memo("one", &remote)?;
+        drop(store);
+        let store = Store::open(&path)?;
+
+        let conflict = store.sync_conflicts("one")?.pop().unwrap();
+        assert_eq!(conflict.note_id, note_id);
+        assert_eq!(conflict.base.unwrap().content, "# Basis\nBody");
+        assert_eq!(conflict.local.content, "# Lokaal\nLokale versie");
+        assert_eq!(conflict.remote.unwrap().content, "# Remote\nRemote versie");
+        assert_eq!(
+            store.note(&note_id)?.unwrap().content,
+            "# Lokaal\nLokale versie"
+        );
+        assert_eq!(store.pending_sync_events(10)?, pending_before);
+
+        remote.content = "# Remote bijgewerkt\nNieuwere serverversie".to_owned();
+        remote.title = Some("Remote bijgewerkt".to_owned());
+        remote.updated_at = Some(3);
+        store.import_backend_memo("one", &remote)?;
+        let conflict = store.sync_conflicts("one")?.pop().unwrap();
+        assert_eq!(conflict.base.unwrap().content, "# Basis\nBody");
+        assert_eq!(conflict.local.content, "# Lokaal\nLokale versie");
+        assert_eq!(
+            conflict.remote.unwrap().content,
+            "# Remote bijgewerkt\nNieuwere serverversie"
+        );
+        assert_eq!(store.pending_sync_events(10)?, pending_before);
+        assert_eq!(
+            store.note(&note_id)?.unwrap().content,
+            "# Lokaal\nLokale versie"
+        );
+        store.resolve_sync_conflict("one", &note_id, SyncConflictResolution::KeepRemote)?;
+        assert!(store.sync_conflicts("one")?.is_empty());
+        assert!(store.pending_sync_events(10)?.is_empty());
+        assert_eq!(
+            store.note(&note_id)?.unwrap().content,
+            "# Remote bijgewerkt\nNieuwere serverversie"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn keeping_local_conflict_resolution_requeues_current_note() -> Result<()> {
+        let store = Store::open(":memory:")?;
+        store.add_backend_account("one", "Werk", "memos", "https://memos.example.com")?;
+        let mut remote = memo::Memo {
+            id: "memos/note-one".to_owned(),
+            content: "# Basis\nBody".to_owned(),
+            title: Some("Basis".to_owned()),
+            folder_id: None,
+            pinned: false,
+            archived: false,
+            updated_at: Some(1),
+        };
+        store.import_backend_memo("one", &remote)?;
+        let note_id = store
+            .notes(&NoteFilter {
+                account_id: Some("one".to_owned()),
+                ..Default::default()
+            })?
+            .remove(0)
+            .id;
+        store.save_note_editor(&note_id, "Lokaal", "Lokale versie")?;
+        remote.content = "# Remote\nRemote versie".to_owned();
+        remote.title = Some("Remote".to_owned());
+        remote.updated_at = Some(2);
+        store.import_backend_memo("one", &remote)?;
+
+        store.resolve_sync_conflict("one", &note_id, SyncConflictResolution::KeepLocal)?;
+
+        assert!(store.sync_conflicts("one")?.is_empty());
+        assert_eq!(store.pending_sync_events(10)?.len(), 1);
+        assert_eq!(
+            store.note(&note_id)?.unwrap().content,
+            "# Lokaal\nLokale versie"
+        );
+        store.import_backend_memo("one", &remote)?;
+        assert!(store.sync_conflicts("one")?.is_empty());
+        assert_eq!(
+            store.note(&note_id)?.unwrap().content,
+            "# Lokaal\nLokale versie"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn confirmed_remote_deletion_removes_clean_cached_note() -> Result<()> {
+        let store = Store::open(":memory:")?;
+        store.add_backend_account("one", "Werk", "memos", "https://memos.example.com")?;
+        let remote = memo::Memo {
+            id: "memos/note-one".to_owned(),
+            content: "# Basis\nBody".to_owned(),
+            title: Some("Basis".to_owned()),
+            folder_id: None,
+            pinned: false,
+            archived: false,
+            updated_at: Some(1),
+        };
+        store.import_backend_memo("one", &remote)?;
+        let note_id = store
+            .notes(&NoteFilter {
+                account_id: Some("one".to_owned()),
+                ..Default::default()
+            })?
+            .remove(0)
+            .id;
+        assert_eq!(
+            store.note_resources_missing_from_snapshot("one", &[])?,
+            vec![(note_id.clone(), remote.id.clone())]
+        );
+
+        store.import_complete_backend_snapshot("one", &[], &[], &[note_id.clone()])?;
+
+        assert!(store.note(&note_id)?.is_none());
+        assert!(store.sync_conflicts("one")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn confirmed_remote_deletion_with_pending_edit_becomes_conflict() -> Result<()> {
+        let store = Store::open(":memory:")?;
+        store.add_backend_account("one", "Werk", "memos", "https://memos.example.com")?;
+        let remote = memo::Memo {
+            id: "memos/note-one".to_owned(),
+            content: "# Basis\nBody".to_owned(),
+            title: Some("Basis".to_owned()),
+            folder_id: None,
+            pinned: false,
+            archived: false,
+            updated_at: Some(1),
+        };
+        store.import_backend_memo("one", &remote)?;
+        let note_id = store
+            .notes(&NoteFilter {
+                account_id: Some("one".to_owned()),
+                ..Default::default()
+            })?
+            .remove(0)
+            .id;
+        store.save_note_editor(&note_id, "Lokaal", "Lokale versie")?;
+
+        store.import_complete_backend_snapshot("one", &[], &[], &[note_id.clone()])?;
+
+        let conflict = store.sync_conflicts("one")?.pop().unwrap();
+        assert!(conflict.remote.is_none());
+        assert_eq!(conflict.local.content, "# Lokaal\nLokale versie");
+        assert_eq!(
+            store.note(&note_id)?.unwrap().content,
+            "# Lokaal\nLokale versie"
+        );
+        store.resolve_sync_conflict("one", &note_id, SyncConflictResolution::KeepLocal)?;
+        assert!(matches!(
+            store.pending_sync_events(10)?.last().map(|event| &event.event),
+            Some(SyncEvent::NoteRestored { note }) if note.id == note_id
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn remote_edit_racing_local_delete_can_keep_remote() -> Result<()> {
+        let store = Store::open(":memory:")?;
+        store.add_backend_account("one", "Werk", "memos", "https://memos.example.com")?;
+        let mut remote = memo::Memo {
+            id: "memos/note-one".to_owned(),
+            content: "# Basis\nBody".to_owned(),
+            title: Some("Basis".to_owned()),
+            folder_id: None,
+            pinned: false,
+            archived: true,
+            updated_at: Some(1),
+        };
+        store.import_backend_memo("one", &remote)?;
+        let note_id = store
+            .notes(&NoteFilter {
+                account_id: Some("one".to_owned()),
+                archived: true,
+                ..Default::default()
+            })?
+            .remove(0)
+            .id;
+        let deleted_snapshot = store.note(&note_id)?.unwrap();
+        store.delete_note(&note_id)?;
+        remote.content = "# Server edit\nKeep this".to_owned();
+        remote.title = Some("Server edit".to_owned());
+        remote.updated_at = Some(2);
+
+        store.import_backend_snapshot("one", &[], std::slice::from_ref(&remote))?;
+
+        let conflict = store.sync_conflicts("one")?.pop().unwrap();
+        assert!(conflict.local_deleted);
+        assert_eq!(conflict.local.content, deleted_snapshot.content);
+        assert_eq!(conflict.remote.unwrap().content, "# Server edit\nKeep this");
+        assert!(store.note(&note_id)?.is_none());
+        store.resolve_sync_conflict("one", &note_id, SyncConflictResolution::KeepRemote)?;
+        assert_eq!(
+            store.note(&note_id)?.unwrap().content,
+            "# Server edit\nKeep this"
+        );
+        assert!(store.pending_sync_events(10)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn remote_edit_racing_local_delete_can_keep_local_delete() -> Result<()> {
+        let store = Store::open(":memory:")?;
+        store.add_backend_account("one", "Werk", "memos", "https://memos.example.com")?;
+        let mut remote = memo::Memo {
+            id: "memos/note-one".to_owned(),
+            content: "# Basis\nBody".to_owned(),
+            title: Some("Basis".to_owned()),
+            folder_id: None,
+            pinned: false,
+            archived: true,
+            updated_at: Some(1),
+        };
+        store.import_backend_memo("one", &remote)?;
+        let note_id = store
+            .notes(&NoteFilter {
+                account_id: Some("one".to_owned()),
+                archived: true,
+                ..Default::default()
+            })?
+            .remove(0)
+            .id;
+        store.delete_note(&note_id)?;
+        remote.content = "# Server edit\nKeep this".to_owned();
+        remote.title = Some("Server edit".to_owned());
+        remote.updated_at = Some(2);
+        store.import_backend_snapshot("one", &[], std::slice::from_ref(&remote))?;
+
+        let conflict = store.sync_conflicts("one")?.pop().unwrap();
+        assert!(conflict.local_deleted);
+        store.resolve_sync_conflict("one", &note_id, SyncConflictResolution::KeepLocal)?;
+        assert!(matches!(
+            store.pending_sync_events(10)?.last().map(|event| &event.event),
+            Some(SyncEvent::NoteDeleted { note }) if note.id == note_id
+        ));
+        assert!(store.note(&note_id)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn deleting_deferred_conflict_updates_local_resolution_choice() -> Result<()> {
+        let store = Store::open(":memory:")?;
+        store.add_backend_account("one", "Werk", "memos", "https://memos.example.com")?;
+        let mut remote = memo::Memo {
+            id: "memos/note-one".to_owned(),
+            content: "# Basis\nBody".to_owned(),
+            title: Some("Basis".to_owned()),
+            folder_id: None,
+            pinned: false,
+            archived: true,
+            updated_at: Some(1),
+        };
+        store.import_backend_memo("one", &remote)?;
+        let note_id = store
+            .notes(&NoteFilter {
+                account_id: Some("one".to_owned()),
+                archived: true,
+                ..Default::default()
+            })?
+            .remove(0)
+            .id;
+        store.save_note_editor(&note_id, "Lokaal", "Lokale versie")?;
+        remote.content = "# Server edit\nKeep this".to_owned();
+        remote.title = Some("Server edit".to_owned());
+        remote.updated_at = Some(2);
+        store.import_backend_snapshot("one", &[], std::slice::from_ref(&remote))?;
+
+        store.delete_note(&note_id)?;
+
+        let conflict = store.sync_conflicts("one")?.pop().unwrap();
+        assert!(conflict.local_deleted);
+        store.resolve_sync_conflict("one", &note_id, SyncConflictResolution::KeepLocal)?;
+        assert!(store.note(&note_id)?.is_none());
+        assert!(matches!(
+            store.pending_sync_events(10)?.last().map(|event| &event.event),
+            Some(SyncEvent::NoteDeleted { note }) if note.id == note_id
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn folders_and_rich_content_survive_reopening() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("notes.sqlite3");
@@ -1225,11 +2120,38 @@ mod tests {
             store
                 .connection
                 .pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(schema_version, 9);
+        assert_eq!(schema_version, 11);
         assert_eq!(store.folders()?[0].count, 1);
         let note = store.note(&id)?.unwrap();
         assert_eq!(note.content, content);
         assert_eq!(store.note_color()?, "mint");
+        Ok(())
+    }
+
+    #[test]
+    fn opening_version_ten_database_adds_local_delete_conflict_state() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("notes.sqlite3");
+        {
+            let store = Store::open(&path)?;
+            store
+                .connection
+                .execute_batch("ALTER TABLE sync_conflicts DROP COLUMN local_deleted;")?;
+            store.connection.pragma_update(None, "user_version", 10)?;
+        }
+
+        let store = Store::open(&path)?;
+
+        let schema_version: i64 =
+            store
+                .connection
+                .pragma_query_value(None, "user_version", |row| row.get(0))?;
+        assert_eq!(schema_version, 11);
+        assert!(has_column(
+            &store.connection,
+            "sync_conflicts",
+            "local_deleted"
+        )?);
         Ok(())
     }
 
@@ -1526,7 +2448,7 @@ mod tests {
         let version: i64 = store
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 9);
+        assert_eq!(version, 11);
         Ok(())
     }
 
@@ -1545,7 +2467,12 @@ mod tests {
             )?;
         }
         let connection = Connection::open(&path)?;
-        connection.pragma_update(None, "user_version", 6)?;
+        connection.execute_batch(
+            "DROP TABLE sync_conflicts;
+             DROP TABLE backend_note_bases;
+             DROP TABLE backend_resource_links;
+             PRAGMA user_version = 6;",
+        )?;
         drop(connection);
 
         let store = Store::open(&path)?;
@@ -1554,7 +2481,7 @@ mod tests {
         let version: i64 = store
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 9);
+        assert_eq!(version, 11);
         Ok(())
     }
 

@@ -177,6 +177,14 @@ impl MemosAdapter {
         memo_from_remote(self.client.get_memo(id)?)
     }
 
+    pub fn get_memo_if_exists(&self, name: &str) -> Result<Option<Memo>> {
+        let id = resource_id(name, "memos")?;
+        self.client
+            .get_memo_if_exists(id)?
+            .map(memo_from_remote)
+            .transpose()
+    }
+
     pub fn get_folder(&self, name: &str) -> Result<MemoFolder> {
         let id = resource_id(name, "spaces")?;
         let space = self.client.get_space(id)?;
@@ -199,6 +207,28 @@ impl MemosAdapter {
 impl BackendAdapter for MemosAdapter {
     fn apply_event(&self, event: &SyncEvent) -> Result<()> {
         let mutation = MemosMutation::from_event(event)?;
+        let created_note = match event {
+            SyncEvent::NoteCreated { note } | SyncEvent::NoteRestored { note } => Some(note),
+            _ => None,
+        };
+        if let Some(note) = created_note {
+            return match self.client.send_mutation(
+                mutation.method,
+                &mutation.resource,
+                &mutation.query,
+                mutation.body.as_ref(),
+            ) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    let id = resource_id(&note.id, "memos")?;
+                    match self.client.get_memo(id) {
+                        Ok(remote) if remote_matches_note(&remote, note) => Ok(()),
+                        Ok(_) => Err(error.context(tr("api.memos.error.create_id_conflict"))),
+                        Err(_) => Err(error),
+                    }
+                }
+            };
+        }
         self.client.send_mutation(
             mutation.method,
             &mutation.resource,
@@ -230,6 +260,27 @@ impl BackendAdapter for MemosAdapter {
             })
             .collect())
     }
+}
+
+fn remote_matches_note(remote: &RemoteMemo, note: &NoteSnapshot) -> bool {
+    let state_matches = if note.archived {
+        remote.state == "ARCHIVED"
+    } else {
+        remote.state.is_empty() || remote.state == "NORMAL"
+    };
+    let remote_space = remote.space.as_deref().filter(|space| !space.is_empty());
+    let expected_space = note.folder_id.as_deref().filter(|space| !space.is_empty());
+    let expected_name = if note.id.starts_with("memos/") {
+        note.id.clone()
+    } else {
+        format!("memos/{}", note.id)
+    };
+    remote.name == expected_name
+        && remote.content == note.content
+        && remote.pinned == note.pinned
+        && state_matches
+        && remote_space == expected_space
+        && (remote.visibility.is_empty() || remote.visibility == "PRIVATE")
 }
 
 fn memo_from_remote(remote: RemoteMemo) -> Result<Memo> {
@@ -284,58 +335,128 @@ mod tests {
     fn mock_server(
         statuses: Vec<u16>,
     ) -> Result<(String, thread::JoinHandle<Result<Vec<CapturedRequest>>>)> {
+        mock_server_with_responses(
+            statuses
+                .into_iter()
+                .map(|status| (status, String::new()))
+                .collect(),
+        )
+    }
+
+    fn mock_server_with_responses(
+        responses: Vec<(u16, String)>,
+    ) -> Result<(String, thread::JoinHandle<Result<Vec<CapturedRequest>>>)> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let address = listener.local_addr()?;
-        let server =
-            thread::spawn(move || -> Result<Vec<CapturedRequest>> {
-                let mut requests = Vec::new();
-                for status in statuses {
-                    let (mut stream, _) = listener.accept()?;
-                    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
-                    let mut reader = BufReader::new(stream.try_clone()?);
-                    let mut first_line = String::new();
-                    reader.read_line(&mut first_line)?;
-                    let mut parts = first_line.split_whitespace();
-                    let method = parts.next().context("Request mist methode")?.to_owned();
-                    let path = parts.next().context("Request mist URL")?;
-                    let url = reqwest::Url::parse(&format!("http://{address}{path}"))?;
-                    let mut length = 0;
-                    let mut authorization = String::new();
-                    loop {
-                        let mut header = String::new();
-                        reader.read_line(&mut header)?;
-                        if header == "\r\n" || header.is_empty() {
-                            break;
+        let server = thread::spawn(move || -> Result<Vec<CapturedRequest>> {
+            let mut requests = Vec::new();
+            for (status, response_body) in responses {
+                let (mut stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+                let mut reader = BufReader::new(stream.try_clone()?);
+                let mut first_line = String::new();
+                reader.read_line(&mut first_line)?;
+                let mut parts = first_line.split_whitespace();
+                let method = parts.next().context("Request mist methode")?.to_owned();
+                let path = parts.next().context("Request mist URL")?;
+                let url = reqwest::Url::parse(&format!("http://{address}{path}"))?;
+                let mut length = 0;
+                let mut authorization = String::new();
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header)?;
+                    if header == "\r\n" || header.is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = header.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            length = value.trim().parse::<usize>()?;
                         }
-                        if let Some((name, value)) = header.split_once(':') {
-                            if name.eq_ignore_ascii_case("content-length") {
-                                length = value.trim().parse::<usize>()?;
-                            }
-                            if name.eq_ignore_ascii_case("authorization") {
-                                authorization = value.trim().to_owned();
-                            }
+                        if name.eq_ignore_ascii_case("authorization") {
+                            authorization = value.trim().to_owned();
                         }
                     }
-                    let mut bytes = vec![0; length];
-                    reader.read_exact(&mut bytes)?;
-                    let body = if bytes.is_empty() {
-                        None
-                    } else {
-                        Some(serde_json::from_slice(&bytes)?)
-                    };
-                    requests.push(CapturedRequest {
-                        method,
-                        url,
-                        authorization,
-                        body,
-                    });
-                    stream.write_all(format!(
-                    "HTTP/1.1 {status} Mock\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                ).as_bytes())?;
                 }
-                Ok(requests)
-            });
+                let mut bytes = vec![0; length];
+                reader.read_exact(&mut bytes)?;
+                let body = if bytes.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::from_slice(&bytes)?)
+                };
+                requests.push(CapturedRequest {
+                    method,
+                    url,
+                    authorization,
+                    body,
+                });
+                stream.write_all(
+                        format!(
+                            "HTTP/1.1 {status} Mock\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{response_body}",
+                            response_body.len()
+                        )
+                        .as_bytes(),
+                    )?;
+            }
+            Ok(requests)
+        });
         Ok((format!("http://{address}/memos-server"), server))
+    }
+
+    #[test]
+    fn create_conflict_with_matching_stable_id_is_reconciled() -> Result<()> {
+        let note = note_snapshot();
+        let body = json!({
+            "name": format!("memos/{}", note.id),
+            "content": note.content,
+            "state": "NORMAL",
+            "visibility": "PRIVATE",
+            "space": note.folder_id,
+            "pinned": note.pinned,
+        })
+        .to_string();
+        let (url, server) = mock_server_with_responses(vec![(409, String::new()), (200, body)])?;
+        let adapter = MemosAdapter::new(&url, "test-token")?;
+
+        adapter.apply_event(&SyncEvent::NoteCreated { note: note.clone() })?;
+
+        let requests = server.join().expect("mock server thread panicked")?;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[1].method, "GET");
+        assert_eq!(
+            requests[1].url.path(),
+            format!("/memos-server/api/v1/memos/{}", note.id)
+        );
+        assert_eq!(requests[1].authorization, "Bearer test-token");
+        Ok(())
+    }
+
+    #[test]
+    fn create_conflict_with_different_remote_content_is_not_acknowledged() -> Result<()> {
+        let note = note_snapshot();
+        let body = json!({
+            "name": format!("memos/{}", note.id),
+            "content": "# Andere inhoud",
+            "state": "NORMAL",
+            "visibility": "PRIVATE",
+            "space": note.folder_id,
+            "pinned": note.pinned,
+        })
+        .to_string();
+        let (url, server) = mock_server_with_responses(vec![(409, String::new()), (200, body)])?;
+        let adapter = MemosAdapter::new(&url, "test-token")?;
+
+        assert!(
+            adapter
+                .apply_event(&SyncEvent::NoteCreated { note })
+                .is_err()
+        );
+        assert_eq!(
+            server.join().expect("mock server thread panicked")?.len(),
+            2
+        );
+        Ok(())
     }
 
     fn note_snapshot() -> NoteSnapshot {

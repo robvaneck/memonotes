@@ -1,9 +1,11 @@
 # Memonotes - product- en implementatieplan
 
-Oorspronkelijk plan: 2026-10-05. Stand bijgewerkt: 2026-10-10.
+Oorspronkelijk plan: 2026-10-05. Stand bijgewerkt: 2026-10-12.
 Status: GTK-desktopapp met SQLite, meerdere Memos-accounts, achtergrondophalen en
-automatische outbox-uploads. De editor is nog platte tekst; WYSIWYG en afbeeldingen
-zijn nog niet gebouwd. Conflictafhandeling en robuuste sync zijn nog niet afgerond.
+automatische outbox-uploads. Sync bewaart basisversies, detecteert conflicten,
+reconcilieert bevestigde remote deletions en herstelt onzekere creates. De editor
+is nog platte tekst; WYSIWYG en afbeeldingen zijn nog niet gebouwd. Automatisch
+samenvoegen en live multi-client racevalidatie blijven open.
 Projectmap: /home/fedora/repos/memonotes.
 De onderstaande productafspraken beschrijven het doel; de checklist geeft aan wat
 daadwerkelijk in de huidige code is gerealiseerd. Zie ook [README.md](README.md).
@@ -21,24 +23,26 @@ daadwerkelijk in de huidige code is gerealiseerd. Zie ook [README.md](README.md)
 - [x] 32 notitiekleuren met licht/donker-varianten en een Over-venster.
 - [x] Meerdere accounts beheren, inschakelen/uitschakelen, verbinding testen en PAT in GNOME Keyring bewaren.
 - [x] Memos-adapter met backend-onafhankelijke notitie- en foldermodellen; IMAP/Joplin zijn alleen keuzemogelijkheden, niet geimplementeerd.
-- [x] Memos-notities/spaces gepagineerd ophalen en transactioneel cachen per account (schema v9).
+- [x] Memos-notities/spaces gepagineerd ophalen en transactioneel cachen per account (schema v11: remote-ID-links, sync-baselines en conflicts).
 - [x] Ophalen bij opstart, accountopslaan/inschakelen en elke 60 seconden bij zichtbaar hoofdvenster.
 - [x] Geselecteerde backendnotitie apart ophalen wanneer geen lokale notitie-events pending zijn.
 - [x] Bij openen van een Memos-map de space via GET en actieve notities met space-filter gepagineerd ophalen; pending lokale wijzigingen blijven beschermd.
 - [x] Duurzame outbox, accountrouting, remote-ID-links en bevestiging na succesvolle upload.
-- [x] Automatische uploads, een seconde debounce na tekstbewerking, opeenvolgende updates samenvoegen en 30 seconden retry na uploadfout.
-- [x] Automatische netwerkdetectie zonder handmatige modus: offline API-calls pauzeren, verbindingsfouten stil uitstellen en bij reconnect eerst de outbox-batch versturen en daarna verversen.
-- [x] API-mapping voor notitie-CRUD/herstel, pinnen, archiveren, verplaatsen en mapaanmaak/hernoemen.
+- [x] Automatische uploads, een seconde debounce na tekstbewerking, opeenvolgende updates samenvoegen en capped exponential retry (30 seconden tot maximaal 15 minuten).
+- [x] Automatische netwerkdetectie zonder handmatige modus: offline API-calls pauzeren en na reconnect eerst ophalen/vergelijken, daarna veilige outbox-events uploaden.
+- [x] API-mapping voor notitie-CRUD/herstel, pinnen, archiveren, verplaatsen en mapaanmaak/hernoemen/verwijderen.
+- [x] Core Memos-integratie live getest tegen de doelserver en werkend.
+- [x] Veilige map-/spaceverwijdering met drie dialoogkeuzes: annuleren, map verwijderen met behoud van notities, of map en alle notities verwijderen. Note-moves/-deletions worden voor `FolderDeleted` gequeued.
+- [x] Titel en body vormen één gesynchroniseerd Markdown-document. Legacy-notities met losse titel worden bij bewerken naar een eerste H1 omgezet zonder de body te verliezen; ongewijzigde inhoud maakt geen nieuw sync-event.
+- [x] Drieweg-conflictdetectie bewaart basis, lokale en remote versie; de gebruiker kiest lokaal of server. Lokale deletes die botsen met serverwijzigingen zijn ook oplosbaar.
+- [x] Complete accountrefreshes bevestigen ontbrekende memo's met een directe GET; alleen 404 geldt als remote delete. Pending lokale wijzigingen worden als conflict bewaard.
+- [x] Onzekere creates en HTTP 409 reconciliëren via de stabiele memo-ID; alleen een exact overeenkomende remote resource wordt bevestigd.
+- [x] Handmatig synchroniseren en capped exponential retry voor tijdelijke fouten (30 seconden tot maximaal 15 minuten).
 - [x] API-fouttoasts met deduplicatie; achtergrondophalen/autosave zonder voortgangstoasts.
 - [x] Opslag/sync-tests en HTTP-mocktests; API-probe beschikbaar.
 
 ### Nog te doen
 
-- [ ] Live integratieproef tegen de doelinstallatie van Memos 0.31.0; mocks bewijzen geen servercompatibiliteit.
-- [ ] Veilige mapverwijdering ontwerpen: lokale verwijdering werkt, maar remote `FolderDeleted` is geblokkeerd en kan latere accountuploads ophouden.
-- [ ] Losse notitietitel en Markdown-H1 consistent synchroniseren zonder bestaande inhoud stilzwijgend te herschrijven.
-- [ ] Conflicten detecteren en beide versies bewaren; remote deletions reconciliëren zonder pending wijzigingen te verliezen.
-- [ ] Onzekere create-uitkomsten en HTTP 409 afhandelen zonder duplicaten of permanent vastgelopen events.
 - [ ] Serverfilters/sortering expliciet kiezen en archiefdekking op de echte server toetsen.
 - [ ] Zichtbaarheid en space-rollen lokaal behouden; gedeelde spaces herkenbaar tonen.
 - [ ] WYSIWYG-engine kiezen en opmaak/checklists/undo-redo roundtrips testen.
@@ -46,7 +50,6 @@ daadwerkelijk in de huidige code is gerealiseerd. Zie ook [README.md](README.md)
 - [ ] Markdown-export met folders, metadata en afbeeldingen.
 - [ ] Expliciete onboarding/lokale import en veilig ontkoppelen met pending wijzigingen/export.
 - [ ] Smalle-vensternavigatie, onthouden paneelbreedtes/selectie, toegankelijkheid en zichtbare sync/conflictstatus.
-- [ ] Handmatig verversen en uitgebreidere retry/backoff-afhandeling.
 - [ ] Fedora/Flatpak-verpakking en netwerk/keyringtests in de sandbox.
 
 Niet gebouwd en buiten de huidige versie 1-scope: space-leden/uitnodigingen,
@@ -102,7 +105,7 @@ Voorgestelde brede desktopindeling:
 - Opmaakacties voor bold en italic, met herkenbare bediening en actieve selectiestatus.
 - Afbeeldingen invoegen en inline weergeven; bestandskeuze en plakken ondersteunen.
 - Undo/redo, selectie en normale toetsenbordbediening horen bij de editorproef.
-- Voorstel: titel van nieuwe notities als eerste H1 opslaan voor Memos-compatibiliteit.
+- Nieuwe notities slaan de titel als eerste H1 op voor Memos-compatibiliteit; bij bestaande notities blijft de inhoud ongewijzigd tot de gebruiker ze bewerkt.
 - Voorbeeldloze of lege notities krijgen een lokale weergavetitel; bestaande inhoud niet herschrijven.
 
 Markdown blijft het uitwisselingsformaat met Memos, niet de normale gebruikersinterface.
@@ -186,12 +189,12 @@ en geen geneste mappen: de geraadpleegde Space-definitie biedt geen parent-veld.
 - Mapverplaatsing verandert zichtbaarheid niet impliciet.
 - Bestaande gedeelde spaces herkenbaar tonen; niet stilzwijgend als persoonlijk behandelen.
 - Uitnodigingen, ledenbeheer en publiceren vallen buiten versie 1.
-- Space verwijderen wist volgens de API ook alle geplaatste notities.
-  Daarom is de remote space-verwijderactie in de adapter geblokkeerd. De huidige UI
-  biedt lokale mapverwijdering wel aan en verplaatst lokale notities naar Zonder map.
-  Deze mismatch moet worden opgelost: een geblokkeerd remote delete-event kan de
-  outbox van het account ophouden. Eerst een expliciet veilig ontwerp voor
-  verplaatsen, bevestiging en gelijktijdige serverwijzigingen bepalen.
+- Space verwijderen kan volgens de API ook alle geplaatste notities wissen.
+  De bevestigingsdialoog biedt daarom drie keuzes: annuleren, de map verwijderen
+  en notities behouden, of de map met alle notities verwijderen. Bij behoud worden
+  notities eerst naar Zonder map verplaatst; bij verwijderen worden notities eerst
+  verwijderd. Pas daarna wordt `FolderDeleted` verwerkt. De core spaceflow is live
+  getest; gelijktijdige serverwijzigingen blijven onderdeel van de sync-validatie.
 - Discriminerende integratieproef: PAT gebruiken om een eigen space te maken, een PRIVATE
   notitie eraan te koppelen, te hernoemen en vanuit een tweede client te lezen/verplaatsen.
 - Bij ongeschikte space-semantiek een alternatief voorstellen en opnieuw afstemmen;
@@ -223,16 +226,20 @@ Uploadretries en onderbroken uploads mogen geen dubbele of verweesde attachments
 Gekoppelde afbeeldingen lokaal cachen voor offline lezen; ontbrekende bestanden zichtbaar melden.
 De attachment-API, limieten en URL/authenticatie moeten nog apart worden onderzocht en getest.
 Retries mogen geen dubbele notities maken: stabiele API-compatibele IDs gebruiken en
-na een onzekere create-uitkomst eerst de serverstatus opvragen.
+na een onzekere create-uitkomst eerst de serverstatus opvragen. Dit is geïmplementeerd
+voor note creates; attachment-retries moeten dit later ook volgen.
 Een wijziging tijdens een upload wordt niet door de uploadbevestiging als gesynchroniseerd gemarkeerd.
 
 Conflicten niet oplossen met blind last-write-wins: basis, lokaal en remote vergelijken.
-Beide versies bewaren en de gebruiker laten kiezen zodra beide veranderd zijn.
+De app bewaart die drie versies en laat de gebruiker lokaal of server behouden.
+Automatisch samenvoegen bestaat niet.
 De bekeken API-definities bewijzen geen atomische compare-and-swap; een read-before-write
 is dus geen volledige racebescherming. Dit onderzoeken in de integratieproef en expliciet
 testen met meerdere desktopclients en de Memos-webclient.
 Ontbrekende items in een gedeeltelijke lijst betekenen nooit automatisch verwijdering.
-Remote deletions met pending lokale edits leiden tot herstel/conflict, niet dataverlies.
+Remote deletions worden alleen na directe GET-confirmatie verwerkt. Deletions met
+pending lokale edits of een gelijktijdige serveredit leiden tot herstel/conflict,
+niet stil dataverlies.
 De huidige app biedt archiveren en harde verwijdering vanuit het archief, met een
 undo-stack in het geheugen. `NoteRestored` maakt een verwijderde snapshot opnieuw
 aan; attachments, relaties en shares worden niet hersteld. Een robuust ontwerp
@@ -292,6 +299,6 @@ persoonlijke space-semantiek en veilige offline afbeeldingssync. Mobiel is buite
 
 De app en lokale opslag/API-mocktests bestaan inmiddels in deze workspace.
 De huidige code is leidend voor de gerealiseerde checklist; de overige secties
-blijven productdoelen en acceptatiecriteria. Live servercompatibiliteit,
-concurrente updates, attachment-gedrag en release/sandboxtests zijn nog niet
-aangetoond door de mocktests.
+blijven productdoelen en acceptatiecriteria. Core live servercompatibiliteit is
+bevestigd; concurrente updates, attachment-gedrag en release/sandboxtests zijn
+nog niet gevalideerd.
