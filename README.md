@@ -46,6 +46,8 @@ after confirmation. Permanent deletion cannot be undone. Memos-backed notes
 queue a `NoteDeleted` adapter event that deletes the remote memo; offline or
 failed requests remain queued until synchronization succeeds.
 The note list supports multiple selection and dragging notes into folders.
+It uses GTK's native virtualized `ListView`: only visible rows and an offscreen
+buffer have widgets, and sidebar resizing keeps text at its normal font size.
 See [PLAN.md](PLAN.md) for the current implementation checklist and release gaps.
 
 ## Backend architecture
