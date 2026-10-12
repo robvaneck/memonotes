@@ -1,4 +1,5 @@
-use anyhow::{bail, ensure, Context, Result};
+use crate::i18n::tr;
+use anyhow::{Context, Result, bail, ensure};
 use reqwest::blocking::Client;
 use reqwest::redirect::Policy;
 use reqwest::{Method, Url};
@@ -10,7 +11,8 @@ use std::time::Duration;
 
 pub fn is_connection_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
-        cause.downcast_ref::<reqwest::Error>()
+        cause
+            .downcast_ref::<reqwest::Error>()
             .is_some_and(|error| error.is_connect() || error.is_timeout())
     })
 }
@@ -58,24 +60,24 @@ pub struct RemoteSpace {
 
 impl MemosClient {
     pub fn new(base_url: &str, token: &str) -> Result<Self> {
-        let mut api_base =
-            Url::parse(base_url.trim_end_matches('/')).context("Ongeldige Memos-server-URL")?;
+        let mut api_base = Url::parse(base_url.trim_end_matches('/'))
+            .context(tr("api.memos.error.invalid_server_url"))?;
         ensure!(
             matches!(api_base.scheme(), "https" | "http"),
-            "De Memos-server-URL moet https:// of http:// gebruiken"
+            tr("api.memos.error.unsupported_url_scheme")
         );
         ensure!(
             api_base.host_str().is_some(),
-            "De Memos-server-URL mist een host"
+            tr("api.memos.error.server_host_missing")
         );
         ensure!(
             api_base.username().is_empty()
                 && api_base.password().is_none()
                 && api_base.query().is_none()
                 && api_base.fragment().is_none(),
-            "Gebruik geen inloggegevens, query of fragment in de Memos-server-URL"
+            tr("api.memos.error.server_url_contains_credentials_query_or_fragment")
         );
-        ensure!(!token.trim().is_empty(), "De Memos PAT mag niet leeg zijn");
+        ensure!(!token.trim().is_empty(), tr("api.memos.error.empty_token"));
 
         let base_path = api_base.path().trim_end_matches('/');
         api_base.set_path(&format!("{base_path}/api/v1"));
@@ -84,7 +86,7 @@ impl MemosClient {
             .timeout(Duration::from_secs(15))
             .redirect(Policy::none())
             .build()
-            .context("HTTP-client voor Memos kon niet worden gestart")?;
+            .context(tr("api.memos.error.http_client_initialization_failed"))?;
 
         Ok(Self {
             client,
@@ -95,24 +97,21 @@ impl MemosClient {
 
     pub fn from_env() -> Result<Self> {
         let base_url = env::var("MEMONOTES_MEMOS_URL")
-            .context("Stel MEMONOTES_MEMOS_URL in, bijvoorbeeld https://memos.example.com")?;
+            .context(tr("api.memos.error.server_url_environment_missing"))?;
         let token = env::var("MEMONOTES_MEMOS_TOKEN")
-            .context("Stel MEMONOTES_MEMOS_TOKEN in met een Memos Personal Access Token")?;
+            .context(tr("api.memos.error.token_environment_missing"))?;
         let client = Self::new(&base_url, &token)?;
         ensure!(
             !client.uses_plain_http()
                 || env::var("MEMONOTES_ALLOW_INSECURE_HTTP").ok().as_deref() == Some("1"),
-            "HTTP is onversleuteld; stel MEMONOTES_ALLOW_INSECURE_HTTP=1 expliciet in om door te gaan"
+            tr("api.memos.error.insecure_http_environment_confirmation_required")
         );
         Ok(client)
     }
 
     pub fn check_connection(&self) -> Result<()> {
         let user = self.get_json(self.endpoint("auth/me")?)?;
-        ensure!(
-            user.is_object(),
-            "Memos API gaf geen gebruikersobject terug"
-        );
+        ensure!(user.is_object(), tr("api.memos.error.user_object_missing"));
         Ok(())
     }
 
@@ -122,7 +121,7 @@ impl MemosClient {
 
     pub fn get_memo(&self, id: &str) -> Result<RemoteMemo> {
         serde_json::from_value(self.get_json(self.endpoint(&format!("memos/{id}"))?)?)
-            .context("Memos API gaf een ongeldige notitie terug")
+            .context(tr("api.memos.error.invalid_note_response"))
     }
 
     pub fn list_spaces(&self) -> Result<Vec<RemoteSpace>> {
@@ -131,11 +130,14 @@ impl MemosClient {
 
     pub fn get_space(&self, id: &str) -> Result<RemoteSpace> {
         serde_json::from_value(self.get_json(self.endpoint(&format!("spaces/{id}"))?)?)
-            .context("Memos API gaf een ongeldige space terug")
+            .context(tr("api.memos.error.invalid_space_response"))
     }
 
     pub fn list_space_memos(&self, id: &str) -> Result<Vec<RemoteMemo>> {
-        let filter = format!("space == {}", serde_json::to_string(&format!("spaces/{id}"))?);
+        let filter = format!(
+            "space == {}",
+            serde_json::to_string(&format!("spaces/{id}"))?
+        );
         self.list_pages_with_query(
             "memos",
             "memos",
@@ -162,9 +164,14 @@ impl MemosClient {
         if let Some(body) = body {
             request = request.json(body);
         }
-        let response = request.send().context("Memos-server niet bereikbaar")?;
+        let response = request
+            .send()
+            .context(tr("api.memos.error.server_unreachable"))?;
         let status = response.status();
-        ensure!(status.is_success(), "Memos API gaf HTTP {status}; event niet bevestigd");
+        ensure!(
+            status.is_success(),
+            crate::tr_format!("api.memos.error.mutation_http_status", status = status)
+        );
         Ok(())
     }
 
@@ -180,14 +187,17 @@ impl MemosClient {
             .get(endpoint)
             .bearer_auth(&self.token)
             .send()
-            .context("Memos-server niet bereikbaar")?;
+            .context(tr("api.memos.error.server_unreachable"))?;
         let status = response.status();
         if !status.is_success() {
-            bail!("Memos API gaf HTTP {status}; controleer serveradres en PAT");
+            bail!(crate::tr_format!(
+                "api.memos.error.request_http_status",
+                status = status
+            ));
         }
         response
             .json()
-            .context("Memos API gaf geen geldige JSON terug")
+            .context(tr("api.memos.error.invalid_json_response"))
     }
 
     fn list_pages<T: for<'de> Deserialize<'de>>(
@@ -223,10 +233,18 @@ impl MemosClient {
             let values = page
                 .get(collection)
                 .and_then(Value::as_array)
-                .with_context(|| format!("Memos API-response mist de lijst '{collection}'"))?;
+                .with_context(|| {
+                    crate::tr_format!(
+                        "api.memos.error.collection_missing",
+                        collection = collection
+                    )
+                })?;
             for value in values {
                 items.push(serde_json::from_value(value.clone()).with_context(|| {
-                    format!("Memos API gaf een ongeldige entry in '{collection}' terug")
+                    crate::tr_format!(
+                        "api.memos.error.invalid_collection_entry",
+                        collection = collection
+                    )
                 })?);
             }
 
@@ -240,7 +258,7 @@ impl MemosClient {
             };
             ensure!(
                 seen_tokens.insert(token.clone()),
-                "Memos API herhaalde een paginatoken; paginering afgebroken"
+                tr("api.memos.error.repeated_page_token")
             );
         }
 
@@ -262,8 +280,12 @@ mod tests {
         drop(listener);
         let client = MemosClient::new(&format!("http://{address}"), "probe-token")?;
         let error = client.check_connection().unwrap_err();
-        assert!(is_connection_error(&error.context("Achtergrondophalen mislukt")));
-        assert!(!is_connection_error(&anyhow::anyhow!("Memos API gaf HTTP 401")));
+        assert!(is_connection_error(
+            &error.context("Achtergrondophalen mislukt")
+        ));
+        assert!(!is_connection_error(&anyhow::anyhow!(
+            "Memos API gaf HTTP 401"
+        )));
         Ok(())
     }
 
@@ -297,9 +319,11 @@ mod tests {
         client.check_connection()?;
         let request = server.join().expect("mock server thread panicked")?;
         assert!(request.starts_with("GET /api/v1/auth/me HTTP/1.1"));
-        assert!(request
-            .to_ascii_lowercase()
-            .contains("authorization: bearer probe-token"));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer probe-token")
+        );
         Ok(())
     }
 
@@ -336,9 +360,11 @@ mod tests {
         let memo = client.get_memo("note-id")?;
         let request = server.join().expect("mock server thread panicked")?;
         assert!(request.starts_with("GET /api/v1/memos/note-id HTTP/1.1"));
-        assert!(request
-            .to_ascii_lowercase()
-            .contains("authorization: bearer probe-token"));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer probe-token")
+        );
         assert_eq!(memo.content, "Remote");
         Ok(())
     }
@@ -372,9 +398,12 @@ mod tests {
                         request.push_str(&header);
                     }
                 }
-                write!(stream,
+                write!(
+                    stream,
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(), body)?;
+                    body.len(),
+                    body
+                )?;
                 requests.push(request);
             }
             Ok(requests)
@@ -389,7 +418,11 @@ mod tests {
         assert_eq!(memos.len(), 2);
         assert_eq!(memos[0].content, "Nieuwste inhoud");
         for (index, request) in requests.iter().enumerate() {
-            assert!(request.to_ascii_lowercase().contains("authorization: bearer probe-token"));
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer probe-token")
+            );
             if index == 0 {
                 continue;
             }
@@ -397,11 +430,22 @@ mod tests {
             let endpoint = Url::parse(&format!("http://{address}{path}"))?;
             assert_eq!(endpoint.path(), "/server/api/v1/memos");
             let query: std::collections::HashMap<_, _> = endpoint.query_pairs().collect();
-            assert_eq!(query.get("filter").map(|value| value.as_ref()), Some("space == \"spaces/work\""));
-            assert_eq!(query.get("state").map(|value| value.as_ref()), Some("NORMAL"));
-            assert_eq!(query.get("pageSize").map(|value| value.as_ref()), Some("1000"));
-            assert_eq!(query.get("pageToken").map(|value| value.as_ref()),
-                if index == 2 { Some("next-page") } else { None });
+            assert_eq!(
+                query.get("filter").map(|value| value.as_ref()),
+                Some("space == \"spaces/work\"")
+            );
+            assert_eq!(
+                query.get("state").map(|value| value.as_ref()),
+                Some("NORMAL")
+            );
+            assert_eq!(
+                query.get("pageSize").map(|value| value.as_ref()),
+                Some("1000")
+            );
+            assert_eq!(
+                query.get("pageToken").map(|value| value.as_ref()),
+                if index == 2 { Some("next-page") } else { None }
+            );
         }
         Ok(())
     }
@@ -465,27 +509,42 @@ mod tests {
         assert_eq!(folders[0].id, "spaces/work");
         assert_eq!(folders[0].name, "Work");
         let store = crate::Store::open(":memory:")?;
-        store.add_backend_account("mock-account", "Memos", "memos", &format!("http://{address}"))?;
+        store.add_backend_account(
+            "mock-account",
+            "Memos",
+            "memos",
+            &format!("http://{address}"),
+        )?;
         store.import_backend_snapshot("mock-account", &folders, &memos)?;
         let active = store.notes(&crate::NoteFilter {
-            account_id: Some("mock-account".to_owned()), ..Default::default()
+            account_id: Some("mock-account".to_owned()),
+            ..Default::default()
         })?;
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].content, "# Title");
         assert_eq!(active[0].title, "Title");
-        assert_eq!(active[0].folder_id.as_deref(), Some(store.folders()?[0].id.as_str()));
+        assert_eq!(
+            active[0].folder_id.as_deref(),
+            Some(store.folders()?[0].id.as_str())
+        );
         let archived = store.notes(&crate::NoteFilter {
-            account_id: Some("mock-account".to_owned()), archived: true, ..Default::default()
+            account_id: Some("mock-account".to_owned()),
+            archived: true,
+            ..Default::default()
         })?;
         assert_eq!(archived.len(), 1);
         assert!(store.pending_sync_events(100)?.is_empty());
         assert!(requests[0].starts_with("GET /api/v1/memos?pageSize=1000 HTTP/1.1"));
-        assert!(requests[1]
-            .starts_with("GET /api/v1/memos?pageSize=1000&pageToken=second-page HTTP/1.1"));
+        assert!(
+            requests[1]
+                .starts_with("GET /api/v1/memos?pageSize=1000&pageToken=second-page HTTP/1.1")
+        );
         assert!(requests[2].starts_with("GET /api/v1/spaces?pageSize=1000 HTTP/1.1"));
-        assert!(requests.iter().all(|request| request
-            .to_ascii_lowercase()
-            .contains("authorization: bearer probe-token")));
+        assert!(requests.iter().all(|request| {
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer probe-token")
+        }));
         Ok(())
     }
 

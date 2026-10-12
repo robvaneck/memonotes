@@ -1,3 +1,4 @@
+use crate::i18n::tr;
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -7,9 +8,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 pub mod adapters;
+pub mod credentials;
+pub mod i18n;
 pub mod memo;
 pub mod memos;
-pub mod credentials;
 
 const NOTE_COLOR_IDS: [&str; 36] = [
     "default", "gray", "mauve", "slate", "sage", "olive", "sand", "tomato", "red", "ruby",
@@ -103,6 +105,12 @@ pub enum SyncEvent {
     NoteRestored { note: NoteSnapshot },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FolderDeleteMode {
+    KeepNotes,
+    DeleteNotes,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct SyncOutboxEntry {
     pub sequence: i64,
@@ -126,13 +134,13 @@ pub struct Store {
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let mut connection = Connection::open(path).context("Kan notitieopslag niet openen")?;
+        let mut connection = Connection::open(path).context(tr("storage.error.open_failed"))?;
         connection.pragma_update(None, "foreign_keys", true)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version > 9 {
-            bail!("Deze opslag is gemaakt door een nieuwere versie van Memonotes");
+            bail!(tr("storage.error.newer_schema_version"));
         }
         if version == 0 {
             let transaction = connection.transaction()?;
@@ -252,7 +260,7 @@ impl Store {
 
     pub fn create_folder(&self, account_id: Option<&str>, name: &str) -> Result<String> {
         if name.trim().is_empty() {
-            bail!("Een folder heeft een naam nodig");
+            bail!(tr("storage.error.folder_name_required"));
         }
         let id = Uuid::new_v4().to_string();
         let transaction = self.connection.unchecked_transaction()?;
@@ -276,7 +284,7 @@ impl Store {
 
     pub fn rename_folder(&self, id: &str, name: &str) -> Result<()> {
         if name.trim().is_empty() {
-            bail!("Een folder heeft een naam nodig");
+            bail!(tr("storage.error.folder_name_required"));
         }
         let transaction = self.connection.unchecked_transaction()?;
         let changed = transaction.execute(
@@ -300,7 +308,7 @@ impl Store {
         Ok(())
     }
 
-    pub fn delete_folder(&mut self, id: &str) -> Result<()> {
+    pub fn delete_folder(&mut self, id: &str, mode: FolderDeleteMode) -> Result<()> {
         let transaction = self.connection.unchecked_transaction()?;
         let mut statement = transaction.prepare(
             "SELECT id, folder_id, content, title, updated_at, pinned, archived, account_id
@@ -311,20 +319,33 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
         let changed_at = timestamp()?;
-        transaction.execute(
-            "UPDATE notes SET folder_id = NULL, updated_at = ?2 WHERE folder_id = ?1",
-            params![id, changed_at],
-        )?;
+        if mode == FolderDeleteMode::KeepNotes {
+            transaction.execute(
+                "UPDATE notes SET folder_id = NULL, updated_at = ?2 WHERE folder_id = ?1",
+                params![id, changed_at],
+            )?;
+        } else {
+            transaction.execute("DELETE FROM notes WHERE folder_id = ?1", [id])?;
+        }
         let deleted = transaction.execute("DELETE FROM folders WHERE id = ?1", [id])?;
         self.changed(deleted)?;
         for mut note in moved_notes {
-            note.folder_id = None;
-            note.updated_at = changed_at;
-            append_sync_event(&transaction, SyncEvent::NoteUpdated { note: note.into() })?;
+            match mode {
+                FolderDeleteMode::KeepNotes => {
+                    note.folder_id = None;
+                    note.updated_at = changed_at;
+                    append_sync_event(&transaction, SyncEvent::NoteUpdated { note: note.into() })?;
+                }
+                FolderDeleteMode::DeleteNotes => {
+                    append_sync_event(&transaction, SyncEvent::NoteDeleted { note: note.into() })?;
+                }
+            }
         }
         append_sync_event(
             &transaction,
-            SyncEvent::FolderDeleted { folder_id: id.to_owned() },
+            SyncEvent::FolderDeleted {
+                folder_id: id.to_owned(),
+            },
         )?;
         transaction.commit()?;
         Ok(())
@@ -400,6 +421,35 @@ impl Store {
         Ok(())
     }
 
+    pub fn language_preference(&self) -> Result<Option<String>> {
+        let preference: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT value FROM app_settings WHERE key = 'language'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(preference.filter(|language| i18n::LANGUAGES.contains(&language.as_str())))
+    }
+
+    pub fn set_language_preference(&self, language: Option<&str>) -> Result<()> {
+        if let Some(language) = language {
+            if !i18n::LANGUAGES.contains(&language) {
+                bail!(tr("storage.error.unsupported_language"));
+            }
+            self.connection.execute(
+                "INSERT INTO app_settings (key, value) VALUES ('language', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [language],
+            )?;
+        } else {
+            self.connection
+                .execute("DELETE FROM app_settings WHERE key = 'language'", [])?;
+        }
+        Ok(())
+    }
+
     pub fn note_color(&self) -> Result<String> {
         Ok(self.connection.query_row(
             "SELECT value FROM app_settings WHERE key = 'note_color'",
@@ -410,7 +460,7 @@ impl Store {
 
     pub fn set_note_color(&self, color: &str) -> Result<()> {
         if !NOTE_COLOR_IDS.contains(&color) {
-            bail!("Ongeldige notitiekleur");
+            bail!(tr("storage.error.invalid_note_color"));
         }
         self.connection.execute(
             "INSERT INTO app_settings (key, value) VALUES ('note_color', ?1)
@@ -442,10 +492,7 @@ impl Store {
         let transaction = self.connection.unchecked_transaction()?;
         let note = load_note(&transaction, id)?;
         self.changed(transaction.execute("DELETE FROM notes WHERE id = ?1", [id])?)?;
-        append_sync_event(
-            &transaction,
-            SyncEvent::NoteDeleted { note: note.into() },
-        )?;
+        append_sync_event(&transaction, SyncEvent::NoteDeleted { note: note.into() })?;
         transaction.commit()?;
         Ok(())
     }
@@ -511,13 +558,25 @@ impl Store {
         account: &BackendAccount,
         adapter: &dyn adapters::BackendAdapter,
     ) -> Result<usize> {
-        let mut statement = self.connection.prepare(
-            "SELECT sequence, payload FROM sync_outbox ORDER BY sequence",
-        )?;
-        let pending = statement.query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut statement = self
+            .connection
+            .prepare("SELECT sequence, payload FROM sync_outbox ORDER BY sequence")?;
+        let pending = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
+        let mut folder_owners = HashMap::new();
+        for (_, payload) in &pending {
+            let event: SyncEvent = serde_json::from_str(payload)?;
+            if let SyncEvent::FolderCreated { folder } | SyncEvent::FolderUpdated { folder } = event
+            {
+                if let Some(account_id) = folder.account_id {
+                    folder_owners.insert(folder.id, account_id);
+                }
+            }
+        }
         let mut batches: Vec<(Vec<i64>, SyncEvent)> = Vec::new();
         for (sequence, payload) in pending {
             let event: SyncEvent = serde_json::from_str(&payload)?;
@@ -526,7 +585,7 @@ impl Store {
                 SyncEvent::FolderDeleted { folder_id } => self.connection.query_row(
                     "SELECT account_id FROM backend_resource_links WHERE local_id = ?1 AND remote_name LIKE 'spaces/%'",
                     [folder_id], |row| row.get::<_, String>(0),
-                ).optional()?,
+                ).optional()?.or_else(|| folder_owners.get(folder_id).cloned()),
                 SyncEvent::NoteCreated { note } | SyncEvent::NoteUpdated { note }
                 | SyncEvent::NoteArchived { note } | SyncEvent::NoteUnarchived { note }
                 | SyncEvent::NoteDeleted { note } | SyncEvent::NoteRestored { note } => note.account_id.clone(),
@@ -548,12 +607,19 @@ impl Store {
         }
         let mut sent = 0;
         for (sequences, mut event) in batches {
-            if !account.enabled || account.provider != "memos"
-                || !self.backend_accounts()?.iter().any(|current| current == account)
+            if !account.enabled
+                || account.provider != "memos"
+                || !self
+                    .backend_accounts()?
+                    .iter()
+                    .any(|current| current == account)
             {
-                bail!("Het Memos-account is gewijzigd of uitgeschakeld; verzending gestopt");
+                bail!(tr("api.memos.error.account_changed_or_disabled"));
             }
-            let creates_note = matches!(&event, SyncEvent::NoteCreated { .. } | SyncEvent::NoteRestored { .. });
+            let creates_note = matches!(
+                &event,
+                SyncEvent::NoteCreated { .. } | SyncEvent::NoteRestored { .. }
+            );
             let created_link = match &mut event {
                 SyncEvent::FolderCreated { folder } => {
                     let local_id = folder.id.clone();
@@ -568,17 +634,23 @@ impl Store {
                     *folder_id = self.backend_resource_name(&account.id, folder_id, "spaces")?;
                     None
                 }
-                SyncEvent::NoteCreated { note } | SyncEvent::NoteRestored { note }
-                | SyncEvent::NoteUpdated { note } | SyncEvent::NoteArchived { note }
-                | SyncEvent::NoteUnarchived { note } | SyncEvent::NoteDeleted { note } => {
+                SyncEvent::NoteCreated { note }
+                | SyncEvent::NoteRestored { note }
+                | SyncEvent::NoteUpdated { note }
+                | SyncEvent::NoteArchived { note }
+                | SyncEvent::NoteUnarchived { note }
+                | SyncEvent::NoteDeleted { note } => {
                     let local_id = note.id.clone();
                     note.id = self.backend_resource_name(&account.id, &local_id, "memos")?;
                     if let Some(folder_id) = &mut note.folder_id {
-                        *folder_id = self.backend_resource_name(&account.id, folder_id, "spaces")?;
+                        *folder_id =
+                            self.backend_resource_name(&account.id, folder_id, "spaces")?;
                     }
                     if creates_note {
                         Some((local_id, note.id.clone()))
-                    } else { None }
+                    } else {
+                        None
+                    }
                 }
             };
             adapter.apply_event(&event)?;
@@ -591,7 +663,10 @@ impl Store {
                 )?;
             }
             for sequence in sequences {
-                self.changed(transaction.execute("DELETE FROM sync_outbox WHERE sequence = ?1", [sequence])?)?;
+                self.changed(
+                    transaction
+                        .execute("DELETE FROM sync_outbox WHERE sequence = ?1", [sequence])?,
+                )?;
             }
             transaction.commit()?;
             sent += 1;
@@ -608,7 +683,8 @@ impl Store {
                     SELECT 1 FROM backend_resource_links WHERE account_id = ?1
                     AND local_id = json_extract(payload, '$.snapshot.folder_id')
                     AND remote_name LIKE 'spaces/%')))",
-            [account_id], |row| row.get(0),
+            [account_id],
+            |row| row.get(0),
         )?)
     }
 
@@ -624,20 +700,33 @@ impl Store {
     pub fn outbox_revision(&self) -> Result<i64> {
         Ok(self.connection.query_row(
             "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'sync_outbox'), 0)",
-            [], |row| row.get(0),
+            [],
+            |row| row.get(0),
         )?)
     }
 
-    fn backend_resource_name(&self, account_id: &str, local_id: &str, collection: &str) -> Result<String> {
-        Ok(self.connection.query_row(
-            "SELECT remote_name FROM backend_resource_links
+    fn backend_resource_name(
+        &self,
+        account_id: &str,
+        local_id: &str,
+        collection: &str,
+    ) -> Result<String> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT remote_name FROM backend_resource_links
              WHERE account_id = ?1 AND local_id = ?2 AND remote_name LIKE ?3",
-            params![account_id, local_id, format!("{collection}/%")],
-            |row| row.get::<_, String>(0),
-        ).optional()?.unwrap_or_else(|| {
-            if local_id.starts_with(&format!("{collection}/")) { local_id.to_owned() }
-            else { format!("{collection}/{local_id}") }
-        }))
+                params![account_id, local_id, format!("{collection}/%")],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .unwrap_or_else(|| {
+                if local_id.starts_with(&format!("{collection}/")) {
+                    local_id.to_owned()
+                } else {
+                    format!("{collection}/{local_id}")
+                }
+            }))
     }
 
     pub fn backend_memo_name(&self, account_id: &str, note_id: &str) -> Result<String> {
@@ -688,12 +777,19 @@ impl Store {
             || provider.trim().is_empty()
             || server_url.trim().is_empty()
         {
-            bail!("Accountnaam, backend en serveradres zijn verplicht");
+            bail!(tr("storage.error.account_fields_required"));
         }
         self.connection.execute(
             "INSERT INTO backend_accounts (id, label, provider, server_url, created_at, enabled)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![id, label.trim(), provider, server_url.trim(), timestamp()?, enabled],
+            params![
+                id,
+                label.trim(),
+                provider,
+                server_url.trim(),
+                timestamp()?,
+                enabled
+            ],
         )?;
         Ok(())
     }
@@ -707,7 +803,7 @@ impl Store {
 
     pub fn update_backend_account(&self, id: &str, label: &str, server_url: &str) -> Result<()> {
         if label.trim().is_empty() || server_url.trim().is_empty() {
-            bail!("Accountnaam en serveradres zijn verplicht");
+            bail!(tr("storage.error.account_name_and_server_required"));
         }
         self.changed(self.connection.execute(
             "UPDATE backend_accounts SET label = ?2, server_url = ?3 WHERE id = ?1",
@@ -764,11 +860,15 @@ impl Store {
     }
 
     pub fn note(&self, id: &str) -> Result<Option<Note>> {
-        Ok(self.connection.query_row(
-            "SELECT id, folder_id, content, title, updated_at, pinned, archived, account_id
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT id, folder_id, content, title, updated_at, pinned, archived, account_id
              FROM notes WHERE id = ?1",
-            [id], note_from_row,
-        ).optional()?)
+                [id],
+                note_from_row,
+            )
+            .optional()?)
     }
 
     pub fn import_backend_snapshot(
@@ -783,7 +883,7 @@ impl Store {
             [account_id], |row| row.get(0),
         )?;
         if !valid_account {
-            bail!("Het Memos-account is verwijderd of uitgeschakeld");
+            bail!(tr("api.memos.error.account_removed_or_disabled"));
         }
         let mut protected = HashSet::new();
         let mut statement = transaction.prepare("SELECT payload FROM sync_outbox")?;
@@ -792,14 +892,21 @@ impl Store {
             let event: SyncEvent = serde_json::from_str(&payload?)?;
             let id = match event {
                 SyncEvent::FolderCreated { folder } | SyncEvent::FolderUpdated { folder } => {
-                    if folder.account_id.as_deref() != Some(account_id) { continue; }
+                    if folder.account_id.as_deref() != Some(account_id) {
+                        continue;
+                    }
                     folder.id
                 }
                 SyncEvent::FolderDeleted { folder_id } => folder_id,
-                SyncEvent::NoteCreated { note } | SyncEvent::NoteUpdated { note }
-                | SyncEvent::NoteArchived { note } | SyncEvent::NoteUnarchived { note }
-                | SyncEvent::NoteDeleted { note } | SyncEvent::NoteRestored { note } => {
-                    if note.account_id.as_deref() != Some(account_id) { continue; }
+                SyncEvent::NoteCreated { note }
+                | SyncEvent::NoteUpdated { note }
+                | SyncEvent::NoteArchived { note }
+                | SyncEvent::NoteUnarchived { note }
+                | SyncEvent::NoteDeleted { note }
+                | SyncEvent::NoteRestored { note } => {
+                    if note.account_id.as_deref() != Some(account_id) {
+                        continue;
+                    }
                     note.id
                 }
             };
@@ -808,7 +915,14 @@ impl Store {
         drop(statement);
         let mut folder_ids = HashMap::new();
         for folder in folders {
-            let id = cached_resource_id(&transaction, account_id, &folder.id, "folders", "spaces", &protected)?;
+            let id = cached_resource_id(
+                &transaction,
+                account_id,
+                &folder.id,
+                "folders",
+                "spaces",
+                &protected,
+            )?;
             if !protected.contains(&id) {
                 transaction.execute(
                     "INSERT INTO folders (id, account_id, name) VALUES (?1, ?2, ?3)
@@ -818,14 +932,22 @@ impl Store {
             }
             let exists: bool = transaction.query_row(
                 "SELECT EXISTS(SELECT 1 FROM folders WHERE id = ?1 AND account_id = ?2)",
-                params![id, account_id], |row| row.get(0),
+                params![id, account_id],
+                |row| row.get(0),
             )?;
             if exists {
                 folder_ids.insert(folder.id.clone(), id);
             }
         }
         for memo in memos {
-            let id = cached_resource_id(&transaction, account_id, &memo.id, "notes", "memos", &protected)?;
+            let id = cached_resource_id(
+                &transaction,
+                account_id,
+                &memo.id,
+                "notes",
+                "memos",
+                &protected,
+            )?;
             if protected.contains(&id) {
                 continue;
             }
@@ -863,7 +985,7 @@ impl Store {
 
     fn changed(&self, count: usize) -> Result<()> {
         if count != 1 {
-            bail!("De notitie of folder bestaat niet meer");
+            bail!(tr("storage.error.note_or_folder_missing"));
         }
         Ok(())
     }
@@ -877,21 +999,29 @@ fn cached_resource_id(
     collection: &str,
     protected: &HashSet<String>,
 ) -> Result<String> {
-    let suffix = remote_name.strip_prefix(&format!("{collection}/"))
+    let suffix = remote_name
+        .strip_prefix(&format!("{collection}/"))
         .filter(|id| !id.is_empty() && !id.contains('/'))
-        .context("Memos gaf een ongeldige resourcenaam terug")?;
+        .context(tr("api.memos.error.invalid_resource_name"))?;
     if let Some(id) = connection.query_row(
         "SELECT local_id FROM backend_resource_links WHERE account_id = ?1 AND remote_name = ?2",
         params![account_id, remote_name], |row| row.get::<_, String>(0),
     ).optional()? {
         return Ok(id);
     }
-    let existing = connection.query_row(
-        &format!("SELECT id FROM {table} WHERE id = ?1 AND account_id = ?2"),
-        params![suffix, account_id], |row| row.get::<_, String>(0),
-    ).optional()?;
+    let existing = connection
+        .query_row(
+            &format!("SELECT id FROM {table} WHERE id = ?1 AND account_id = ?2"),
+            params![suffix, account_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
     let id = existing.unwrap_or_else(|| {
-        if protected.contains(suffix) { suffix.to_owned() } else { Uuid::new_v4().to_string() }
+        if protected.contains(suffix) {
+            suffix.to_owned()
+        } else {
+            Uuid::new_v4().to_string()
+        }
     });
     connection.execute(
         "INSERT INTO backend_resource_links (account_id, remote_name, local_id) VALUES (?1, ?2, ?3)",
@@ -918,7 +1048,11 @@ impl From<Note> for NoteSnapshot {
 fn append_sync_event(connection: &Connection, event: SyncEvent) -> Result<()> {
     connection.execute(
         "INSERT INTO sync_outbox (event_id, payload, created_at) VALUES (?1, ?2, ?3)",
-        params![Uuid::new_v4().to_string(), serde_json::to_string(&event)?, timestamp()?],
+        params![
+            Uuid::new_v4().to_string(),
+            serde_json::to_string(&event)?,
+            timestamp()?
+        ],
     )?;
     Ok(())
 }
@@ -937,14 +1071,16 @@ fn ensure_folder_in_account(
     account_id: Option<&str>,
 ) -> Result<()> {
     let folder_account: Option<Option<String>> = connection
-        .query_row("SELECT account_id FROM folders WHERE id = ?1", [folder_id], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT account_id FROM folders WHERE id = ?1",
+            [folder_id],
+            |row| row.get(0),
+        )
         .optional()?;
     match folder_account {
-        None => bail!("De map bestaat niet meer"),
+        None => bail!(tr("storage.error.folder_missing")),
         Some(folder_account) if folder_account.as_deref() != account_id => {
-            bail!("De map hoort bij een ander account")
+            bail!(tr("storage.error.folder_account_mismatch"))
         }
         Some(_) => Ok(()),
     }
@@ -960,7 +1096,10 @@ fn load_note(connection: &Connection, id: &str) -> Result<Note> {
 }
 
 fn timestamp() -> Result<i64> {
-    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis().try_into()?)
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_millis()
+        .try_into()?)
 }
 
 fn note_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Note> {
@@ -1001,15 +1140,26 @@ mod tests {
         assert_eq!(note.content, "# Nieuwe titel\nBestaande tekst");
         assert_eq!(note.editor_document(), "Nieuwe titel\nBestaande tekst");
         let pending = store.pending_sync_events(100)?;
-        assert!(matches!(&pending.last().unwrap().event, SyncEvent::NoteUpdated { note }
-            if note.content == "# Nieuwe titel\nBestaande tekst"));
+        assert!(
+            matches!(&pending.last().unwrap().event, SyncEvent::NoteUpdated { note }
+            if note.content == "# Nieuwe titel\nBestaande tekst")
+        );
         let document = "Gewijzigd in teksteditor\n\nBestaande tekst";
         let (title, body) = memo::editor_parts(document);
         store.save_note_editor(&id, title, body)?;
         let note = store.note(&id)?.unwrap();
         assert_eq!(note.title, "Gewijzigd in teksteditor");
-        assert_eq!(note.editor_document(), "Gewijzigd in teksteditor\n\nBestaande tekst");
-        for document in ["Titel", "Titel\n\nTekst met #hashtag", "#hashtag\nTekst", "", "\nTekst"] {
+        assert_eq!(
+            note.editor_document(),
+            "Gewijzigd in teksteditor\n\nBestaande tekst"
+        );
+        for document in [
+            "Titel",
+            "Titel\n\nTekst met #hashtag",
+            "#hashtag\nTekst",
+            "",
+            "\nTekst",
+        ] {
             let (title, body) = memo::editor_parts(document);
             store.save_note_editor(&id, title, body)?;
             let note = store.note(&id)?.unwrap();
@@ -1029,12 +1179,21 @@ mod tests {
         let store = Store::open(":memory:")?;
         store.add_backend_account("one", "Werk", "memos", "https://memos.example.com")?;
         let mut remote = memo::Memo {
-            id: "memos/title".to_owned(), content: "Eerste regel\n\n# Latere kop".to_owned(),
-            title: Some("Latere kop".to_owned()), folder_id: None,
-            pinned: false, archived: false, updated_at: None,
+            id: "memos/title".to_owned(),
+            content: "Eerste regel\n\n# Latere kop".to_owned(),
+            title: Some("Latere kop".to_owned()),
+            folder_id: None,
+            pinned: false,
+            archived: false,
+            updated_at: None,
         };
         store.import_backend_memo("one", &remote)?;
-        let note = store.notes(&NoteFilter { account_id: Some("one".to_owned()), ..Default::default() })?.remove(0);
+        let note = store
+            .notes(&NoteFilter {
+                account_id: Some("one".to_owned()),
+                ..Default::default()
+            })?
+            .remove(0);
         assert_eq!(note.title, "Eerste regel");
         assert_eq!(note.editor_parts(), ("Eerste regel", "\n# Latere kop"));
         assert_eq!(note.editor_document(), remote.content);
@@ -1062,9 +1221,10 @@ mod tests {
             store.set_note_color("mint")?;
         }
         let store = Store::open(&path)?;
-        let schema_version: i64 = store
-            .connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))?;
+        let schema_version: i64 =
+            store
+                .connection
+                .pragma_query_value(None, "user_version", |row| row.get(0))?;
         assert_eq!(schema_version, 9);
         assert_eq!(store.folders()?[0].count, 1);
         let note = store.note(&id)?.unwrap();
@@ -1079,13 +1239,25 @@ mod tests {
         let path = directory.path().join("notes.sqlite3");
         let store = Store::open(&path)?;
         for account_id in ["one", "two"] {
-            store.add_backend_account(account_id, account_id, "memos", "https://memos.example.com")?;
+            store.add_backend_account(
+                account_id,
+                account_id,
+                "memos",
+                "https://memos.example.com",
+            )?;
         }
-        let folders = vec![memo::MemoFolder { id: "spaces/work".to_owned(), name: "Werk".to_owned() }];
+        let folders = vec![memo::MemoFolder {
+            id: "spaces/work".to_owned(),
+            name: "Werk".to_owned(),
+        }];
         let mut memos = vec![memo::Memo {
-            id: "memos/remote-one".to_owned(), content: "# Server\nInhoud".to_owned(),
-            title: Some("Server".to_owned()), folder_id: Some("spaces/work".to_owned()),
-            pinned: true, archived: false, updated_at: Some(1791633600000),
+            id: "memos/remote-one".to_owned(),
+            content: "# Server\nInhoud".to_owned(),
+            title: Some("Server".to_owned()),
+            folder_id: Some("spaces/work".to_owned()),
+            pinned: true,
+            archived: false,
+            updated_at: Some(1791633600000),
         }];
         for account_id in ["one", "two"] {
             store.import_backend_snapshot(account_id, &folders, &memos)?;
@@ -1096,23 +1268,40 @@ mod tests {
         };
         store.import_backend_memo("two", &second_account_memo)?;
         assert!(store.pending_sync_events(100)?.is_empty());
-        let filter = NoteFilter { account_id: Some("one".to_owned()), ..Default::default() };
+        let filter = NoteFilter {
+            account_id: Some("one".to_owned()),
+            ..Default::default()
+        };
         let first = store.notes(&filter)?.remove(0);
         assert_eq!(first.updated_at, 1791633600000);
         assert!(first.pinned);
         let mut focused_memo = memos[0].clone();
         focused_memo.content = "Bijgewerkt via gerichte GET".to_owned();
         store.import_backend_memo("one", &focused_memo)?;
-        assert_eq!(store.note(&first.id)?.unwrap().content, "Bijgewerkt via gerichte GET");
+        assert_eq!(
+            store.note(&first.id)?.unwrap().content,
+            "Bijgewerkt via gerichte GET"
+        );
         assert_eq!(store.note(&first.id)?.unwrap().folder_id, first.folder_id);
         assert!(!store.has_pending_note_events(&first.id)?);
-        let second = store.notes(&NoteFilter { account_id: Some("two".to_owned()), ..Default::default() })?.remove(0);
+        let second = store
+            .notes(&NoteFilter {
+                account_id: Some("two".to_owned()),
+                ..Default::default()
+            })?
+            .remove(0);
         assert_eq!(second.updated_at, 1791720000000);
         assert_ne!(first.updated_at, second.updated_at);
         assert_ne!(first.id, second.id);
         assert_ne!(first.folder_id, second.folder_id);
-        assert_eq!(store.backend_folder_name("one", first.folder_id.as_deref().unwrap())?, "spaces/work");
-        assert_eq!(store.backend_folder_name("two", second.folder_id.as_deref().unwrap())?, "spaces/work");
+        assert_eq!(
+            store.backend_folder_name("one", first.folder_id.as_deref().unwrap())?,
+            "spaces/work"
+        );
+        assert_eq!(
+            store.backend_folder_name("two", second.folder_id.as_deref().unwrap())?,
+            "spaces/work"
+        );
         store.save_note(&first.id, "Lokale wijziging", "Lokaal")?;
         assert!(store.has_pending_note_events(&first.id)?);
         store.rename_folder(first.folder_id.as_deref().unwrap(), "Lokale mapnaam")?;
@@ -1121,7 +1310,15 @@ mod tests {
         store.import_backend_snapshot("one", &folders, &memos)?;
         assert_eq!(store.notes(&filter)?.len(), 1);
         assert_eq!(store.note(&first.id)?.unwrap().content, "Lokale wijziging");
-        assert_eq!(store.folders()?.into_iter().find(|folder| folder.id == first.folder_id.as_deref().unwrap()).unwrap().name, "Lokale mapnaam");
+        assert_eq!(
+            store
+                .folders()?
+                .into_iter()
+                .find(|folder| folder.id == first.folder_id.as_deref().unwrap())
+                .unwrap()
+                .name,
+            "Lokale mapnaam"
+        );
         assert_eq!(store.pending_sync_events(100)?, pending);
         store.delete_note(&first.id)?;
         store.import_backend_snapshot("one", &folders, &memos)?;
@@ -1130,8 +1327,19 @@ mod tests {
         drop(store);
         let store = Store::open(&path)?;
         store.import_backend_snapshot("two", &folders, &memos)?;
-        assert_eq!(store.note(&second.id)?.unwrap().content, "Gewijzigd op server");
-        assert_eq!(store.notes(&NoteFilter { account_id: Some("two".to_owned()), ..Default::default() })?.len(), 1);
+        assert_eq!(
+            store.note(&second.id)?.unwrap().content,
+            "Gewijzigd op server"
+        );
+        assert_eq!(
+            store
+                .notes(&NoteFilter {
+                    account_id: Some("two".to_owned()),
+                    ..Default::default()
+                })?
+                .len(),
+            1
+        );
         Ok(())
     }
 
@@ -1139,14 +1347,30 @@ mod tests {
     fn backend_import_rolls_back_invalid_data_and_rejects_disabled_accounts() -> Result<()> {
         let store = Store::open(":memory:")?;
         store.add_backend_account("one", "Werk", "memos", "https://memos.example.com")?;
-        let folders = vec![memo::MemoFolder { id: "spaces/work".to_owned(), name: "Werk".to_owned() }];
+        let folders = vec![memo::MemoFolder {
+            id: "spaces/work".to_owned(),
+            name: "Werk".to_owned(),
+        }];
         let invalid = memo::Memo {
-            id: "invalid".to_owned(), content: "Inhoud".to_owned(), title: None,
-            folder_id: None, pinned: false, archived: false, updated_at: None,
+            id: "invalid".to_owned(),
+            content: "Inhoud".to_owned(),
+            title: None,
+            folder_id: None,
+            pinned: false,
+            archived: false,
+            updated_at: None,
         };
-        assert!(store.import_backend_snapshot("one", &folders, &[invalid]).is_err());
+        assert!(
+            store
+                .import_backend_snapshot("one", &folders, &[invalid])
+                .is_err()
+        );
         assert!(store.folders()?.is_empty());
-        let links: i64 = store.connection.query_row("SELECT count(*) FROM backend_resource_links", [], |row| row.get(0))?;
+        let links: i64 = store.connection.query_row(
+            "SELECT count(*) FROM backend_resource_links",
+            [],
+            |row| row.get(0),
+        )?;
         assert_eq!(links, 0);
         store.set_backend_account_enabled("one", false)?;
         assert!(store.import_backend_snapshot("one", &folders, &[]).is_err());
@@ -1191,7 +1415,11 @@ mod tests {
 
             let events = store.pending_sync_events(100)?;
             assert_eq!(events.len(), 9);
-            assert!(events.windows(2).all(|pair| pair[0].sequence < pair[1].sequence));
+            assert!(
+                events
+                    .windows(2)
+                    .all(|pair| pair[0].sequence < pair[1].sequence)
+            );
             assert!(events.iter().all(|event| !event.event_id.is_empty()));
             assert!(matches!(events[0].event, SyncEvent::FolderCreated { .. }));
             assert!(matches!(events[1].event, SyncEvent::FolderUpdated { .. }));
@@ -1336,7 +1564,7 @@ mod tests {
         let folder_id = store.create_folder(None, "Werk")?;
         let note_id = store.create_note(None, Some(&folder_id))?;
 
-        store.delete_folder(&folder_id)?;
+        store.delete_folder(&folder_id, FolderDeleteMode::KeepNotes)?;
 
         let events = store.pending_sync_events(100)?;
         assert!(matches!(events[2].event, SyncEvent::NoteUpdated { .. }));
@@ -1362,8 +1590,14 @@ mod tests {
 
         assert!(store.create_note(Some("home"), Some(&work_folder)).is_err());
         assert!(store.move_note(&home_note, Some(&work_folder)).is_err());
-        let work = NoteFilter { account_id: Some("work".into()), ..Default::default() };
-        let home = NoteFilter { account_id: Some("home".into()), ..Default::default() };
+        let work = NoteFilter {
+            account_id: Some("work".into()),
+            ..Default::default()
+        };
+        let home = NoteFilter {
+            account_id: Some("home".into()),
+            ..Default::default()
+        };
         assert_eq!(store.notes(&work)?[0].id, work_note);
         assert_eq!(store.notes(&home)?[0].id, home_note);
         assert_eq!(store.count_notes(&NoteFilter::default())?, 0);
@@ -1382,6 +1616,31 @@ mod tests {
         store.set_note_color("teal")?;
         assert_eq!(store.note_color()?, "teal");
         assert!(store.set_note_color("not-a-color").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn language_preference_persists_and_supports_system_default() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("notes.sqlite3");
+        let store = Store::open(&path)?;
+        assert_eq!(store.language_preference()?, None);
+        for language in i18n::LANGUAGES {
+            store.set_language_preference(Some(language))?;
+            assert_eq!(
+                Store::open(&path)?.language_preference()?.as_deref(),
+                Some(language)
+            );
+        }
+        assert!(store.set_language_preference(Some("unknown")).is_err());
+        assert_eq!(store.language_preference()?.as_deref(), Some("es"));
+        store.set_language_preference(None)?;
+        assert_eq!(Store::open(&path)?.language_preference()?, None);
+        store.connection.execute(
+            "INSERT INTO app_settings (key, value) VALUES ('language', 'unknown')",
+            [],
+        )?;
+        assert_eq!(store.language_preference()?, None);
         Ok(())
     }
 
@@ -1436,7 +1695,7 @@ mod tests {
         store.save_note(&note_id, "Belangrijk", "Plan")?;
         store.set_archived(&archived_note_id, true)?;
 
-        store.delete_folder(&folder_id)?;
+        store.delete_folder(&folder_id, FolderDeleteMode::KeepNotes)?;
 
         assert!(store.folders()?.is_empty());
         let note = store.note(&note_id)?.unwrap();
@@ -1466,16 +1725,53 @@ mod tests {
     }
 
     #[test]
+    fn deleting_folder_and_notes_queues_note_deletions_before_folder_delete() -> Result<()> {
+        let mut store = Store::open(":memory:")?;
+        let folder_id = store.create_folder(None, "Werk")?;
+        let note_id = store.create_note(None, Some(&folder_id))?;
+
+        store.delete_folder(&folder_id, FolderDeleteMode::DeleteNotes)?;
+
+        assert!(store.folders()?.is_empty());
+        assert!(store.note(&note_id)?.is_none());
+        let events = store.pending_sync_events(100)?;
+        assert!(matches!(
+            &events[2].event,
+            SyncEvent::NoteDeleted { note } if note.id == note_id
+        ));
+        assert!(matches!(
+            &events[3].event,
+            SyncEvent::FolderDeleted { folder_id: deleted_id } if deleted_id == &folder_id
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn moving_pinning_archiving_and_searching_are_consistent() -> Result<()> {
         let store = Store::open(":memory:")?;
         let folder = store.create_folder(None, "Werk")?;
         let id = store.create_note(None, None)?;
         store.save_note(&id, "**Planning** 100%", "Weekplan")?;
-        assert_eq!(store.notes(&NoteFilter { search: "100%".into(), ..Default::default() })?.len(), 1);
+        assert_eq!(
+            store
+                .notes(&NoteFilter {
+                    search: "100%".into(),
+                    ..Default::default()
+                })?
+                .len(),
+            1
+        );
         store.move_note(&id, Some(&folder))?;
         store.set_pinned(&id, true)?;
         assert!(store.note(&id)?.unwrap().pinned);
-        assert!(store.notes(&NoteFilter { unfiled: true, ..Default::default() })?.is_empty());
+        assert!(
+            store
+                .notes(&NoteFilter {
+                    unfiled: true,
+                    ..Default::default()
+                })?
+                .is_empty()
+        );
         assert_eq!(store.folders()?[0].count, 1);
         store.set_archived(&id, true)?;
         assert!(store.notes(&NoteFilter::default())?.is_empty());
@@ -1495,7 +1791,14 @@ mod tests {
         store.delete_note(&id)?;
 
         assert!(store.note(&id)?.is_none());
-        assert!(store.notes(&NoteFilter { archived: true, ..Default::default() })?.is_empty());
+        assert!(
+            store
+                .notes(&NoteFilter {
+                    archived: true,
+                    ..Default::default()
+                })?
+                .is_empty()
+        );
         Ok(())
     }
 

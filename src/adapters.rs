@@ -1,3 +1,4 @@
+use crate::i18n::tr;
 use anyhow::{Context, Result, bail, ensure};
 use reqwest::Method;
 use serde_json::{Value, json};
@@ -26,12 +27,12 @@ impl MemosMutation {
             SyncEvent::FolderCreated { folder } | SyncEvent::FolderUpdated { folder } => {
                 ensure!(
                     folder.account_id.is_some(),
-                    "Lokale mappen worden niet geupload"
+                    tr("api.memos.error.local_folder_upload_blocked")
                 );
                 let id = resource_id(&folder.id, "spaces")?;
                 ensure!(
                     !folder.name.trim().is_empty(),
-                    "Een folder heeft een naam nodig"
+                    tr("storage.error.folder_name_required")
                 );
                 if matches!(event, SyncEvent::FolderCreated { .. }) {
                     Ok(Self {
@@ -49,10 +50,14 @@ impl MemosMutation {
                     })
                 }
             }
-            SyncEvent::FolderDeleted { .. } => {
-                bail!(
-                    "Memos-space verwijderen is geblokkeerd: de API wist ook alle notities in de space"
-                )
+            SyncEvent::FolderDeleted { folder_id } => {
+                let id = resource_id(folder_id, "spaces")?;
+                Ok(Self {
+                    method: Method::DELETE,
+                    resource: format!("spaces/{id}"),
+                    query: Vec::new(),
+                    body: None,
+                })
             }
             SyncEvent::NoteCreated { note }
             | SyncEvent::NoteRestored { note }
@@ -62,7 +67,7 @@ impl MemosMutation {
             | SyncEvent::NoteDeleted { note } => {
                 ensure!(
                     note.account_id.is_some(),
-                    "Lokale notities worden niet geupload"
+                    tr("api.memos.error.local_note_upload_blocked")
                 );
                 let id = resource_id(&note.id, "memos")?;
                 let name = format!("memos/{id}");
@@ -123,7 +128,7 @@ fn resource_id<'value>(value: &'value str, collection: &str) -> Result<&'value s
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
             && id.as_bytes()[0].is_ascii_alphanumeric()
             && id.as_bytes()[id.len() - 1].is_ascii_alphanumeric(),
-        "Ongeldige Memos-resource-ID"
+        tr("api.memos.error.invalid_resource_id")
     );
     Ok(id)
 }
@@ -231,7 +236,10 @@ fn memo_from_remote(remote: RemoteMemo) -> Result<Memo> {
     let archived = match remote.state.as_str() {
         "" | "NORMAL" => false,
         "ARCHIVED" => true,
-        state => bail!("Onbekende Memos-notitiestatus: {state}"),
+        state => bail!(crate::tr_format!(
+            "api.memos.error.unknown_note_state",
+            state = state
+        )),
     };
     Ok(Memo {
         id: remote.name,
@@ -250,10 +258,10 @@ fn memo_from_remote(remote: RemoteMemo) -> Result<Memo> {
 
 fn parse_memos_update_time(value: &str) -> Result<TimestampMillis> {
     gio::glib::DateTime::from_iso8601(value, None)
-        .context("Memos gaf een ongeldige updateTime terug")?
+        .context(tr("api.memos.error.invalid_update_time"))?
         .to_unix()
         .checked_mul(1000)
-        .context("Memos gaf een updateTime buiten het ondersteunde bereik terug")
+        .context(tr("api.memos.error.update_time_out_of_range"))
 }
 
 #[cfg(test)]
@@ -400,6 +408,15 @@ mod tests {
                 Some(json!({"name": "spaces/work", "title": "Werk"})),
             ),
             (
+                SyncEvent::FolderDeleted {
+                    folder_id: "work".to_owned(),
+                },
+                "DELETE",
+                "spaces/work".to_owned(),
+                Vec::new(),
+                None,
+            ),
+            (
                 SyncEvent::NoteCreated { note: note.clone() },
                 "POST",
                 "memos".to_owned(),
@@ -474,14 +491,15 @@ mod tests {
     }
 
     #[test]
-    fn blocks_local_events_unsafe_space_deletion_and_invalid_ids() -> Result<()> {
+    fn blocks_local_events_and_invalid_resource_ids() -> Result<()> {
         let adapter = MemosAdapter::new("http://127.0.0.1:9", "test-token")?;
-        let error = adapter
-            .apply_event(&SyncEvent::FolderDeleted {
-                folder_id: "work".to_owned(),
-            })
-            .unwrap_err();
-        assert!(error.to_string().contains("geblokkeerd"));
+        assert!(
+            adapter
+                .apply_event(&SyncEvent::FolderDeleted {
+                    folder_id: "../auth/me".to_owned(),
+                })
+                .is_err()
+        );
         let mut note = note_snapshot();
         note.account_id = None;
         assert!(MemosMutation::from_event(&SyncEvent::NoteCreated { note: note.clone() }).is_err());
@@ -518,26 +536,55 @@ mod tests {
         let (url, server) = mock_server(vec![204, 503])?;
         store.add_backend_account("one", "Werk", "memos", &url)?;
         store.add_backend_account("two", "Ander", "memos", "https://other.example.com")?;
-        let folder = MemoFolder { id: "spaces/remote-folder".to_owned(), name: "Werk".to_owned() };
+        let folder = MemoFolder {
+            id: "spaces/remote-folder".to_owned(),
+            name: "Werk".to_owned(),
+        };
         let memo = Memo {
-            id: "memos/remote-memo".to_owned(), content: "Origineel".to_owned(), title: None,
-            folder_id: Some(folder.id.clone()), pinned: false, archived: false, updated_at: None,
+            id: "memos/remote-memo".to_owned(),
+            content: "Origineel".to_owned(),
+            title: None,
+            folder_id: Some(folder.id.clone()),
+            pinned: false,
+            archived: false,
+            updated_at: None,
         };
         store.import_backend_snapshot("one", &[folder], &[memo])?;
-        let note = store.notes(&crate::NoteFilter { account_id: Some("one".to_owned()), ..Default::default() })?.remove(0);
+        let note = store
+            .notes(&crate::NoteFilter {
+                account_id: Some("one".to_owned()),
+                ..Default::default()
+            })?
+            .remove(0);
         store.rename_folder(note.folder_id.as_deref().unwrap(), "Hernoemd")?;
         store.save_note(&note.id, "Mijn wijziging", "")?;
         let local_id = store.create_note(None, None)?;
         let other_id = store.create_note(Some("two"), None)?;
         assert!(store.has_backend_events("one")?);
-        let account = store.backend_accounts()?.into_iter().find(|account| account.id == "one").unwrap();
+        let account = store
+            .backend_accounts()?
+            .into_iter()
+            .find(|account| account.id == "one")
+            .unwrap();
         let adapter = MemosAdapter::new(&url, "test-token")?;
         assert!(store.sync_backend_events(&account, &adapter).is_err());
         let requests = server.join().expect("mock server thread panicked")?;
-        assert_eq!(requests[0].url.path(), "/memos-server/api/v1/spaces/remote-folder");
-        assert_eq!(requests[1].url.path(), "/memos-server/api/v1/memos/remote-memo");
-        assert_eq!(requests[1].body.as_ref().unwrap()["content"], "Mijn wijziging");
-        assert_eq!(requests[1].body.as_ref().unwrap()["space"], "spaces/remote-folder");
+        assert_eq!(
+            requests[0].url.path(),
+            "/memos-server/api/v1/spaces/remote-folder"
+        );
+        assert_eq!(
+            requests[1].url.path(),
+            "/memos-server/api/v1/memos/remote-memo"
+        );
+        assert_eq!(
+            requests[1].body.as_ref().unwrap()["content"],
+            "Mijn wijziging"
+        );
+        assert_eq!(
+            requests[1].body.as_ref().unwrap()["space"],
+            "spaces/remote-folder"
+        );
         assert_eq!(store.pending_sync_events(100)?.len(), 3);
         store.save_note(&note.id, "Nieuwere wijziging", "")?;
         let (retry_url, retry_server) = mock_server(vec![204])?;
@@ -545,12 +592,19 @@ mod tests {
         assert_eq!(store.sync_backend_events(&account, &retry_adapter)?, 1);
         let requests = retry_server.join().expect("mock server thread panicked")?;
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].body.as_ref().unwrap()["content"], "Nieuwere wijziging");
+        assert_eq!(
+            requests[0].body.as_ref().unwrap()["content"],
+            "Nieuwere wijziging"
+        );
         assert!(!store.has_backend_events("one")?);
         let remaining = store.pending_sync_events(100)?;
         assert_eq!(remaining.len(), 2);
-        assert!(matches!(&remaining[0].event, SyncEvent::NoteCreated { note } if note.id == local_id));
-        assert!(matches!(&remaining[1].event, SyncEvent::NoteCreated { note } if note.id == other_id));
+        assert!(
+            matches!(&remaining[0].event, SyncEvent::NoteCreated { note } if note.id == local_id)
+        );
+        assert!(
+            matches!(&remaining[1].event, SyncEvent::NoteCreated { note } if note.id == other_id)
+        );
         assert_eq!(store.note(&note.id)?.unwrap().content, "Nieuwere wijziging");
         store.set_backend_account_enabled("one", false)?;
         store.save_note(&note.id, "Offline wijziging", "")?;
@@ -591,8 +645,11 @@ mod tests {
             if snapshot.id == note.id && snapshot.archived
                 && snapshot.account_id.as_deref() == Some("one")));
 
-        let account = store.backend_accounts()?.into_iter()
-            .find(|account| account.id == "one").unwrap();
+        let account = store
+            .backend_accounts()?
+            .into_iter()
+            .find(|account| account.id == "one")
+            .unwrap();
         let adapter = MemosAdapter::new(&url, "test-token")?;
         assert!(store.sync_backend_events(&account, &adapter).is_err());
         assert_eq!(store.pending_sync_events(100)?, pending);
@@ -601,17 +658,25 @@ mod tests {
         assert_eq!(store.sync_backend_events(&account, &adapter)?, 1);
         assert!(store.pending_sync_events(100)?.is_empty());
         assert!(store.note(&note.id)?.is_none());
-        assert_eq!(store.notes(&crate::NoteFilter {
-            account_id: Some("two".to_owned()),
-            archived: true,
-            ..Default::default()
-        })?.len(), 1);
+        assert_eq!(
+            store
+                .notes(&crate::NoteFilter {
+                    account_id: Some("two".to_owned()),
+                    archived: true,
+                    ..Default::default()
+                })?
+                .len(),
+            1
+        );
 
         let requests = server.join().expect("mock server thread panicked")?;
         assert_eq!(requests.len(), 2);
         for request in requests {
             assert_eq!(request.method, "DELETE");
-            assert_eq!(request.url.path(), "/memos-server/api/v1/memos/archived-memo");
+            assert_eq!(
+                request.url.path(),
+                "/memos-server/api/v1/memos/archived-memo"
+            );
             assert!(request.url.query().is_none());
             assert!(request.body.is_none());
             assert_eq!(request.authorization, "Bearer test-token");
@@ -636,7 +701,9 @@ mod tests {
         let pending = store.pending_sync_events(100)?;
         let account = store.backend_accounts()?.remove(0);
         let offline_adapter = MemosAdapter::new(&offline_url, "test-token")?;
-        let error = store.sync_backend_events(&account, &offline_adapter).unwrap_err();
+        let error = store
+            .sync_backend_events(&account, &offline_adapter)
+            .unwrap_err();
         assert!(crate::memos::is_connection_error(&error));
         assert_eq!(store.pending_sync_events(100)?, pending);
         drop(store);
@@ -653,7 +720,10 @@ mod tests {
         assert_eq!(requests[1].method, "POST");
         assert_eq!(requests[1].url.path(), "/memos-server/api/v1/memos");
         assert_eq!(requests[2].method, "PATCH");
-        assert_eq!(requests[2].body.as_ref().unwrap()["content"], "Laatste offline wijziging");
+        assert_eq!(
+            requests[2].body.as_ref().unwrap()["content"],
+            "Laatste offline wijziging"
+        );
         assert_eq!(requests[3].method, "PATCH");
         assert_eq!(requests[3].body.as_ref().unwrap()["state"], "ARCHIVED");
         let note = store.note(&note_id)?.unwrap();

@@ -4,8 +4,8 @@
   "private": true,
   "description": "Command shortcuts for the native Memonotes Rust app",
   "scripts": {
-    "dev": "cargo watch --delay 1 --watch src --watch Cargo.toml --watch Cargo.lock --env MEMONOTES_DEV=1 --exec 'build --features gtk-ui --bin memonotes' --shell 'exec target/debug/memonotes'",
-    "watch:check": "cargo watch --watch src --watch Cargo.toml --watch Cargo.lock --exec 'check --features gtk-ui --bin memonotes'",
+    "dev": "cargo watch --delay 1 --watch src --watch translations.json --watch Cargo.toml --watch Cargo.lock --env MEMONOTES_DEV=1 --exec 'build --features gtk-ui --bin memonotes' --shell 'exec target/debug/memonotes'",
+    "watch:check": "cargo watch --watch src --watch translations.json --watch Cargo.toml --watch Cargo.lock --exec 'check --features gtk-ui --bin memonotes'",
     "start": "cargo run --features gtk-ui --bin memonotes",
     "build": "cargo build --release --features gtk-ui --bin memonotes",
     "check": "cargo check --features gtk-ui --bin memonotes",

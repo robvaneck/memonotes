@@ -50,6 +50,40 @@ It uses GTK's native virtualized `ListView`: only visible rows and an offscreen
 buffer have widgets, and sidebar resizing keeps text at its normal font size.
 See [PLAN.md](PLAN.md) for the current implementation checklist and release gaps.
 
+## Translations
+
+All application labels, tooltips, dialogs and application-generated errors are
+translated into English, German, French, Dutch and Spanish. The external
+`translations.json` catalog uses stable, descriptive English keys, with `en`,
+`de`, `fr`, `nl` and `es` values. Colors use `color_mint`, `color_iris`,
+`color_teal`, etc. Other keys use dotted namespaces with snake_case names,
+such as `note.move_to_folder`, `account.field.server_url` and
+`api.memos.error.invalid_server_url`. Use `tr("color_mint")` for fixed text
+and `tr_format!("api.memos.error.request_http_status", status = status)` for
+messages with named placeholders. Keep placeholders identical to the English
+reference translation. Stored color IDs such as `mint` do not change.
+Translations are embedded at build time; rebuild after changes.
+The development watcher also watches the catalog.
+
+Choose **Settings > General > Language** to select English, German, French,
+Dutch or Spanish, or **System default**. The choice is stored locally and takes
+effect after restarting the app; open notes and ongoing synchronization are
+not interrupted. Language names are displayed in their own language.
+
+With **System default**, the app follows the system message locale (`LC_ALL`, `LC_MESSAGES`, then `LANG`),
+including `LANGUAGE` preferences unless the message locale is `C` or `POSIX`.
+Unsupported languages fall back to English. With **System default** selected,
+override the application language at startup, for example:
+
+```sh
+MEMONOTES_LANGUAGE=nl npm start
+MEMONOTES_LANGUAGE=de npm run dev
+```
+
+Use `en`, `de`, `fr`, `nl` or `es`. Existing note content, account names and
+folder names are never translated. Messages supplied by operating-system or
+third-party libraries retain their own localization.
+
 ## Backend architecture
 
 Backend calls go through `BackendAdapter`, implemented by `MemosAdapter`.

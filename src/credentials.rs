@@ -1,3 +1,4 @@
+use crate::i18n::tr;
 use anyhow::{Context, Result};
 use gio::Cancellable;
 use libsecret::{Schema, SchemaAttributeType, SchemaFlags};
@@ -25,7 +26,7 @@ pub fn store_token(account_id: &str, label: &str, token: &str) -> Result<()> {
         token,
         None::<&Cancellable>,
     )
-    .context("Token opslaan in de GNOME-keyring is mislukt")
+    .context(tr("credentials.error.store_token_failed"))
 }
 
 pub fn lookup_token(account_id: &str) -> Result<Option<String>> {
@@ -36,7 +37,7 @@ pub fn lookup_token(account_id: &str) -> Result<Option<String>> {
             attributes(account_id),
             None::<&Cancellable>,
         )
-        .context("Token ophalen uit de GNOME-keyring is mislukt")?
+        .context(tr("credentials.error.lookup_token_failed"))?
         .map(|token| token.to_string()),
     )
 }
@@ -44,6 +45,6 @@ pub fn lookup_token(account_id: &str) -> Result<Option<String>> {
 pub fn delete_token(account_id: &str) -> Result<()> {
     let schema = schema();
     libsecret::password_clear_sync(Some(&schema), attributes(account_id), None::<&Cancellable>)
-        .context("Token verwijderen uit de GNOME-keyring is mislukt")?;
+        .context(tr("credentials.error.remove_token_failed"))?;
     Ok(())
 }
