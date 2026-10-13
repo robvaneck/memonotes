@@ -12,15 +12,33 @@ pub struct EditorDocument {
 pub struct RenderedMarkdown {
     pub text: String,
     pub spans: Vec<MarkupSpan>,
+    pub headings: Vec<HeadingSpan>,
+    pub links: Vec<LinkSpan>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeadingSpan {
+    pub range: Range<usize>,
+    pub level: u8,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinkSpan {
+    pub range: Range<usize>,
+    pub url: String,
 }
 
 pub fn render_markdown_source(markdown: &str) -> RenderedMarkdown {
     let source_spans = markdown_style_spans(markdown);
-    let hidden_ranges: Vec<_> = source_spans
+    let (source_headings, heading_markers) = markdown_heading_ranges(markdown);
+    let mut hidden_ranges: Vec<_> = source_spans
         .iter()
         .filter(|span| span.hidden)
         .map(|span| span.range.clone())
         .collect();
+    hidden_ranges.extend(heading_markers);
+    let source_links = markdown_link_ranges(markdown);
+    hidden_ranges.extend(source_links.iter().flat_map(|link| link.hidden.clone()));
     let mut output = String::with_capacity(markdown.len());
     let mut output_offsets = vec![0; markdown.len() + 1];
 
@@ -51,11 +69,149 @@ pub fn render_markdown_source(markdown: &str) -> RenderedMarkdown {
             })
         })
         .collect();
+    let headings = source_headings
+        .into_iter()
+        .filter_map(|(range, level)| {
+            let start = output_offsets[range.start];
+            let end = output_offsets[range.end];
+            (start < end).then_some(HeadingSpan {
+                range: start..end,
+                level,
+            })
+        })
+        .collect();
+
+    let links = source_links
+        .into_iter()
+        .filter_map(|link| {
+            let start = output_offsets[link.content.start];
+            let end = output_offsets[link.content.end];
+            (start < end).then_some(LinkSpan {
+                range: start..end,
+                url: link.url,
+            })
+        })
+        .collect();
 
     RenderedMarkdown {
         text: output,
         spans,
+        headings,
+        links,
     }
+}
+
+struct SourceLink {
+    content: Range<usize>,
+    hidden: [Range<usize>; 2],
+    url: String,
+}
+
+fn markdown_link_ranges(markdown: &str) -> Vec<SourceLink> {
+    let options = Options::ENABLE_TASKLISTS | Options::ENABLE_STRIKETHROUGH;
+    let mut links = Vec::new();
+    // (url, first inner start, last inner end)
+    let mut open: Option<(String, usize, usize)> = None;
+
+    for (event, range) in Parser::new_ext(markdown, options).into_offset_iter() {
+        match event {
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                open = Some((dest_url.to_string(), usize::MAX, 0));
+            }
+            Event::End(TagEnd::Link) => {
+                if let Some((url, first, last)) = open.take()
+                    && first < last
+                {
+                    links.push(SourceLink {
+                        content: first..last,
+                        hidden: [range.start..first, last..range.end],
+                        url,
+                    });
+                }
+            }
+            _ => {
+                if let Some((_, first, last)) = open.as_mut() {
+                    *first = (*first).min(range.start);
+                    *last = (*last).max(range.end);
+                }
+            }
+        }
+    }
+    links
+}
+
+/// Returns an absolute http(s)/mailto URL without whitespace, or `None` if unsupported.
+pub fn normalize_link_url(input: &str) -> Option<String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return None;
+    }
+    let scheme_end = input.find(':').filter(|&index| {
+        let scheme = &input[..index];
+        scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
+    });
+    let url = match scheme_end {
+        Some(_) => input.to_owned(),
+        None if input.contains('@') && !input.contains('/') => format!("mailto:{input}"),
+        None => format!("https://{input}"),
+    };
+    is_openable_link(&url)
+        .then(|| url.split_whitespace().collect::<Vec<_>>().join("%20"))
+}
+
+pub fn is_openable_link(url: &str) -> bool {
+    let scheme = url.split(':').next().unwrap_or_default().to_ascii_lowercase();
+    matches!(scheme.as_str(), "http" | "https" | "mailto") && url.len() > scheme.len() + 1
+}
+
+/// Wraps an already serialized label as an inline Markdown link.
+pub fn markdown_link(label: &str, url: &str) -> String {
+    let mut output = String::from("[");
+    let mut previous_backslash = false;
+    for character in label.chars() {
+        if matches!(character, '[' | ']') && !previous_backslash {
+            output.push('\\');
+        }
+        previous_backslash = character == '\\' && !previous_backslash;
+        output.push(character);
+    }
+    output.push_str("](");
+    escape_markdown_destination(url, &mut output);
+    output.push(')');
+    output
+}
+
+fn markdown_heading_ranges(markdown: &str) -> (Vec<(Range<usize>, u8)>, Vec<Range<usize>>) {
+    let mut headings = Vec::new();
+    let mut markers = Vec::new();
+    let mut fenced_code = false;
+    let mut offset = 0;
+
+    for line_with_ending in markdown.split_inclusive('\n') {
+        let line = line_with_ending.strip_suffix('\n').unwrap_or(line_with_ending);
+        let trimmed = line.trim_start_matches(' ');
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            fenced_code = !fenced_code;
+        } else if !fenced_code {
+            let indentation = line.len() - trimmed.len();
+            let marker_length = trimmed.bytes().take_while(|byte| *byte == b'#').count();
+            if indentation <= 3
+                && (1..=6).contains(&marker_length)
+                && trimmed.as_bytes().get(marker_length).is_some_and(u8::is_ascii_whitespace)
+            {
+                let content_start = offset + indentation + marker_length + 1;
+                let content_end = offset + line.len();
+                markers.push(offset + indentation..content_start);
+                headings.push((content_start..content_end, marker_length as u8));
+            }
+        }
+        offset += line_with_ending.len();
+    }
+
+    (headings, markers)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -999,6 +1155,27 @@ mod tests {
     }
 
     #[test]
+    fn markdown_rendering_hides_heading_markers_and_skips_fenced_code() {
+        let rendered = render_markdown_source(
+            "# Title\n\n## **Section**\n### Subsection\n```md\n#### literal\n```",
+        );
+
+        assert_eq!(
+            rendered.text,
+            "Title\n\nSection\nSubsection\n```md\n#### literal\n```"
+        );
+        assert_eq!(rendered.headings.len(), 3);
+        for (level, text) in [(1, "Title"), (2, "Section"), (3, "Subsection")] {
+            let heading = rendered
+                .headings
+                .iter()
+                .find(|heading| heading.level == level)
+                .unwrap();
+            assert_eq!(&rendered.text[heading.range.clone()], text);
+        }
+    }
+
+    #[test]
     fn markdown_render_ranges_remain_byte_aligned_after_unicode_text() {
         let rendered = render_markdown_source("é **bold**");
 
@@ -1010,6 +1187,35 @@ mod tests {
             .unwrap();
         assert_eq!(&rendered.text[bold.range.clone()], "bold");
         assert_eq!(rendered.text[..bold.range.start].chars().count(), 2);
+    }
+
+    #[test]
+    fn markdown_rendering_hides_link_syntax_and_reports_link_ranges() {
+        let rendered = render_markdown_source("é [**site**](https://example.test/a_(b)) and <https://x.test>");
+
+        assert_eq!(rendered.text, "é site and https://x.test");
+        assert_eq!(rendered.links.len(), 2);
+        assert_eq!(&rendered.text[rendered.links[0].range.clone()], "site");
+        assert_eq!(rendered.links[0].url, "https://example.test/a_(b)");
+        assert_eq!(&rendered.text[rendered.links[1].range.clone()], "https://x.test");
+    }
+
+    #[test]
+    fn link_urls_are_normalized_and_restricted_to_safe_schemes() {
+        assert_eq!(normalize_link_url(" example.test/a b "), Some("https://example.test/a%20b".into()));
+        assert_eq!(normalize_link_url("me@example.test"), Some("mailto:me@example.test".into()));
+        assert_eq!(normalize_link_url("http://example.test"), Some("http://example.test".into()));
+        assert_eq!(normalize_link_url("javascript:alert(1)"), None);
+        assert_eq!(normalize_link_url("  "), None);
+        assert!(!is_openable_link("file:///etc/passwd"));
+    }
+
+    #[test]
+    fn markdown_link_escapes_brackets_and_parentheses_once() {
+        assert_eq!(
+            markdown_link("a [b] \\[c\\]", "https://x.test/(y)"),
+            "[a \\[b\\] \\[c\\]](https://x.test/\\(y\\))"
+        );
     }
 
     #[test]

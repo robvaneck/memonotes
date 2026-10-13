@@ -5,7 +5,8 @@ use anyhow::{Context, Result};
 use libadwaita as adw;
 use memonotes::adapters::{BackendAdapter, MemosAdapter};
 use memonotes::editor_document::{
-    Mark, MarkupSpan, markdown_inline_text, markdown_preview_text, render_markdown_source,
+    LinkSpan, Mark, MarkupSpan, is_openable_link, markdown_inline_text, markdown_link,
+    markdown_preview_text, normalize_link_url, render_markdown_source,
 };
 use memonotes::i18n::tr;
 use memonotes::{
@@ -4022,13 +4023,31 @@ fn connect_tab_navigation(
 ) {
     let next = next.downgrade();
     let previous = previous.downgrade();
+    let widget_for_keys = widget.clone().upcast::<gtk::Widget>().downgrade();
     let keys = gtk::EventControllerKey::new();
     keys.set_propagation_phase(gtk::PropagationPhase::Capture);
     keys.connect_key_pressed(move |_, key, _, modifiers| {
-        if key != gtk::gdk::Key::Tab {
+        if !matches!(key, gtk::gdk::Key::Tab | gtk::gdk::Key::ISO_Left_Tab) {
             return gtk::glib::Propagation::Proceed;
         }
-        let target = if modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
+        if let Some(editor) = widget_for_keys
+            .upgrade()
+            .and_then(|widget| widget.downcast::<gtk::TextView>().ok())
+        {
+            let buffer = editor.buffer();
+            let cursor = buffer.iter_at_mark(&buffer.get_insert());
+            if let Some(start) = buffer.iter_at_line(cursor.line()) {
+                let mut end = start;
+                end.forward_to_line_end();
+                let line = buffer.slice(&start, &end, true);
+                if editor_list_kind(&buffer, start, &line).is_some() {
+                    return gtk::glib::Propagation::Proceed;
+                }
+            }
+        }
+        let target = if key == gtk::gdk::Key::ISO_Left_Tab
+            || modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK)
+        {
             &previous
         } else {
             &next
@@ -5076,6 +5095,14 @@ fn editor_format_toolbar(editor: &gtk::TextView) -> gtk::Box {
         toolbar.append(&button);
     }
 
+    let link_button = icon_button("insert-link-symbolic", tr("editor.format.link"));
+    link_button.set_size_request(36, 36);
+    let editor_for_link = editor.clone();
+    link_button.connect_clicked(move |_| edit_editor_link(&editor_for_link));
+    toolbar.append(&link_button);
+
+    toolbar.append(&editor_heading_menu(editor));
+
     for (icon, tooltip, kind) in [
         (
             "checkbox-checked-symbolic",
@@ -5098,6 +5125,172 @@ fn editor_format_toolbar(editor: &gtk::TextView) -> gtk::Box {
     toolbar
 }
 
+fn editor_heading_menu(editor: &gtk::TextView) -> gtk::MenuButton {
+    let pending_heading = install_pending_heading_style(editor);
+    let menu_button = gtk::MenuButton::new();
+    menu_button.set_label("P");
+    menu_button.set_tooltip_text(Some(tr("editor.format.heading")));
+    menu_button.set_size_request(36, 36);
+
+    let menu_button_weak = menu_button.downgrade();
+    let pending_for_label = Rc::clone(&pending_heading);
+    let update_label: Rc<dyn Fn(&gtk::TextBuffer)> = Rc::new(move |buffer| {
+        if let Some(menu_button) = menu_button_weak.upgrade() {
+            menu_button.set_label(&editor_block_style_label(buffer, &pending_for_label));
+        }
+    });
+    let buffer = editor.buffer();
+    let update_after_change = Rc::clone(&update_label);
+    buffer.connect_changed(move |buffer| update_after_change(buffer));
+    let update_after_cursor_move = Rc::clone(&update_label);
+    let pending_for_cursor = Rc::clone(&pending_heading);
+    buffer.connect_notify_local(Some("cursor-position"), move |buffer, _| {
+        let cursor = buffer.iter_at_mark(&buffer.get_insert());
+        if pending_for_cursor
+            .get()
+            .is_some_and(|(line, _)| line != cursor.line())
+        {
+            pending_for_cursor.set(None);
+        }
+        update_after_cursor_move(buffer);
+    });
+
+    let popover = gtk::Popover::new();
+    let choices = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    for (level, label) in [
+        (None, "editor.format.paragraph"),
+        (Some(1), "editor.format.heading_1"),
+        (Some(2), "editor.format.heading_2"),
+        (Some(3), "editor.format.heading_3"),
+        (Some(4), "editor.format.heading_4"),
+        (Some(5), "editor.format.heading_5"),
+        (Some(6), "editor.format.heading_6"),
+    ] {
+        let choice = gtk::Button::with_label(tr(label));
+        choice.add_css_class("flat");
+        choice.set_halign(gtk::Align::Fill);
+        let editor = editor.clone();
+        let pending_heading = Rc::clone(&pending_heading);
+        let popover = popover.clone();
+        choice.connect_clicked(move |_| {
+            apply_editor_block_style(&editor, level, &pending_heading);
+            popover.popdown();
+            editor.grab_focus();
+        });
+        choices.append(&choice);
+    }
+    popover.set_child(Some(&choices));
+    menu_button.set_popover(Some(&popover));
+    update_label(&buffer);
+    menu_button
+}
+
+fn editor_block_style_label(
+    buffer: &gtk::TextBuffer,
+    pending_heading: &Cell<Option<(i32, u8)>>,
+) -> String {
+    let cursor = buffer.iter_at_mark(&buffer.get_insert());
+    let line = cursor.line();
+    if let Some((pending_line, level)) = pending_heading.get()
+        && pending_line == line
+    {
+        return format!("H{level}");
+    }
+    if line == 0 {
+        return "H1".to_owned();
+    }
+    let Some(line_start) = buffer.iter_at_line(line) else {
+        return "P".to_owned();
+    };
+    (1..=6)
+        .find(|level| line_start.has_tag(&heading_style_tag(buffer, *level)))
+        .map_or_else(|| "P".to_owned(), |level| format!("H{level}"))
+}
+
+fn install_pending_heading_style(editor: &gtk::TextView) -> Rc<Cell<Option<(i32, u8)>>> {
+    let pending_heading = Rc::new(Cell::new(None));
+    let pending_for_change = Rc::clone(&pending_heading);
+    editor.buffer().connect_changed(move |buffer| {
+        let Some((pending_line, level)) = pending_for_change.get() else {
+            return;
+        };
+        let cursor = buffer.iter_at_mark(&buffer.get_insert());
+        if cursor.line() != pending_line {
+            return;
+        }
+        let Some(line_start) = buffer.iter_at_line(pending_line) else {
+            return;
+        };
+        let mut line_end = line_start;
+        line_end.forward_to_line_end();
+        if buffer
+            .slice(&line_start, &line_end, true)
+            .to_string()
+            .trim()
+            .is_empty()
+        {
+            return;
+        }
+        buffer.apply_tag(
+            &heading_style_tag(buffer, level),
+            &line_start,
+            &line_end,
+        );
+        pending_for_change.set(None);
+    });
+    pending_heading
+}
+
+fn apply_editor_block_style(
+    editor: &gtk::TextView,
+    level: Option<u8>,
+    pending_heading: &Cell<Option<(i32, u8)>>,
+) {
+    let buffer = editor.buffer();
+    let cursor_line = buffer.iter_at_mark(&buffer.get_insert()).line();
+    let selection = buffer.selection_bounds();
+    let (first_line, mut last_line) = selection
+        .as_ref()
+        .map(|(start, end)| (start.line(), end.line()))
+        .unwrap_or_else(|| {
+            let cursor = buffer.iter_at_mark(&buffer.get_insert());
+            (cursor.line(), cursor.line())
+        });
+    if let Some((_, end)) = selection.as_ref()
+        && end.line_offset() == 0
+        && last_line > first_line
+    {
+        last_line -= 1;
+    }
+
+    for line_number in first_line..=last_line {
+        if line_number == 0 {
+            continue;
+        }
+        let Some(line_start) = buffer.iter_at_line(line_number) else {
+            continue;
+        };
+        let mut line_end = line_start;
+        line_end.forward_to_line_end();
+        let line_text = buffer.slice(&line_start, &line_end, true).to_string();
+        for existing_level in 1..=6 {
+            let tag = heading_style_tag(&buffer, existing_level);
+            buffer.remove_tag(&tag, &line_start, &line_end);
+        }
+        if let Some(level) = level {
+            if line_text.trim().is_empty() && line_number == cursor_line {
+                pending_heading.set(Some((line_number, level)));
+            } else {
+                let tag = heading_style_tag(&buffer, level);
+                buffer.apply_tag(&tag, &line_start, &line_end);
+            }
+        } else if line_text.trim().is_empty() && line_number == cursor_line {
+            pending_heading.set(None);
+        }
+    }
+    buffer.emit_by_name::<()>("changed", &[]);
+}
+
 #[derive(Clone, Copy)]
 enum ListPrefixKind {
     Task,
@@ -5106,10 +5299,31 @@ enum ListPrefixKind {
 
 fn install_editor_format_shortcuts(editor: &gtk::TextView) {
     let buffer = editor.buffer();
+    let auto_linking = Rc::new(Cell::new(false));
+    let auto_linking_for_change = Rc::clone(&auto_linking);
+    buffer.connect_changed(move |buffer| {
+        if auto_linking_for_change.replace(true) {
+            return;
+        }
+        auto_link_plain_urls(buffer);
+        auto_linking_for_change.set(false);
+    });
     let editor_for_enter = editor.clone();
     let keys = gtk::EventControllerKey::new();
     keys.set_propagation_phase(gtk::PropagationPhase::Capture);
     keys.connect_key_pressed(move |_, key, _, modifiers| {
+        if matches!(key, gtk::gdk::Key::Tab | gtk::gdk::Key::ISO_Left_Tab)
+            && !modifiers.intersects(
+                gtk::gdk::ModifierType::CONTROL_MASK | gtk::gdk::ModifierType::ALT_MASK,
+            )
+            && indent_editor_list(
+                &editor_for_enter,
+                key == gtk::gdk::Key::ISO_Left_Tab
+                    || modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK),
+            )
+        {
+            return gtk::glib::Propagation::Stop;
+        }
         if matches!(key, gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter)
             && !modifiers.intersects(
                 gtk::gdk::ModifierType::CONTROL_MASK
@@ -5131,6 +5345,7 @@ fn install_editor_format_shortcuts(editor: &gtk::TextView) {
             gtk::gdk::Key::b if !shifted => apply_inline_style(&buffer, Mark::Bold),
             gtk::gdk::Key::i if !shifted => apply_inline_style(&buffer, Mark::Italic),
             gtk::gdk::Key::u if !shifted => apply_inline_style(&buffer, Mark::Underline),
+            gtk::gdk::Key::k if !shifted => edit_editor_link(&editor_for_enter),
             gtk::gdk::Key::t | gtk::gdk::Key::T if shifted => {
                 toggle_list_prefix(&editor_for_enter, ListPrefixKind::Task)
             }
@@ -5142,6 +5357,330 @@ fn install_editor_format_shortcuts(editor: &gtk::TextView) {
         gtk::glib::Propagation::Stop
     });
     editor.add_controller(keys);
+
+    let click = gtk::GestureClick::new();
+    click.set_button(gtk::gdk::BUTTON_PRIMARY);
+    click.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let editor_for_click = editor.clone();
+    click.connect_pressed(move |gesture, _, x, y| {
+        if !gesture
+            .current_event_state()
+            .contains(gtk::gdk::ModifierType::CONTROL_MASK)
+        {
+            return;
+        }
+        let (x, y) = editor_for_click.window_to_buffer_coords(
+            gtk::TextWindowType::Widget,
+            x as i32,
+            y as i32,
+        );
+        let Some(url) = editor_for_click
+            .iter_at_location(x, y)
+            .and_then(|iter| link_url_at(&iter))
+        else {
+            return;
+        };
+        if is_openable_link(&url)
+            && let Err(error) = adw::gio::AppInfo::launch_default_for_uri(
+                &url,
+                None::<&adw::gio::AppLaunchContext>,
+            )
+        {
+            eprintln!(
+                "{}",
+                memonotes::tr_format!("link.error.open_failed", error = error)
+            );
+        }
+    });
+    editor.add_controller(click);
+}
+
+const LINK_TAG_PREFIX: &str = "editor-link:";
+
+fn auto_link_plain_urls(buffer: &gtk::TextBuffer) {
+    let (start, end) = buffer.bounds();
+    let text = buffer.slice(&start, &end, true).to_string();
+    let characters: Vec<char> = text.chars().collect();
+    let mut index = 0;
+
+    while index < characters.len() {
+        while index < characters.len() && characters[index].is_whitespace() {
+            index += 1;
+        }
+        let token_start = index;
+        while index < characters.len() && !characters[index].is_whitespace() {
+            index += 1;
+        }
+        let token_end = index;
+        if token_start == token_end {
+            continue;
+        }
+
+        let mut url_end = token_end;
+        while url_end > token_start
+            && matches!(characters[url_end - 1], '.' | ',' | '!' | '?' | ';' | ':')
+        {
+            url_end -= 1;
+        }
+        while url_end > token_start {
+            let closing = characters[url_end - 1];
+            let (open, close) = match closing {
+                ')' => ('(', ')'),
+                ']' => ('[', ']'),
+                '}' => ('{', '}'),
+                _ => break,
+            };
+            let candidate: String = characters[token_start..url_end].iter().collect();
+            if candidate.matches(close).count() <= candidate.matches(open).count() {
+                break;
+            }
+            url_end -= 1;
+        }
+
+        let candidate: String = characters[token_start..url_end].iter().collect();
+        if !is_auto_link_candidate(&candidate) {
+            continue;
+        }
+        let Some(url) = normalize_link_url(&candidate) else {
+            continue;
+        };
+        let link_start = buffer.iter_at_offset(token_start as i32);
+        let link_end = buffer.iter_at_offset(url_end as i32);
+        remove_link_tags(buffer, &link_start, &link_end);
+        buffer.apply_tag(&link_tag(buffer, &url), &link_start, &link_end);
+    }
+}
+
+fn is_auto_link_candidate(candidate: &str) -> bool {
+    let address = candidate
+        .strip_prefix("https://")
+        .or_else(|| candidate.strip_prefix("http://"))
+        .unwrap_or(candidate);
+    let host = address
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .rsplit('@')
+        .next()
+        .unwrap_or_default()
+        .split(':')
+        .next()
+        .unwrap_or_default();
+    if host.parse::<std::net::IpAddr>().is_ok() || host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let labels: Vec<_> = host.split('.').collect();
+    labels.len() >= 2
+        && labels.iter().all(|label| {
+            !label.is_empty()
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || character == '-'
+                })
+        })
+        && labels.last().is_some_and(|label| {
+            label.len() >= 2 && label.chars().all(|character| character.is_ascii_alphabetic())
+        })
+}
+
+fn link_tag(buffer: &gtk::TextBuffer, url: &str) -> gtk::TextTag {
+    let name = format!("{LINK_TAG_PREFIX}{url}");
+    editor_text_tag(buffer, &name.clone(), || {
+        gtk::TextTag::builder()
+            .name(name)
+            .foreground("#3584e4")
+            .underline(gtk::pango::Underline::Single)
+            .build()
+    })
+}
+
+fn link_url_at(iter: &gtk::TextIter) -> Option<String> {
+    iter.tags().iter().find_map(|tag| {
+        tag.name()
+            .and_then(|name| name.strip_prefix(LINK_TAG_PREFIX).map(str::to_owned))
+    })
+}
+
+fn remove_link_tags(buffer: &gtk::TextBuffer, start: &gtk::TextIter, end: &gtk::TextIter) {
+    let mut tags = Vec::new();
+    buffer.tag_table().foreach(|tag| {
+        if tag
+            .name()
+            .is_some_and(|name| name.starts_with(LINK_TAG_PREFIX))
+        {
+            tags.push(tag.clone());
+        }
+    });
+    for tag in tags {
+        buffer.remove_tag(&tag, start, end);
+    }
+}
+
+/// The URL and bounds of the link touching `cursor`, if any.
+fn link_at_cursor(
+    buffer: &gtk::TextBuffer,
+    cursor: &gtk::TextIter,
+) -> Option<(String, gtk::TextIter, gtk::TextIter)> {
+    let mut inside = *cursor;
+    let url = match link_url_at(&inside) {
+        Some(url) => url,
+        None => {
+            if !inside.backward_char() {
+                return None;
+            }
+            link_url_at(&inside)?
+        }
+    };
+    let tag = link_tag(buffer, &url);
+    let mut start = inside;
+    if !start.starts_tag(Some(&tag)) {
+        start.backward_to_tag_toggle(Some(&tag));
+    }
+    let mut end = inside;
+    end.forward_to_tag_toggle(Some(&tag));
+    Some((url, start, end))
+}
+
+fn edit_editor_link(editor: &gtk::TextView) {
+    let buffer = editor.buffer();
+    let cursor = buffer.iter_at_mark(&buffer.get_insert());
+    let existing = link_at_cursor(&buffer, &cursor);
+    let (initial_url, start, end) = match (buffer.selection_bounds(), existing) {
+        (Some((start, end)), existing) => (
+            existing.map(|(url, _, _)| url).unwrap_or_default(),
+            start.offset(),
+            end.offset(),
+        ),
+        (None, Some((url, start, end))) => (url, start.offset(), end.offset()),
+        (None, None) => (String::new(), cursor.offset(), cursor.offset()),
+    };
+    let editing_link = !initial_url.is_empty();
+
+    let entry = gtk::Entry::builder()
+        .placeholder_text("https://")
+        .text(&initial_url)
+        .width_chars(36)
+        .activates_default(true)
+        .build();
+    entry.connect_map(|entry| {
+        entry.grab_focus();
+    });
+    let dialog = adw::AlertDialog::builder()
+        .heading(tr("editor.link.title"))
+        .build();
+    dialog.set_extra_child(Some(&entry));
+    dialog.add_response("cancel", tr("action.cancel"));
+    if editing_link {
+        dialog.add_response("remove", tr("editor.link.remove"));
+        dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
+    }
+    dialog.add_response("apply", tr("action.save"));
+    dialog.set_response_appearance("apply", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("apply"));
+    dialog.set_close_response("cancel");
+
+    let editor_for_response = editor.clone();
+    dialog.choose(
+        Some(editor),
+        None::<&adw::gio::Cancellable>,
+        move |response| {
+            let buffer = editor_for_response.buffer();
+            let mut start = buffer.iter_at_offset(start);
+            let mut end = buffer.iter_at_offset(end);
+            match response.as_str() {
+                "remove" => remove_link_tags(&buffer, &start, &end),
+                "apply" => {
+                    let Some(url) = normalize_link_url(entry.text().as_str()) else {
+                        return;
+                    };
+                    buffer.begin_user_action();
+                    if start == end {
+                        buffer.insert(&mut end, &url);
+                        start = buffer.iter_at_offset(start.offset());
+                    }
+                    remove_link_tags(&buffer, &start, &end);
+                    buffer.apply_tag(&link_tag(&buffer, &url), &start, &end);
+                    buffer.end_user_action();
+                }
+                _ => return,
+            }
+            buffer.emit_by_name::<()>("changed", &[]);
+            editor_for_response.grab_focus();
+        },
+    );
+}
+
+fn editor_list_kind(
+    buffer: &gtk::TextBuffer,
+    mut start: gtk::TextIter,
+    line: &str,
+) -> Option<ListPrefixKind> {
+    let trimmed = line.trim_start_matches([' ', '\t']);
+    let indentation = line.chars().count() - trimmed.chars().count();
+    start.forward_chars(indentation as i32);
+    if trimmed.starts_with("• ") {
+        Some(ListPrefixKind::Bullet)
+    } else if trimmed.starts_with("☐ ") || trimmed.starts_with("☑ ") {
+        Some(ListPrefixKind::Task)
+    } else if trimmed.starts_with("\u{fffc} ") {
+        Some(if start.has_tag(&bullet_marker_tag(buffer)) {
+            ListPrefixKind::Bullet
+        } else {
+            ListPrefixKind::Task
+        })
+    } else {
+        None
+    }
+}
+
+fn indent_editor_list(editor: &gtk::TextView, outdent: bool) -> bool {
+    let buffer = editor.buffer();
+    let selection = buffer.selection_bounds();
+    let (first, mut last) = selection
+        .as_ref()
+        .map(|(start, end)| (start.line(), end.line()))
+        .unwrap_or_else(|| {
+            let line = buffer.iter_at_mark(&buffer.get_insert()).line();
+            (line, line)
+        });
+    if let Some((_, end)) = selection.as_ref()
+        && end.line_offset() == 0
+        && last > first
+    {
+        last -= 1;
+    }
+    let mut handled = false;
+    buffer.begin_user_action();
+    for line_number in (first..=last).rev() {
+        let Some(mut start) = buffer.iter_at_line(line_number) else {
+            continue;
+        };
+        let mut end = start;
+        end.forward_to_line_end();
+        let line = buffer.slice(&start, &end, true).to_string();
+        if editor_list_kind(&buffer, start, &line).is_none() {
+            continue;
+        }
+        handled = true;
+        if outdent {
+            let count = if line.starts_with('\t') {
+                1
+            } else {
+                line.chars()
+                    .take_while(|character| *character == ' ')
+                    .take(4)
+                    .count()
+            };
+            let mut end = start;
+            end.forward_chars(count as i32);
+            buffer.delete(&mut start, &mut end);
+        } else {
+            buffer.insert(&mut start, "    ");
+        }
+    }
+    buffer.end_user_action();
+    handled
 }
 
 fn continue_editor_list_on_enter(editor: &gtk::TextView) -> bool {
@@ -5153,23 +5692,22 @@ fn continue_editor_list_on_enter(editor: &gtk::TextView) -> bool {
     let mut line_end = line_start;
     line_end.forward_to_line_end();
     let line = buffer.slice(&line_start, &line_end, true).to_string();
-    let prefix = if line.starts_with("\u{fffc} ") {
-        let empty = line.chars().skip(2).collect::<String>().trim().is_empty();
-        Some((ListPrefixKind::Task, 2, "☐ ", empty))
-    } else if line.starts_with("☐ ") || line.starts_with("☑ ") {
-        let empty = line.chars().skip(2).collect::<String>().trim().is_empty();
-        Some((ListPrefixKind::Task, 2, "☐ ", empty))
-    } else if line.starts_with("• ") {
-        let empty = line.chars().skip(2).collect::<String>().trim().is_empty();
-        Some((ListPrefixKind::Bullet, 2, "• ", empty))
-    } else {
-        None
-    };
-    let Some((kind, prefix_chars, marker, empty)) = prefix else {
+    let Some(kind) = editor_list_kind(&buffer, line_start, &line) else {
         return false;
+    };
+    let trimmed = line.trim_start_matches([' ', '\t']);
+    let indentation = &line[..line.len() - trimmed.len()];
+    let prefix_chars = indentation.chars().count() as i32 + 2;
+    let empty = trimmed.chars().skip(2).collect::<String>().trim().is_empty();
+    let marker = match kind {
+        ListPrefixKind::Bullet => "• ",
+        ListPrefixKind::Task => "☐ ",
     };
 
     if empty {
+        if !indentation.is_empty() {
+            return indent_editor_list(editor, true);
+        }
         let mut prefix_end = line_start;
         prefix_end.forward_chars(prefix_chars);
         remove_editor_anchor_widgets(editor, line_start, prefix_end);
@@ -5177,10 +5715,10 @@ fn continue_editor_list_on_enter(editor: &gtk::TextView) -> bool {
         return true;
     }
 
-    buffer.insert_at_cursor(&format!("\n{marker}"));
-    if matches!(kind, ListPrefixKind::Task) {
-        install_task_checkbuttons(editor);
-    }
+    buffer.begin_user_action();
+    buffer.insert_at_cursor(&format!("\n{indentation}{marker}"));
+    install_task_checkbuttons(editor);
+    buffer.end_user_action();
     true
 }
 
@@ -5230,7 +5768,12 @@ fn toggle_list_prefix(editor: &gtk::TextView, kind: ListPrefixKind) {
         let mut line_end = line_start;
         line_end.forward_to_line_end();
         let line = buffer.slice(&line_start, &line_end, true).to_string();
-        if line.starts_with("\u{fffc} ") && matches!(kind, ListPrefixKind::Task) {
+        let trimmed = line.trim_start_matches([' ', '\t']);
+        let indentation = line.chars().count() - trimmed.chars().count();
+        line_start.forward_chars(indentation as i32);
+        let line = trimmed;
+        let bullet = line_start.has_tag(&bullet_marker_tag(&buffer));
+        if line.starts_with("\u{fffc} ") && !bullet && matches!(kind, ListPrefixKind::Task) {
             let checked_tag = task_checkbox_checked_tag(&buffer);
             if let Some(anchor) = line_start.child_anchor()
                 && let Some(checkbox) = anchor
@@ -5243,7 +5786,11 @@ fn toggle_list_prefix(editor: &gtk::TextView, kind: ListPrefixKind) {
             }
         }
         let (remove_chars, insert_prefix) = if line.starts_with("\u{fffc} ") {
-            (2, "• ")
+            if bullet {
+                list_prefix_change("• ", kind)
+            } else {
+                (2, "• ")
+            }
         } else {
             list_prefix_change(&line, kind)
         };
@@ -5338,6 +5885,407 @@ fn markdown_from_editor_text(text: &str) -> String {
 #[cfg(test)]
 mod editor_format_tests {
     use super::*;
+
+    #[test]
+    fn bullet_markers_are_widgets_and_not_clipboard_text() -> Result<()> {
+        if std::env::var_os("MEMONOTES_EDITOR_FORMAT_TEST").is_none() {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "editor_format_tests::bullet_markers_are_widgets_and_not_clipboard_text",
+                    "--test-threads=1",
+                ])
+                .env("MEMONOTES_EDITOR_FORMAT_TEST", "1")
+                .status()?;
+            assert!(status.success());
+            return Ok(());
+        }
+        gtk::init()?;
+        let editor = gtk::TextView::new();
+        set_editor_view_content(&editor, "Title\n- First\n- Second");
+        let window = gtk::Window::builder()
+            .default_width(480)
+            .default_height(180)
+            .child(&editor)
+            .build();
+        window.present();
+        while gtk::glib::MainContext::default().pending() {
+            gtk::glib::MainContext::default().iteration(false);
+        }
+        let buffer = editor.buffer();
+        let start = buffer.iter_at_line(1).unwrap();
+        let marker = start.child_anchor().unwrap().widgets()[0]
+            .clone().downcast::<gtk::Label>().unwrap();
+        assert!(!marker.is_selectable());
+        assert!(!marker.can_target());
+        let marker_bounds = marker.compute_bounds(&editor).unwrap();
+        let (_, layout_y) = marker.layout_offsets();
+        let (ink, _) = marker.layout().pixel_extents();
+        let marker_center = marker_bounds.y() + layout_y as f32
+            + ink.y() as f32 + ink.height() as f32 / 2.0;
+        let mut text_start = start;
+        text_start.forward_chars(2);
+        let text_bounds = editor.iter_location(&text_start);
+        let text_center = text_bounds.y() as f32 + text_bounds.height() as f32 / 2.0;
+        assert!(
+            (marker_center - text_center).abs() <= 1.0,
+            "bullet center {marker_center}; text center {text_center}; marker {marker_bounds:?}; ink {ink:?}; layout_y {layout_y}; text {text_bounds:?}"
+        );
+        window.set_child(gtk::Widget::NONE);
+        window.destroy();
+        let mut end = start;
+        end.forward_to_line_end();
+        buffer.select_range(&start, &end);
+        let clipboard = editor.clipboard();
+        buffer.copy_clipboard(&clipboard);
+        let copied = gtk::glib::MainContext::default()
+            .block_on(clipboard.read_text_future())?.unwrap();
+        assert_eq!(copied.trim(), "First");
+        buffer.cut_clipboard(&clipboard, true);
+        buffer.place_cursor(&buffer.end_iter());
+        let pasted = Rc::new(Cell::new(false));
+        let pasted_for_signal = Rc::clone(&pasted);
+        buffer.connect_paste_done(move |_, _| pasted_for_signal.set(true));
+        buffer.paste_clipboard(&clipboard, None, true);
+        while !pasted.get() {
+            gtk::glib::MainContext::default().iteration(true);
+        }
+        assert_eq!(markdown_from_editor_buffer(&buffer), "# Title\n\n- Second First");
+        Ok(())
+    }
+
+    #[test]
+    fn list_tab_shortcuts_preserve_nesting_and_enter_level() -> Result<()> {
+        if std::env::var_os("MEMONOTES_EDITOR_FORMAT_TEST").is_none() {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "editor_format_tests::list_tab_shortcuts_preserve_nesting_and_enter_level",
+                    "--test-threads=1",
+                ])
+                .env("MEMONOTES_EDITOR_FORMAT_TEST", "1")
+                .status()?;
+            assert!(status.success());
+            return Ok(());
+        }
+        gtk::init()?;
+        let editor = gtk::TextView::new();
+        let controllers = editor.observe_controllers();
+        let existing: Vec<_> = (0..controllers.n_items()).filter_map(|index| controllers.item(index)).collect();
+        install_editor_format_shortcuts(&editor);
+        let keys = (0..controllers.n_items()).filter_map(|index| controllers.item(index))
+            .filter(|controller| !existing.contains(controller))
+            .find_map(|controller| controller.downcast::<gtk::EventControllerKey>().ok()).unwrap();
+        let existing: Vec<_> = (0..controllers.n_items()).filter_map(|index| controllers.item(index)).collect();
+        connect_tab_navigation(&editor, gtk::Button::new().upcast(), gtk::Button::new().upcast());
+        let navigation = (0..controllers.n_items()).filter_map(|index| controllers.item(index))
+            .find(|controller| !existing.contains(controller)).unwrap()
+            .downcast::<gtk::EventControllerKey>().unwrap();
+        let buffer = editor.buffer();
+        set_editor_view_content(&editor, "Title\n- Parent\n- Child\n- [x] Task\nParagraph");
+        buffer.place_cursor(&buffer.iter_at_line(2).unwrap());
+        let press = |key: gtk::gdk::Key, modifiers: gtk::gdk::ModifierType| {
+            if keys.emit_by_name::<bool>("key-pressed", &[&key, &0u32, &modifiers]) {
+                gtk::glib::Propagation::Stop
+            } else {
+                gtk::glib::Propagation::Proceed
+            }
+        };
+        assert!(!navigation.emit_by_name::<bool>("key-pressed",
+            &[&gtk::gdk::Key::Tab, &0u32, &gtk::gdk::ModifierType::empty()]));
+        assert_eq!(press(gtk::gdk::Key::Tab, gtk::gdk::ModifierType::empty()), gtk::glib::Propagation::Stop);
+        assert_eq!(markdown_from_editor_buffer(&buffer), "# Title\n- Parent\n    - Child\n- [x] Task\nParagraph");
+        buffer.undo();
+        assert_eq!(markdown_from_editor_buffer(&buffer), "# Title\n- Parent\n- Child\n- [x] Task\nParagraph");
+        buffer.redo();
+        assert_eq!(press(gtk::gdk::Key::ISO_Left_Tab, gtk::gdk::ModifierType::SHIFT_MASK), gtk::glib::Propagation::Stop);
+        buffer.select_range(&buffer.iter_at_line(2).unwrap(), &buffer.iter_at_line(4).unwrap());
+        assert!(indent_editor_list(&editor, false));
+        let nested = "# Title\n- Parent\n    - Child\n    - [x] Task\nParagraph";
+        assert_eq!(markdown_from_editor_buffer(&buffer), nested);
+        set_editor_view_content(&editor, "Other\nBody");
+        set_editor_view_content(&editor, nested);
+        assert_eq!(markdown_from_editor_buffer(&buffer), nested);
+        let mut end = buffer.iter_at_line(2).unwrap();
+        end.forward_to_line_end();
+        buffer.place_cursor(&end);
+        assert_eq!(press(gtk::gdk::Key::Return, gtk::gdk::ModifierType::empty()), gtk::glib::Propagation::Stop);
+        assert_eq!(markdown_from_editor_buffer(&buffer), "# Title\n- Parent\n    - Child\n    - \n    - [x] Task\nParagraph");
+        assert!(continue_editor_list_on_enter(&editor));
+        assert_eq!(markdown_from_editor_buffer(&buffer), "# Title\n- Parent\n    - Child\n- \n    - [x] Task\nParagraph");
+        assert!(continue_editor_list_on_enter(&editor));
+        assert_eq!(markdown_from_editor_buffer(&buffer), "# Title\n- Parent\n    - Child\n\n    - [x] Task\nParagraph");
+        buffer.place_cursor(&buffer.end_iter());
+        assert_eq!(press(gtk::gdk::Key::Tab, gtk::gdk::ModifierType::empty()), gtk::glib::Propagation::Proceed);
+        Ok(())
+    }
+
+    #[test]
+    fn markdown_headings_render_as_styled_blocks_and_round_trip() -> Result<()> {
+        if std::env::var_os("MEMONOTES_EDITOR_FORMAT_TEST").is_none() {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "editor_format_tests::markdown_headings_render_as_styled_blocks_and_round_trip",
+                    "--test-threads=1",
+                ])
+                .env("MEMONOTES_EDITOR_FORMAT_TEST", "1")
+                .status()?;
+            assert!(status.success());
+            return Ok(());
+        }
+        gtk::init()?;
+        let editor = gtk::TextView::new();
+        set_editor_view_content(
+            &editor,
+            "Title\n# Main section\n## Section\n\n### Subsection\n```md\n#### literal\n```",
+        );
+        let buffer = editor.buffer();
+        let rendered_text = buffer
+            .slice(&buffer.start_iter(), &buffer.end_iter(), true)
+            .to_string();
+        assert_eq!(
+            rendered_text,
+            "Title\nMain section\nSection\n\nSubsection\n```md\n#### literal\n```"
+        );
+
+        let main_heading_start = buffer.iter_at_line(1).unwrap();
+        assert!(main_heading_start.has_tag(&heading_style_tag(&buffer, 1)));
+        let section_start = buffer.iter_at_line(2).unwrap();
+        assert!(section_start.has_tag(&heading_style_tag(&buffer, 2)));
+        let subsection_start = buffer.iter_at_line(4).unwrap();
+        assert!(subsection_start.has_tag(&heading_style_tag(&buffer, 3)));
+        let code_heading_start = buffer.iter_at_line(6).unwrap();
+        assert!(!code_heading_start.has_tag(&heading_style_tag(&buffer, 4)));
+        let mut main_heading_end = main_heading_start;
+        main_heading_end.forward_to_line_end();
+        buffer.insert(&mut main_heading_end, " updated");
+        style_note_heading(&buffer);
+        assert!(
+            buffer
+                .iter_at_line(1)
+                .unwrap()
+                .has_tag(&heading_style_tag(&buffer, 1))
+        );
+        assert_eq!(
+            markdown_from_editor_buffer(&buffer),
+            "# Title\n# Main section updated\n## Section\n\n### Subsection\n```md\n#### literal\n```"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn links_render_as_tagged_text_and_round_trip() -> Result<()> {
+        if std::env::var_os("MEMONOTES_EDITOR_FORMAT_TEST").is_none() {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "editor_format_tests::links_render_as_tagged_text_and_round_trip",
+                    "--test-threads=1",
+                ])
+                .env("MEMONOTES_EDITOR_FORMAT_TEST", "1")
+                .status()?;
+            assert!(status.success());
+            return Ok(());
+        }
+        gtk::init()?;
+        let editor = gtk::TextView::new();
+        let source = "Title\nSee [**docs**](https://example.test/a) now";
+        set_editor_view_content(&editor, source);
+        let buffer = editor.buffer();
+        let text = buffer
+            .slice(&buffer.start_iter(), &buffer.end_iter(), true)
+            .to_string();
+        assert_eq!(text, "Title\nSee docs now");
+        let mut inside = buffer.iter_at_line(1).unwrap();
+        inside.forward_chars(5);
+        assert_eq!(link_url_at(&inside).as_deref(), Some("https://example.test/a"));
+        let (_, link_start, link_end) = link_at_cursor(&buffer, &inside).unwrap();
+        assert_eq!(buffer.slice(&link_start, &link_end, true), "docs");
+        assert_eq!(markdown_from_editor_buffer(&buffer), format!("# Title\n{}", &source[6..]));
+
+        let mut start = buffer.iter_at_line(1).unwrap();
+        let mut end = start;
+        end.forward_chars(3);
+        buffer.apply_tag(&link_tag(&buffer, "https://x.test"), &start, &end);
+        assert_eq!(
+            markdown_from_editor_buffer(&buffer),
+            "# Title\n[See](https://x.test) [**docs**](https://example.test/a) now"
+        );
+        end.forward_to_line_end();
+        start = buffer.iter_at_line(1).unwrap();
+        remove_link_tags(&buffer, &start, &end);
+        assert_eq!(
+            markdown_from_editor_buffer(&buffer),
+            "# Title\nSee **docs** now"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn typing_a_url_and_delimiter_automatically_creates_a_link() -> Result<()> {
+        if std::env::var_os("MEMONOTES_EDITOR_FORMAT_TEST").is_none() {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "editor_format_tests::typing_a_url_and_delimiter_automatically_creates_a_link",
+                    "--test-threads=1",
+                ])
+                .env("MEMONOTES_EDITOR_FORMAT_TEST", "1")
+                .status()?;
+            assert!(status.success());
+            return Ok(());
+        }
+        gtk::init()?;
+        let editor = gtk::TextView::new();
+        let buffer = editor.buffer();
+        buffer.set_text("Title\n");
+        install_editor_format_shortcuts(&editor);
+        buffer.place_cursor(&buffer.end_iter());
+        for character in "www.example.test, ".chars() {
+            buffer.insert_at_cursor(&character.to_string());
+        }
+
+        let url_start = buffer.iter_at_line(1).unwrap();
+        let mut url_end = url_start;
+        url_end.forward_chars("www.example.test".chars().count() as i32);
+        assert_eq!(link_url_at(&url_start).as_deref(), Some("https://www.example.test"));
+        assert_eq!(buffer.slice(&url_start, &url_end, true), "www.example.test");
+        assert_eq!(
+            markdown_from_editor_buffer(&buffer),
+            "# Title\n[www.example.test](https://www.example.test), "
+        );
+
+        buffer.set_text("Title\n");
+        buffer.place_cursor(&buffer.end_iter());
+        for character in "https://example.com".chars() {
+            buffer.insert_at_cursor(&character.to_string());
+        }
+        let complete_url = buffer.iter_at_line(1).unwrap();
+        assert_eq!(link_url_at(&complete_url).as_deref(), Some("https://example.com"));
+        assert_eq!(
+            markdown_from_editor_buffer(&buffer),
+            "# Title\n[https://example.com](https://example.com)"
+        );
+
+        buffer.set_text("Title\n");
+        buffer.place_cursor(&buffer.end_iter());
+        for character in "https://nos.nl ".chars() {
+            buffer.insert_at_cursor(&character.to_string());
+        }
+        let suffix_start = buffer.iter_at_offset("Title\nhttps://nos".chars().count() as i32);
+        let suffix_start_offset = suffix_start.offset();
+        let mut delete_start = suffix_start;
+        let mut suffix_end = buffer.iter_at_offset("Title\nhttps://nos.nl".chars().count() as i32);
+        buffer.delete(&mut delete_start, &mut suffix_end);
+        buffer.place_cursor(&buffer.iter_at_offset(suffix_start_offset));
+        for character in ".com".chars() {
+            buffer.insert_at_cursor(&character.to_string());
+        }
+        let edited_url_start = buffer.iter_at_line(1).unwrap();
+        assert_eq!(link_url_at(&edited_url_start).as_deref(), Some("https://nos.com"));
+        assert_eq!(
+            markdown_from_editor_buffer(&buffer),
+            "# Title\n[https://nos.com](https://nos.com) "
+        );
+
+        buffer.set_text("Title\nhttps://example.test");
+        assert_eq!(
+            link_url_at(&buffer.iter_at_line(1).unwrap()).as_deref(),
+            Some("https://example.test")
+        );
+        buffer.place_cursor(&buffer.end_iter());
+        for character in " example.net ".chars() {
+            buffer.insert_at_cursor(&character.to_string());
+        }
+        let bare_domain = buffer.iter_at_offset("Title\nhttps://example.test ".chars().count() as i32);
+        assert_eq!(link_url_at(&bare_domain).as_deref(), Some("https://example.net"));
+        Ok(())
+    }
+
+    #[test]
+    fn heading_menu_formats_and_clears_cursor_block() -> Result<()> {
+        if std::env::var_os("MEMONOTES_EDITOR_FORMAT_TEST").is_none() {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "editor_format_tests::heading_menu_formats_and_clears_cursor_block",
+                    "--test-threads=1",
+                ])
+                .env("MEMONOTES_EDITOR_FORMAT_TEST", "1")
+                .status()?;
+            assert!(status.success());
+            return Ok(());
+        }
+        gtk::init()?;
+        let editor = gtk::TextView::new();
+        set_editor_view_content(&editor, "Title\nFirst paragraph\nSecond paragraph");
+        let buffer = editor.buffer();
+        style_note_heading(&buffer);
+        buffer.place_cursor(&buffer.start_iter());
+        let menu = editor_heading_menu(&editor);
+        assert_eq!(menu.label().as_deref(), Some("H1"));
+        buffer.place_cursor(&buffer.iter_at_line(1).unwrap());
+        assert_eq!(menu.label().as_deref(), Some("P"));
+        let second_line = buffer.iter_at_line(2).unwrap();
+        buffer.place_cursor(&second_line);
+        assert_eq!(menu.label().as_deref(), Some("P"));
+
+        fn activate_menu_choice(menu: &gtk::MenuButton, index: usize) {
+            let choices = menu
+                .popover()
+                .unwrap()
+                .child()
+                .unwrap()
+                .downcast::<gtk::Box>()
+                .unwrap();
+            let mut option = choices.first_child().unwrap();
+            for _ in 0..index {
+                option = option.next_sibling().unwrap();
+            }
+            option.downcast::<gtk::Button>().unwrap().emit_clicked();
+        }
+
+        activate_menu_choice(&menu, 2);
+        assert_eq!(menu.label().as_deref(), Some("H2"));
+        assert!(buffer
+            .iter_at_line(2)
+            .unwrap()
+            .has_tag(&heading_style_tag(&buffer, 2)));
+        assert_eq!(
+            markdown_from_editor_buffer(&buffer),
+            "# Title\nFirst paragraph\n## Second paragraph"
+        );
+
+        activate_menu_choice(&menu, 0);
+        assert_eq!(menu.label().as_deref(), Some("P"));
+        assert!(!buffer
+            .iter_at_line(2)
+            .unwrap()
+            .has_tag(&heading_style_tag(&buffer, 2)));
+        assert_eq!(
+            markdown_from_editor_buffer(&buffer),
+            "# Title\nFirst paragraph\nSecond paragraph"
+        );
+
+        let mut end = buffer.end_iter();
+        buffer.insert(&mut end, "\n");
+        let blank_line = buffer.iter_at_line(3).unwrap();
+        buffer.place_cursor(&blank_line);
+        activate_menu_choice(&menu, 3);
+        assert_eq!(menu.label().as_deref(), Some("H3"));
+        buffer.insert_at_cursor("New heading");
+        assert_eq!(menu.label().as_deref(), Some("H3"));
+        assert!(buffer
+            .iter_at_line(3)
+            .unwrap()
+            .has_tag(&heading_style_tag(&buffer, 3)));
+        assert_eq!(
+            markdown_from_editor_buffer(&buffer),
+            "# Title\nFirst paragraph\nSecond paragraph\n### New heading"
+        );
+        Ok(())
+    }
 
     #[test]
     fn editor_text_undo_and_redo_preserve_user_edits_only() -> Result<()> {
@@ -5652,6 +6600,29 @@ fn style_note_heading(buffer: &gtk::TextBuffer) {
     buffer.apply_tag(&tag, &start, &heading_end);
 }
 
+fn heading_style_tag(buffer: &gtk::TextBuffer, level: u8) -> gtk::TextTag {
+    let (name, scale, spacing) = match level {
+        1 => ("editor-h1", 1.65, 8),
+        2 => ("editor-h2", 1.4, 7),
+        3 => ("editor-h3", 1.2, 6),
+        4 => ("editor-h4", 1.1, 5),
+        5 => ("editor-h5", 1.0, 4),
+        _ => ("editor-h6", 0.95, 4),
+    };
+    let table = buffer.tag_table();
+    table.lookup(name).unwrap_or_else(|| {
+        let tag = gtk::TextTag::builder()
+            .name(name)
+            .weight(700)
+            .scale(scale)
+            .pixels_above_lines(spacing)
+            .pixels_below_lines(spacing)
+            .build();
+        table.add(&tag);
+        tag
+    })
+}
+
 fn inline_style_tag(buffer: &gtk::TextBuffer, mark: Mark) -> gtk::TextTag {
     let (name, build): (&str, fn() -> gtk::TextTag) = match mark {
         Mark::Bold => ("editor-mark-bold", || {
@@ -5688,8 +6659,15 @@ fn inline_style_tag(buffer: &gtk::TextBuffer, mark: Mark) -> gtk::TextTag {
     editor_text_tag(buffer, name, build)
 }
 
-fn apply_rendered_spans(buffer: &gtk::TextBuffer, text: &str, spans: &[MarkupSpan]) {
+fn apply_rendered_spans(
+    buffer: &gtk::TextBuffer,
+    text: &str,
+    spans: &[MarkupSpan],
+    headings: &[memonotes::editor_document::HeadingSpan],
+    links: &[LinkSpan],
+) {
     let (start, end) = buffer.bounds();
+    remove_link_tags(buffer, &start, &end);
     let marks = [
         Mark::Bold,
         Mark::Italic,
@@ -5717,6 +6695,20 @@ fn apply_rendered_spans(buffer: &gtk::TextBuffer, text: &str, spans: &[MarkupSpa
             buffer.apply_tag(tag, &start, &end);
         }
     }
+
+    for heading in headings {
+        let start_offset = text[..heading.range.start].chars().count() as i32;
+        let end_offset = text[..heading.range.end].chars().count() as i32;
+        let start = buffer.iter_at_offset(start_offset);
+        let end = buffer.iter_at_offset(end_offset);
+        buffer.apply_tag(&heading_style_tag(buffer, heading.level), &start, &end);
+    }
+
+    for link in links {
+        let start = buffer.iter_at_offset(text[..link.range.start].chars().count() as i32);
+        let end = buffer.iter_at_offset(text[..link.range.end].chars().count() as i32);
+        buffer.apply_tag(&link_tag(buffer, &link.url), &start, &end);
+    }
 }
 
 fn remove_editor_anchor_widgets(editor: &gtk::TextView, mut iter: gtk::TextIter, end: gtk::TextIter) {
@@ -5742,7 +6734,13 @@ fn set_editor_view_content(editor: &gtk::TextView, content: &str) {
     buffer.set_enable_undo(false);
     remove_editor_anchor_widgets(editor, start, end);
     buffer.set_text(&rendered.text);
-    apply_rendered_spans(&buffer, &rendered.text, &rendered.spans);
+    apply_rendered_spans(
+        &buffer,
+        &rendered.text,
+        &rendered.spans,
+        &rendered.headings,
+        &rendered.links,
+    );
     install_task_checkbuttons(editor);
     buffer.set_enable_undo(true);
 }
@@ -5751,6 +6749,14 @@ fn task_checkbox_checked_tag(buffer: &gtk::TextBuffer) -> gtk::TextTag {
     editor_text_tag(buffer, "task-checkbox-checked", || {
         gtk::TextTag::builder()
             .name("task-checkbox-checked")
+            .build()
+    })
+}
+
+fn bullet_marker_tag(buffer: &gtk::TextBuffer) -> gtk::TextTag {
+    editor_text_tag(buffer, "bullet-marker", || {
+        gtk::TextTag::builder()
+            .name("bullet-marker")
             .build()
     })
 }
@@ -5768,10 +6774,13 @@ fn install_task_checkbuttons(editor: &gtk::TextView) {
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
             in_fenced_code = !in_fenced_code;
         } else if !in_fenced_code {
-            if line.starts_with("☐ ") {
-                checkbox_offsets.push((offset, false));
-            } else if line.starts_with("☑ ") {
-                checkbox_offsets.push((offset, true));
+            let indentation = line.chars().count() - trimmed.chars().count();
+            if trimmed.starts_with("☐ ") {
+                checkbox_offsets.push((offset + indentation, false));
+            } else if trimmed.starts_with("☑ ") {
+                checkbox_offsets.push((offset + indentation, true));
+            } else if trimmed.starts_with("• ") {
+                checkbox_offsets.push((offset + indentation, false));
             }
         }
         offset += line.chars().count() + 1;
@@ -5780,6 +6789,7 @@ fn install_task_checkbuttons(editor: &gtk::TextView) {
     let checked_tag = task_checkbox_checked_tag(&buffer);
     for (offset, checked) in checkbox_offsets.into_iter().rev() {
         let mut marker_start = buffer.iter_at_offset(offset as i32);
+        let bullet = marker_start.char() == '•';
         let mut marker_end = marker_start;
         marker_end.forward_chars(2);
         buffer.delete(&mut marker_start, &mut marker_end);
@@ -5787,6 +6797,31 @@ fn install_task_checkbuttons(editor: &gtk::TextView) {
         let mut anchor_iter = buffer.iter_at_offset(offset as i32);
         let anchor = buffer.create_child_anchor(&mut anchor_iter);
         buffer.insert(&mut anchor_iter, " ");
+        let anchor_start = buffer.iter_at_child_anchor(&anchor);
+        let mut anchor_end = anchor_start;
+        anchor_end.forward_char();
+        buffer.remove_tag(&bullet_marker_tag(&buffer), &anchor_start, &anchor_end);
+        buffer.remove_tag(&checked_tag, &anchor_start, &anchor_end);
+        if bullet {
+            let anchor_start = buffer.iter_at_child_anchor(&anchor);
+            let mut anchor_end = anchor_start;
+            anchor_end.forward_char();
+            buffer.apply_tag(&bullet_marker_tag(&buffer), &anchor_start, &anchor_end);
+            let marker = gtk::Label::new(Some("•"));
+            marker.set_selectable(false);
+            marker.set_can_target(false);
+            marker.set_valign(gtk::Align::Baseline);
+            let text_layout = editor.create_pango_layout(Some(" "));
+            let (_, text_extent) = text_layout.pixel_extents();
+            let (bullet_ink, bullet_extent) = marker.layout().pixel_extents();
+            let bullet_center = bullet_ink.y() + bullet_ink.height() / 2;
+            let rise = text_layout.baseline()
+                - (text_extent.height() / 2 + bullet_extent.height() - bullet_center)
+                    * gtk::pango::SCALE;
+            bullet_marker_tag(&buffer).set_rise(rise);
+            editor.add_child_at_anchor(&marker, &anchor);
+            continue;
+        }
         if checked {
             let anchor_start = buffer.iter_at_child_anchor(&anchor);
             let mut anchor_end = anchor_start;
@@ -5845,25 +6880,49 @@ fn markdown_from_editor_buffer(buffer: &gtk::TextBuffer) -> String {
         let line = line_with_ending
             .strip_suffix('\n')
             .unwrap_or(line_with_ending);
+        let trimmed = line.trim_start_matches([' ', '\t']);
+        let indentation = line.chars().count() - trimmed.chars().count();
+        let marker_offset = char_offset + indentation;
         let line_chars: Vec<_> = line.chars().collect();
-        let (prefix, prefix_chars) = if line.starts_with("\u{fffc} ") {
-            let checkbox = buffer.iter_at_offset(char_offset as i32);
+        let line_start = buffer.iter_at_offset(char_offset as i32);
+        let heading_level = (1..=6).find(|level| {
+            line_start.has_tag(&heading_style_tag(buffer, *level))
+        });
+        let (prefix, prefix_chars) = if trimmed.starts_with("\u{fffc} ") {
+            let checkbox = buffer.iter_at_offset(marker_offset as i32);
             let checked = checkbox.has_tag(&task_checkbox_checked_tag(buffer));
-            (if checked { "☑ " } else { "☐ " }, 2)
-        } else if line.starts_with("☐ ") {
-            ("☐ ", 2)
-        } else if line.starts_with("☑ ") {
-            ("☑ ", 2)
-        } else if line.starts_with("• ") {
-            ("• ", 2)
+            let marker = if checkbox.has_tag(&bullet_marker_tag(buffer)) {
+                "• "
+            } else if checked {
+                "☑ "
+            } else {
+                "☐ "
+            };
+            (marker.to_owned(), 2)
+        } else if trimmed.starts_with("☐ ") {
+            ("☐ ".to_owned(), 2)
+        } else if trimmed.starts_with("☑ ") {
+            ("☑ ".to_owned(), 2)
+        } else if trimmed.starts_with("• ") {
+            ("• ".to_owned(), 2)
+        } else if let Some(level) = heading_level {
+            (format!("{} ", "#".repeat(level as usize)), 0)
         } else {
-            ("", 0)
+            (String::new(), 0)
         };
-        body.push_str(prefix);
+        let content_start = if prefix_chars > 0 {
+            indentation + prefix_chars
+        } else {
+            0
+        };
+        if prefix_chars > 0 {
+            body.extend(line_chars[..indentation].iter());
+        }
+        body.push_str(&prefix);
         body.push_str(&serialize_inline_range(
             buffer,
-            &line_chars[prefix_chars..],
-            char_offset + prefix_chars,
+            &line_chars[content_start..],
+            char_offset + content_start,
         ));
         if line_with_ending.ends_with('\n') {
             body.push('\n');
@@ -5891,26 +6950,37 @@ fn serialize_inline_range(
         .into_iter()
         .map(|mark| (mark, inline_style_tag(buffer, mark)))
         .collect();
-    let mut output = String::new();
-    let mut active_marks = Vec::new();
-    let mut run = String::new();
+    let mut runs: Vec<(Option<String>, Vec<Mark>, String)> = Vec::new();
 
     for (character_offset, character) in characters.iter().enumerate() {
         let iter = buffer.iter_at_offset((start_offset + character_offset) as i32);
-        let next_marks: Vec<_> = tags
+        let marks: Vec<_> = tags
             .iter()
             .filter(|(_, tag)| iter.has_tag(tag))
             .map(|(mark, _)| *mark)
             .collect();
-        if !run.is_empty() && next_marks != active_marks {
-            output.push_str(&serialize_marked_text(&run, &active_marks));
-            run.clear();
+        let url = link_url_at(&iter);
+        match runs.last_mut() {
+            Some((last_url, last_marks, text)) if *last_url == url && *last_marks == marks => {
+                text.push(*character)
+            }
+            _ => runs.push((url, marks, character.to_string())),
         }
-        active_marks = next_marks;
-        run.push(*character);
     }
-    if !run.is_empty() {
-        output.push_str(&serialize_marked_text(&run, &active_marks));
+
+    let mut output = String::new();
+    let mut index = 0;
+    while index < runs.len() {
+        let url = runs[index].0.clone();
+        let mut label = String::new();
+        while index < runs.len() && runs[index].0 == url {
+            label.push_str(&serialize_marked_text(&runs[index].2, &runs[index].1));
+            index += 1;
+        }
+        match url {
+            Some(url) => output.push_str(&markdown_link(&label, &url)),
+            None => output.push_str(&label),
+        }
     }
     output
 }
