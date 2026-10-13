@@ -4,6 +4,9 @@ use adw::{Application, ApplicationWindow, HeaderBar, ToolbarView};
 use anyhow::{Context, Result};
 use libadwaita as adw;
 use memonotes::adapters::{BackendAdapter, MemosAdapter};
+use memonotes::editor_document::{
+    Mark, MarkupSpan, markdown_inline_text, markdown_preview_text, render_markdown_source,
+};
 use memonotes::i18n::tr;
 use memonotes::{
     BackendAccount, FolderDeleteMode, Note, NoteFilter, Store, SyncConflictResolution,
@@ -154,7 +157,7 @@ struct WindowState {
     active_filter: RefCell<ActiveNoteFilter>,
     note_id: RefCell<Option<String>>,
     note_windows: RefCell<HashMap<String, ApplicationWindow>>,
-    note_window_editors: RefCell<HashMap<String, gtk::glib::WeakRef<gtk::TextBuffer>>>,
+    note_window_editors: RefCell<HashMap<String, gtk::glib::WeakRef<gtk::TextView>>>,
     suppress_detached_editor_events: Cell<bool>,
     note_list: NoteList,
     note_list_focus: gtk::ScrolledWindow,
@@ -396,6 +399,9 @@ fn build_window(application: &Application) -> Result<()> {
 
     let editor = gtk::Box::new(gtk::Orientation::Vertical, 12);
     editor.add_css_class("note-detail-surface");
+    let format_toolbar = editor_format_toolbar(&content);
+    editor.append(&format_toolbar);
+    install_editor_format_shortcuts(&content);
     let editor_actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     editor_actions.append(&pin_button);
     editor_actions.append(&archive_button);
@@ -3371,7 +3377,10 @@ fn note_detail_css(dark: bool) -> String {
          textview.empty-note-heading {{ font-size: 1.65em; font-weight: 700; }} \
          .note-detail-pane {{ background-image: linear-gradient(to right, alpha(black, 0.05), transparent 8px); }} \
          .note-color-option {{ padding: 5px; }} \
-         .note-color-swatch {{ border-radius: 50px; border: 1px solid alpha(@theme_fg_color, 0.18); }} "
+         .note-color-swatch {{ border-radius: 50px; border: 1px solid alpha(@theme_fg_color, 0.18); }} \
+         button.task-checkbox {{ min-width: 16px; min-height: 16px; padding: 0; border-radius: 50%; border: 1px solid #3584e4; background: transparent; box-shadow: none; transform: translate(0px, 5px); }} \
+         button.task-checkbox:checked {{ background: #3584e4; color: white; }} \
+         button.task-checkbox label {{ font-size: 14px; font-weight: 700; }} "
     );
     for &(color, _, _, _) in &NOTE_COLOR_PALETTE {
         let value = note_color_value(color, dark);
@@ -3883,9 +3892,8 @@ fn connect_events(state: &Rc<WindowState>, new_note: &gtk::Button) {
     let buffer = state.content.buffer();
     let handler = buffer.connect_changed(move |buffer| {
         style_note_heading(buffer);
-        let (start, end) = buffer.bounds();
-        let body = buffer.text(&start, &end, true);
-        save_current(&state_for_content, body.as_str());
+        let markdown = markdown_from_editor_buffer(buffer);
+        save_current(&state_for_content, &markdown);
     });
     track_signal(state, &buffer, handler);
 
@@ -4150,13 +4158,7 @@ fn build_note_row(state: &Rc<WindowState>, note: &Note) -> gtk::Box {
     heading_row.append(&heading);
     heading_row.append(&metadata);
     let preview = gtk::Label::builder()
-        .label(
-            note.editor_parts()
-                .1
-                .lines()
-                .find(|line| !line.trim().is_empty())
-                .unwrap_or(""),
-        )
+        .label(note_preview_text(note))
         .xalign(0.0)
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .build();
@@ -4712,13 +4714,7 @@ fn update_note_row_widgets(row: &gtk::Box, note: &Note, folder_name: &str) {
     }
     if let Some(preview_row) = heading_row.next_sibling().and_downcast::<gtk::Box>() {
         if let Some(preview) = preview_row.first_child().and_downcast::<gtk::Label>() {
-            preview.set_text(
-                note.editor_parts()
-                    .1
-                    .lines()
-                    .find(|line| !line.trim().is_empty())
-                    .unwrap_or(""),
-            );
+            preview.set_text(&note_preview_text(note));
         }
         if let Some(folder) = preview_row.last_child().and_downcast::<gtk::Label>() {
             folder.set_text(folder_name);
@@ -4748,6 +4744,14 @@ fn show_note(state: &Rc<WindowState>, note: &Note) {
     set_note_surfaces_color(&state.note_surfaces.borrow(), &state.note_color.borrow());
 }
 
+fn note_preview_text(note: &Note) -> String {
+    markdown_preview_text(note.editor_parts().1)
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default()
+        .to_owned()
+}
+
 fn open_note_window(application: &gtk::Application, state: &Rc<WindowState>, note: &Note) {
     if let Some(window) = state.note_windows.borrow().get(&note.id) {
         window.present();
@@ -4775,11 +4779,14 @@ fn open_note_window(application: &gtk::Application, state: &Rc<WindowState>, not
         .build();
     content.add_css_class("note-detail-surface");
     prepare_empty_heading(&content);
-    content.buffer().set_text(&note.editor_document());
+    set_editor_view_content(&content, &note.editor_document());
     style_note_heading(&content.buffer());
+    let format_toolbar = editor_format_toolbar(&content);
+    install_editor_format_shortcuts(&content);
 
     let editor = gtk::Box::new(gtk::Orientation::Vertical, 12);
     editor.add_css_class("note-detail-surface");
+    editor.append(&format_toolbar);
     let content_scroll = gtk::ScrolledWindow::builder()
         .vexpand(true)
         .child(&content)
@@ -4846,7 +4853,7 @@ fn open_note_window(application: &gtk::Application, state: &Rc<WindowState>, not
     state
         .note_window_editors
         .borrow_mut()
-        .insert(note.id.clone(), buffer.downgrade());
+        .insert(note.id.clone(), content.downgrade());
     window.present();
     content.grab_focus();
 }
@@ -4858,10 +4865,11 @@ fn refresh_open_note_windows(state: &Rc<WindowState>) {
             continue;
         };
         let editors = state.note_window_editors.borrow().get(&note_id).cloned();
-        let Some(buffer) = editors.and_then(|buffer| buffer.upgrade()) else {
+        let Some(editor) = editors.and_then(|editor| editor.upgrade()) else {
             state.note_window_editors.borrow_mut().remove(&note_id);
             continue;
         };
+        let buffer = editor.buffer();
         if let Some(window) = state.note_windows.borrow().get(&note_id) {
             window.set_title(Some(if note.title.is_empty() {
                 "Nieuwe notitie"
@@ -4870,7 +4878,7 @@ fn refresh_open_note_windows(state: &Rc<WindowState>) {
             }));
         }
         let previous_suppress = state.suppress_detached_editor_events.replace(true);
-        buffer.set_text(&note.editor_document());
+        set_editor_view_content(&editor, &note.editor_document());
         style_note_heading(&buffer);
         state.suppress_detached_editor_events.set(previous_suppress);
     }
@@ -4889,8 +4897,7 @@ fn save_detached_note(state: &Rc<WindowState>, note_id: &str, buffer: &gtk::Text
     if state.suppress_detached_editor_events.get() {
         return;
     }
-    let (start, end) = buffer.bounds();
-    let content = buffer.text(&start, &end, true);
+    let content = markdown_from_editor_buffer(buffer);
     let (title, body) = memonotes::memo::editor_parts(content.as_str());
     let Some(current) = state.store.borrow().note(note_id).ok().flatten() else {
         return;
@@ -4966,6 +4973,519 @@ fn save_current(state: &Rc<WindowState>, content: &str) {
     }
 }
 
+fn editor_format_toolbar(editor: &gtk::TextView) -> gtk::Box {
+    let buffer = editor.buffer();
+    let toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    toolbar.add_css_class("linked");
+    toolbar.set_halign(gtk::Align::Start);
+    toolbar.set_margin_start(44);
+    toolbar.set_margin_top(8);
+
+    for (icon, tooltip, mark) in [
+        (
+            "format-text-bold-symbolic",
+            "editor.format.bold",
+            Mark::Bold,
+        ),
+        (
+            "format-text-italic-symbolic",
+            "editor.format.italic",
+            Mark::Italic,
+        ),
+        (
+            "format-text-underline-symbolic",
+            "editor.format.underline",
+            Mark::Underline,
+        ),
+    ] {
+        let button = icon_button(icon, tr(tooltip));
+        button.set_size_request(36, 36);
+        let buffer = buffer.clone();
+        button.connect_clicked(move |_| apply_inline_style(&buffer, mark));
+        toolbar.append(&button);
+    }
+
+    for (icon, tooltip, kind) in [
+        (
+            "checkbox-checked-symbolic",
+            "editor.format.task_list",
+            ListPrefixKind::Task,
+        ),
+        (
+            "view-list-bullet-symbolic",
+            "editor.format.bullet_list",
+            ListPrefixKind::Bullet,
+        ),
+    ] {
+        let button = icon_button(icon, tr(tooltip));
+        button.set_size_request(36, 36);
+        let editor = editor.clone();
+        button.connect_clicked(move |_| toggle_list_prefix(&editor, kind));
+        toolbar.append(&button);
+    }
+
+    toolbar
+}
+
+#[derive(Clone, Copy)]
+enum ListPrefixKind {
+    Task,
+    Bullet,
+}
+
+fn install_editor_format_shortcuts(editor: &gtk::TextView) {
+    let buffer = editor.buffer();
+    let editor_for_enter = editor.clone();
+    let keys = gtk::EventControllerKey::new();
+    keys.connect_key_pressed(move |_, key, _, modifiers| {
+        if matches!(key, gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter)
+            && !modifiers.intersects(
+                gtk::gdk::ModifierType::CONTROL_MASK
+                    | gtk::gdk::ModifierType::ALT_MASK
+                    | gtk::gdk::ModifierType::SHIFT_MASK,
+            )
+            && continue_editor_list_on_enter(&editor_for_enter)
+        {
+            return gtk::glib::Propagation::Stop;
+        }
+        if !modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK) {
+            return gtk::glib::Propagation::Proceed;
+        }
+        let shifted = modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK);
+        match key {
+            gtk::gdk::Key::b if !shifted => apply_inline_style(&buffer, Mark::Bold),
+            gtk::gdk::Key::i if !shifted => apply_inline_style(&buffer, Mark::Italic),
+            gtk::gdk::Key::u if !shifted => apply_inline_style(&buffer, Mark::Underline),
+            gtk::gdk::Key::t | gtk::gdk::Key::T if shifted => {
+                toggle_list_prefix(&editor_for_enter, ListPrefixKind::Task)
+            }
+            gtk::gdk::Key::l | gtk::gdk::Key::L if shifted => {
+                toggle_list_prefix(&editor_for_enter, ListPrefixKind::Bullet)
+            }
+            _ => return gtk::glib::Propagation::Proceed,
+        }
+        gtk::glib::Propagation::Stop
+    });
+    editor.add_controller(keys);
+}
+
+fn continue_editor_list_on_enter(editor: &gtk::TextView) -> bool {
+    let buffer = editor.buffer();
+    let cursor = buffer.iter_at_mark(&buffer.get_insert());
+    let Some(mut line_start) = buffer.iter_at_line(cursor.line()) else {
+        return false;
+    };
+    let mut line_end = line_start;
+    line_end.forward_to_line_end();
+    let line = buffer.slice(&line_start, &line_end, true).to_string();
+    let prefix = if line.starts_with("\u{fffc} ") {
+        let empty = line.chars().skip(2).collect::<String>().trim().is_empty();
+        Some((ListPrefixKind::Task, 2, "☐ ", empty))
+    } else if line.starts_with("☐ ") || line.starts_with("☑ ") {
+        let empty = line.chars().skip(2).collect::<String>().trim().is_empty();
+        Some((ListPrefixKind::Task, 2, "☐ ", empty))
+    } else if line.starts_with("• ") {
+        let empty = line.chars().skip(2).collect::<String>().trim().is_empty();
+        Some((ListPrefixKind::Bullet, 2, "• ", empty))
+    } else {
+        None
+    };
+    let Some((kind, prefix_chars, marker, empty)) = prefix else {
+        return false;
+    };
+
+    if empty {
+        let mut prefix_end = line_start;
+        prefix_end.forward_chars(prefix_chars);
+        remove_editor_anchor_widgets(editor, line_start, prefix_end);
+        buffer.delete(&mut line_start, &mut prefix_end);
+        return true;
+    }
+
+    buffer.insert_at_cursor(&format!("\n{marker}"));
+    if matches!(kind, ListPrefixKind::Task) {
+        install_task_checkbuttons(editor);
+    }
+    true
+}
+
+fn apply_inline_style(buffer: &gtk::TextBuffer, mark: Mark) {
+    let Some((start, end)) = buffer.selection_bounds() else {
+        return;
+    };
+    let tag = inline_style_tag(buffer, mark);
+    let mut cursor = start;
+    let mut all_styled = true;
+    while cursor.offset() < end.offset() {
+        if !cursor.has_tag(&tag) {
+            all_styled = false;
+            break;
+        }
+        cursor.forward_char();
+    }
+    if all_styled {
+        buffer.remove_tag(&tag, &start, &end);
+    } else {
+        buffer.apply_tag(&tag, &start, &end);
+    }
+    buffer.emit_by_name::<()>("changed", &[]);
+}
+
+fn toggle_list_prefix(editor: &gtk::TextView, kind: ListPrefixKind) {
+    let buffer = editor.buffer();
+    let selection = buffer.selection_bounds();
+    let (start_line, mut end_line) = selection
+        .as_ref()
+        .map(|(start, end)| (start.line(), end.line()))
+        .unwrap_or_else(|| {
+            let cursor = buffer.iter_at_mark(&buffer.get_insert());
+            (cursor.line(), cursor.line())
+        });
+    if let Some((_, end)) = selection.as_ref()
+        && end.line_offset() == 0
+        && end_line > start_line
+    {
+        end_line -= 1;
+    }
+
+    for line_number in (start_line..=end_line).rev() {
+        let Some(mut line_start) = buffer.iter_at_line(line_number) else {
+            continue;
+        };
+        let mut line_end = line_start;
+        line_end.forward_to_line_end();
+        let line = buffer.slice(&line_start, &line_end, true).to_string();
+        if line.starts_with("\u{fffc} ") && matches!(kind, ListPrefixKind::Task) {
+            let checked_tag = task_checkbox_checked_tag(&buffer);
+            if let Some(anchor) = line_start.child_anchor()
+                && let Some(checkbox) = anchor
+                    .widgets()
+                    .into_iter()
+                    .find_map(|widget| widget.downcast::<gtk::ToggleButton>().ok())
+            {
+                checkbox.set_active(!line_start.has_tag(&checked_tag));
+                continue;
+            }
+        }
+        let (remove_chars, insert_prefix) = if line.starts_with("\u{fffc} ") {
+            (2, "• ")
+        } else {
+            list_prefix_change(&line, kind)
+        };
+        let mut prefix_end = line_start;
+        prefix_end.forward_chars(remove_chars);
+        remove_editor_anchor_widgets(editor, line_start, prefix_end);
+        buffer.delete(&mut line_start, &mut prefix_end);
+        buffer.insert(&mut line_start, insert_prefix);
+    }
+    install_task_checkbuttons(editor);
+    editor.grab_focus();
+}
+
+fn list_prefix_change(line: &str, kind: ListPrefixKind) -> (i32, &'static str) {
+    match kind {
+        ListPrefixKind::Task if line.starts_with("☐ ") => (2, "☑ "),
+        ListPrefixKind::Task if line.starts_with("☑ ") => (2, "☐ "),
+        ListPrefixKind::Task if line.starts_with("• ") => (2, "☐ "),
+        ListPrefixKind::Task => (0, "☐ "),
+        ListPrefixKind::Bullet if line.starts_with("☐ ") || line.starts_with("☑ ") => (2, "• "),
+        ListPrefixKind::Bullet if line.starts_with("• ") => (2, ""),
+        ListPrefixKind::Bullet => (0, "• "),
+    }
+}
+
+fn map_list_markers(text: &str, to_editor: bool) -> String {
+    let mut mapped = String::with_capacity(text.len());
+    let mut in_fenced_code = false;
+
+    for line_with_ending in text.split_inclusive('\n') {
+        let line = line_with_ending
+            .strip_suffix('\n')
+            .unwrap_or(line_with_ending);
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fenced_code = !in_fenced_code;
+            mapped.push_str(line_with_ending);
+            continue;
+        }
+
+        if in_fenced_code {
+            mapped.push_str(line_with_ending);
+            continue;
+        }
+
+        let indentation = line.len() - trimmed.len();
+        let (rest, replacement) = if to_editor {
+            if let Some(rest) = trimmed.strip_prefix("- [ ] ") {
+                (Some(rest), "☐ ")
+            } else if let Some(rest) = trimmed
+                .strip_prefix("- [x] ")
+                .or_else(|| trimmed.strip_prefix("- [X] "))
+            {
+                (Some(rest), "☑ ")
+            } else if let Some(rest) = trimmed.strip_prefix("- ") {
+                (Some(rest), "• ")
+            } else {
+                (None, "")
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("☐ ") {
+            (Some(rest), "- [ ] ")
+        } else if let Some(rest) = trimmed.strip_prefix("☑ ") {
+            (Some(rest), "- [x] ")
+        } else if let Some(rest) = trimmed.strip_prefix("• ") {
+            (Some(rest), "- ")
+        } else {
+            (None, "")
+        };
+
+        if let Some(rest) = rest {
+            mapped.push_str(&line[..indentation]);
+            mapped.push_str(replacement);
+            mapped.push_str(rest);
+        } else {
+            mapped.push_str(line);
+        }
+        if line_with_ending.ends_with('\n') {
+            mapped.push('\n');
+        }
+    }
+    mapped
+}
+
+fn editor_text_from_markdown(markdown: &str) -> String {
+    map_list_markers(markdown, true)
+}
+
+fn markdown_from_editor_text(text: &str) -> String {
+    map_list_markers(text, false)
+}
+
+#[cfg(test)]
+mod editor_format_tests {
+    use super::*;
+
+    #[test]
+    fn task_and_bullet_prefixes_toggle_and_convert() {
+        assert_eq!(
+            list_prefix_change("Buy tickets", ListPrefixKind::Task),
+            (0, "☐ ")
+        );
+        assert_eq!(
+            list_prefix_change("☐ Buy tickets", ListPrefixKind::Task),
+            (2, "☑ ")
+        );
+        assert_eq!(
+            list_prefix_change("☑ Buy tickets", ListPrefixKind::Task),
+            (2, "☐ ")
+        );
+        assert_eq!(
+            list_prefix_change("☑ Buy tickets", ListPrefixKind::Bullet),
+            (2, "• ")
+        );
+        assert_eq!(
+            list_prefix_change("• Buy tickets", ListPrefixKind::Bullet),
+            (2, "")
+        );
+        assert_eq!(
+            editor_text_from_markdown("- [ ] Task\n- [x] Done\n- Bullet"),
+            "☐ Task\n☑ Done\n• Bullet"
+        );
+        assert_eq!(
+            markdown_from_editor_text("☐ Task\n☑ Done\n• Bullet"),
+            "- [ ] Task\n- [x] Done\n- Bullet"
+        );
+        assert_eq!(
+            editor_text_from_markdown("```md\n- [ ] literal\n```"),
+            "```md\n- [ ] literal\n```"
+        );
+        assert_eq!(serialize_marked_text("[label](url)", &[]), "[label](url)");
+    }
+
+    #[test]
+    fn task_checkbox_toggles_and_enter_continues_then_ends_the_list() -> Result<()> {
+        if std::env::var_os("MEMONOTES_EDITOR_FORMAT_TEST").is_none() {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "editor_format_tests::task_checkbox_toggles_and_enter_continues_then_ends_the_list",
+                    "--test-threads=1",
+                ])
+                .env("MEMONOTES_EDITOR_FORMAT_TEST", "1")
+                .status()?;
+            assert!(status.success());
+            return Ok(());
+        }
+        gtk::init()?;
+        let display = gtk::gdk::Display::default().unwrap();
+        let provider = gtk::CssProvider::new();
+        provider.load_from_data(&note_detail_css(false));
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+        let editor = gtk::TextView::new();
+        set_editor_view_content(&editor, "Title\n- [ ] Task");
+        let window = gtk::Window::builder()
+            .default_width(480)
+            .default_height(180)
+            .child(&editor)
+            .build();
+        window.present();
+        while gtk::glib::MainContext::default().pending() {
+            gtk::glib::MainContext::default().iteration(false);
+        }
+        let buffer = editor.buffer();
+        assert_eq!(markdown_from_editor_buffer(&buffer), "# Title\n- [ ] Task");
+
+        let anchor = buffer.iter_at_offset(6).child_anchor().unwrap();
+        let checkbox = anchor
+            .widgets()
+            .into_iter()
+            .next()
+            .unwrap()
+            .downcast::<gtk::ToggleButton>()
+            .unwrap();
+        let checkbox_bounds = checkbox.compute_bounds(&editor).unwrap();
+        let text_bounds = editor.iter_location(&buffer.iter_at_offset(8));
+        let checkbox_center = checkbox_bounds.y() + checkbox_bounds.height() / 2.0;
+        let text_center = text_bounds.y() as f32 + text_bounds.height() as f32 / 2.0;
+        assert!(
+            (checkbox_center - text_center).abs() <= 1.0,
+            "checkbox center {checkbox_center}; text center {text_center}; checkbox {checkbox_bounds:?}; text {text_bounds:?}"
+        );
+        let (cursor, _) = editor.cursor_locations(Some(&buffer.iter_at_offset(8)));
+        assert!(
+            cursor.height() <= 20,
+            "text cursor height is {}px",
+            cursor.height()
+        );
+        assert_eq!(checkbox.valign(), gtk::Align::End);
+        assert_eq!(checkbox.cursor().unwrap().name().as_deref(), Some("pointer"));
+        let checkmark = checkbox.child().unwrap().downcast::<gtk::Label>().unwrap();
+        assert_eq!(checkmark.halign(), gtk::Align::Center);
+        assert_eq!(checkmark.valign(), gtk::Align::Center);
+        assert_eq!(checkmark.xalign(), 0.5);
+        checkbox.set_active(true);
+        assert_eq!(checkmark.text(), "✓");
+        assert_eq!(markdown_from_editor_buffer(&buffer), "# Title\n- [x] Task");
+
+        let changed_handler = buffer.connect_changed(|buffer| {
+            style_note_heading(buffer);
+            let _ = markdown_from_editor_buffer(buffer);
+        });
+        for click in 0..100 {
+            let checked = click % 2 != 0;
+            checkbox.set_active(checked);
+            assert_eq!(checkmark.text(), if checked { "✓" } else { "" });
+            assert_eq!(
+                markdown_from_editor_buffer(&buffer),
+                if checked { "# Title\n- [x] Task" } else { "# Title\n- [ ] Task" }
+            );
+            while gtk::glib::MainContext::default().pending() {
+                gtk::glib::MainContext::default().iteration(false);
+            }
+        }
+        buffer.disconnect(changed_handler);
+
+        for refresh in 0..20 {
+            let anchor = buffer.iter_at_offset(6).child_anchor().unwrap();
+            let widget = anchor.widgets().into_iter().next().unwrap();
+            let buffer_for_unrealize = buffer.clone();
+            let anchor_for_unrealize = anchor.clone();
+            let removed_before_delete = Rc::new(Cell::new(false));
+            let removed_for_unrealize = Rc::clone(&removed_before_delete);
+            widget.connect_unrealize(move |_| {
+                removed_for_unrealize.set(!anchor_for_unrealize.is_deleted());
+                let _ = buffer_for_unrealize.selection_bounds();
+            });
+            let content = if refresh % 2 == 0 {
+                "Title\n- [ ] Task"
+            } else {
+                "Title\n- [x] Task"
+            };
+            set_editor_view_content(&editor, content);
+            assert!(removed_before_delete.get());
+            while gtk::glib::MainContext::default().pending() {
+                gtk::glib::MainContext::default().iteration(false);
+            }
+            assert_eq!(markdown_from_editor_buffer(&buffer), format!("# {content}"));
+        }
+
+        let end = buffer.end_iter();
+        buffer.place_cursor(&end);
+        assert!(continue_editor_list_on_enter(&editor));
+        assert!(
+            buffer
+                .slice(&buffer.start_iter(), &buffer.end_iter(), true)
+                .contains("\n\u{fffc} ")
+        );
+        assert_eq!(
+            markdown_from_editor_buffer(&buffer),
+            "# Title\n- [x] Task\n- [ ] "
+        );
+
+        assert!(continue_editor_list_on_enter(&editor));
+        assert_eq!(
+            markdown_from_editor_buffer(&buffer),
+            "# Title\n- [x] Task\n"
+        );
+
+        set_editor_view_content(&editor, "Title\n- Bullet");
+        let end = buffer.end_iter();
+        buffer.place_cursor(&end);
+        assert!(continue_editor_list_on_enter(&editor));
+        assert!(continue_editor_list_on_enter(&editor));
+        assert_eq!(markdown_from_editor_buffer(&buffer), "# Title\n- Bullet\n");
+
+        set_editor_view_content(&editor, "Title\nTask");
+        let end = buffer.end_iter();
+        buffer.place_cursor(&end);
+        toggle_list_prefix(&editor, ListPrefixKind::Task);
+        assert!(
+            buffer
+                .slice(&buffer.start_iter(), &buffer.end_iter(), true)
+                .contains("\n\u{fffc} Task")
+        );
+        let cursor = buffer.iter_at_mark(&buffer.get_insert());
+        let mut item_end = buffer.iter_at_line(cursor.line()).unwrap();
+        item_end.forward_to_line_end();
+        assert_eq!(cursor.offset(), item_end.offset());
+        assert_eq!(markdown_from_editor_buffer(&buffer), "# Title\n- [ ] Task");
+        toggle_list_prefix(&editor, ListPrefixKind::Task);
+        assert_eq!(markdown_from_editor_buffer(&buffer), "# Title\n- [x] Task");
+        toggle_list_prefix(&editor, ListPrefixKind::Bullet);
+        assert_eq!(markdown_from_editor_buffer(&buffer), "# Title\n- Task");
+
+        set_editor_view_content(
+            &editor,
+            "Title\n- [ ] One\n- [ ] Two\n- [ ] Three\n- [ ] Four\n- [ ] Five\n- [ ] Last",
+        );
+        let mut typing_position = buffer.iter_at_line(5).unwrap();
+        let typing_anchor = typing_position.child_anchor().unwrap();
+        typing_position.forward_chars(4);
+        buffer.place_cursor(&typing_position);
+        for _ in 0..40 {
+            buffer.insert_at_cursor("n");
+            let cursor_offset = buffer.iter_at_mark(&buffer.get_insert()).offset();
+            let content = markdown_from_editor_buffer(&buffer);
+            set_editor_view_content(&editor, &content);
+            assert_eq!(buffer.iter_at_mark(&buffer.get_insert()).offset(), cursor_offset);
+            assert_eq!(buffer.iter_at_mark(&buffer.get_insert()).line(), 5);
+            assert!(!typing_anchor.is_deleted());
+        }
+        let selection_start = buffer.iter_at_line(5).unwrap();
+        let mut selection_end = selection_start;
+        selection_end.forward_chars(6);
+        buffer.select_range(&selection_start, &selection_end);
+        let content = markdown_from_editor_buffer(&buffer);
+        set_editor_view_content(&editor, &content);
+        assert_eq!(buffer.iter_at_mark(&buffer.get_insert()).offset(), selection_start.offset());
+        assert_eq!(buffer.iter_at_mark(&buffer.selection_bound()).offset(), selection_end.offset());
+        Ok(())
+    }
+}
+
 fn prepare_empty_heading(content: &gtk::TextView) {
     content.add_css_class("empty-note-heading");
     let editor = content.downgrade();
@@ -5001,9 +5521,291 @@ fn style_note_heading(buffer: &gtk::TextBuffer) {
     buffer.apply_tag(&tag, &start, &heading_end);
 }
 
+fn inline_style_tag(buffer: &gtk::TextBuffer, mark: Mark) -> gtk::TextTag {
+    let (name, build): (&str, fn() -> gtk::TextTag) = match mark {
+        Mark::Bold => ("editor-mark-bold", || {
+            gtk::TextTag::builder()
+                .name("editor-mark-bold")
+                .weight(700)
+                .build()
+        }),
+        Mark::Italic => ("editor-mark-italic", || {
+            gtk::TextTag::builder()
+                .name("editor-mark-italic")
+                .style(gtk::pango::Style::Italic)
+                .build()
+        }),
+        Mark::Underline => ("editor-mark-underline", || {
+            gtk::TextTag::builder()
+                .name("editor-mark-underline")
+                .underline(gtk::pango::Underline::Single)
+                .build()
+        }),
+        Mark::Strikethrough => ("editor-mark-strikethrough", || {
+            gtk::TextTag::builder()
+                .name("editor-mark-strikethrough")
+                .strikethrough(true)
+                .build()
+        }),
+        Mark::Code => ("editor-mark-code", || {
+            gtk::TextTag::builder()
+                .name("editor-mark-code")
+                .family("monospace")
+                .build()
+        }),
+    };
+    editor_text_tag(buffer, name, build)
+}
+
+fn apply_rendered_spans(buffer: &gtk::TextBuffer, text: &str, spans: &[MarkupSpan]) {
+    let (start, end) = buffer.bounds();
+    let marks = [
+        Mark::Bold,
+        Mark::Italic,
+        Mark::Underline,
+        Mark::Strikethrough,
+        Mark::Code,
+    ];
+    let tags: Vec<_> = marks
+        .into_iter()
+        .map(|mark| (mark, inline_style_tag(buffer, mark)))
+        .collect();
+    for (_, tag) in &tags {
+        buffer.remove_tag(tag, &start, &end);
+    }
+
+    for span in spans {
+        let Some(mark) = span.mark else {
+            continue;
+        };
+        let start_offset = text[..span.range.start].chars().count() as i32;
+        let end_offset = text[..span.range.end].chars().count() as i32;
+        let start = buffer.iter_at_offset(start_offset);
+        let end = buffer.iter_at_offset(end_offset);
+        if let Some((_, tag)) = tags.iter().find(|(tag_mark, _)| *tag_mark == mark) {
+            buffer.apply_tag(tag, &start, &end);
+        }
+    }
+}
+
+fn remove_editor_anchor_widgets(editor: &gtk::TextView, mut iter: gtk::TextIter, end: gtk::TextIter) {
+    while iter.offset() < end.offset() {
+        if let Some(anchor) = iter.child_anchor() {
+            for widget in anchor.widgets() {
+                editor.remove(&widget);
+            }
+        }
+        iter.forward_char();
+    }
+}
+
+fn set_editor_view_content(editor: &gtk::TextView, content: &str) {
+    let buffer = editor.buffer();
+    let (title, body) = memonotes::memo::editor_parts(content);
+    if markdown_from_editor_buffer(&buffer) == memonotes::memo::editor_content(title, body) {
+        return;
+    }
+    let mapped = editor_text_from_markdown(content);
+    let rendered = render_markdown_source(&mapped);
+    let (start, end) = buffer.bounds();
+    remove_editor_anchor_widgets(editor, start, end);
+    buffer.set_text(&rendered.text);
+    apply_rendered_spans(&buffer, &rendered.text, &rendered.spans);
+    install_task_checkbuttons(editor);
+}
+
+fn task_checkbox_checked_tag(buffer: &gtk::TextBuffer) -> gtk::TextTag {
+    editor_text_tag(buffer, "task-checkbox-checked", || {
+        gtk::TextTag::builder()
+            .name("task-checkbox-checked")
+            .build()
+    })
+}
+
+fn install_task_checkbuttons(editor: &gtk::TextView) {
+    let buffer = editor.buffer();
+    let (start, end) = buffer.bounds();
+    let text = buffer.slice(&start, &end, true).to_string();
+    let mut checkbox_offsets = Vec::new();
+    let mut offset = 0;
+    let mut in_fenced_code = false;
+
+    for line in text.split('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fenced_code = !in_fenced_code;
+        } else if !in_fenced_code {
+            if line.starts_with("☐ ") {
+                checkbox_offsets.push((offset, false));
+            } else if line.starts_with("☑ ") {
+                checkbox_offsets.push((offset, true));
+            }
+        }
+        offset += line.chars().count() + 1;
+    }
+
+    let checked_tag = task_checkbox_checked_tag(&buffer);
+    for (offset, checked) in checkbox_offsets.into_iter().rev() {
+        let mut marker_start = buffer.iter_at_offset(offset as i32);
+        let mut marker_end = marker_start;
+        marker_end.forward_chars(2);
+        buffer.delete(&mut marker_start, &mut marker_end);
+
+        let mut anchor_iter = buffer.iter_at_offset(offset as i32);
+        let anchor = buffer.create_child_anchor(&mut anchor_iter);
+        buffer.insert(&mut anchor_iter, " ");
+        if checked {
+            let anchor_start = buffer.iter_at_child_anchor(&anchor);
+            let mut anchor_end = anchor_start;
+            anchor_end.forward_char();
+            buffer.apply_tag(&checked_tag, &anchor_start, &anchor_end);
+        }
+
+        let checkbox = gtk::ToggleButton::new();
+        checkbox.set_size_request(16, 16);
+        checkbox.set_halign(gtk::Align::Center);
+        checkbox.set_valign(gtk::Align::End);
+        checkbox.set_focus_on_click(false);
+        checkbox.set_cursor_from_name(Some("pointer"));
+        checkbox.add_css_class("task-checkbox");
+        checkbox.set_tooltip_text(Some(tr("editor.format.task_list")));
+        let checkmark = gtk::Label::builder()
+            .label(if checked { "✓" } else { "" })
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::Center)
+            .xalign(0.5)
+            .yalign(0.5)
+            .build();
+        checkbox.set_child(Some(&checkmark));
+        checkbox.set_active(checked);
+
+        let buffer_for_toggle = buffer.clone();
+        let anchor_for_toggle = anchor.clone();
+        let checked_tag_for_toggle = checked_tag.clone();
+        checkbox.connect_toggled(move |checkbox| {
+            let start = buffer_for_toggle.iter_at_child_anchor(&anchor_for_toggle);
+            let mut end = start;
+            end.forward_char();
+            if checkbox.is_active() {
+                buffer_for_toggle.apply_tag(&checked_tag_for_toggle, &start, &end);
+                checkmark.set_text("✓");
+            } else {
+                buffer_for_toggle.remove_tag(&checked_tag_for_toggle, &start, &end);
+                checkmark.set_text("");
+            }
+            buffer_for_toggle.emit_by_name::<()>("changed", &[]);
+        });
+        editor.add_child_at_anchor(&checkbox, &anchor);
+    }
+}
+
+fn markdown_from_editor_buffer(buffer: &gtk::TextBuffer) -> String {
+    let (start, end) = buffer.bounds();
+    let text = buffer.slice(&start, &end, true).to_string();
+    let mut lines = text.split_inclusive('\n');
+    let title_line = lines.next().unwrap_or_default();
+    let title = title_line.strip_suffix('\n').unwrap_or(title_line);
+    let mut body = String::new();
+    let mut char_offset = title_line.chars().count();
+
+    for line_with_ending in lines {
+        let line = line_with_ending
+            .strip_suffix('\n')
+            .unwrap_or(line_with_ending);
+        let line_chars: Vec<_> = line.chars().collect();
+        let (prefix, prefix_chars) = if line.starts_with("\u{fffc} ") {
+            let checkbox = buffer.iter_at_offset(char_offset as i32);
+            let checked = checkbox.has_tag(&task_checkbox_checked_tag(buffer));
+            (if checked { "☑ " } else { "☐ " }, 2)
+        } else if line.starts_with("☐ ") {
+            ("☐ ", 2)
+        } else if line.starts_with("☑ ") {
+            ("☑ ", 2)
+        } else if line.starts_with("• ") {
+            ("• ", 2)
+        } else {
+            ("", 0)
+        };
+        body.push_str(prefix);
+        body.push_str(&serialize_inline_range(
+            buffer,
+            &line_chars[prefix_chars..],
+            char_offset + prefix_chars,
+        ));
+        if line_with_ending.ends_with('\n') {
+            body.push('\n');
+        }
+        char_offset += line_with_ending.chars().count();
+    }
+
+    let body = markdown_from_editor_text(&body);
+    memonotes::memo::editor_content(title, &body)
+}
+
+fn serialize_inline_range(
+    buffer: &gtk::TextBuffer,
+    characters: &[char],
+    start_offset: usize,
+) -> String {
+    let marks = [
+        Mark::Bold,
+        Mark::Italic,
+        Mark::Underline,
+        Mark::Strikethrough,
+        Mark::Code,
+    ];
+    let tags: Vec<_> = marks
+        .into_iter()
+        .map(|mark| (mark, inline_style_tag(buffer, mark)))
+        .collect();
+    let mut output = String::new();
+    let mut active_marks = Vec::new();
+    let mut run = String::new();
+
+    for (character_offset, character) in characters.iter().enumerate() {
+        let iter = buffer.iter_at_offset((start_offset + character_offset) as i32);
+        let next_marks: Vec<_> = tags
+            .iter()
+            .filter(|(_, tag)| iter.has_tag(tag))
+            .map(|(mark, _)| *mark)
+            .collect();
+        if !run.is_empty() && next_marks != active_marks {
+            output.push_str(&serialize_marked_text(&run, &active_marks));
+            run.clear();
+        }
+        active_marks = next_marks;
+        run.push(*character);
+    }
+    if !run.is_empty() {
+        output.push_str(&serialize_marked_text(&run, &active_marks));
+    }
+    output
+}
+
+fn serialize_marked_text(text: &str, marks: &[Mark]) -> String {
+    if marks.is_empty() {
+        text.to_owned()
+    } else {
+        markdown_inline_text(text, marks)
+    }
+}
+
+fn editor_text_tag(
+    buffer: &gtk::TextBuffer,
+    name: &str,
+    build: impl FnOnce() -> gtk::TextTag,
+) -> gtk::TextTag {
+    let table = buffer.tag_table();
+    table.lookup(name).unwrap_or_else(|| {
+        let tag = build();
+        table.add(&tag);
+        tag
+    })
+}
+
 fn set_editor_text(state: &WindowState, content: &str) {
     state.suppress_editor_events.set(true);
-    state.content.buffer().set_text(content);
+    set_editor_view_content(&state.content, content);
     style_note_heading(&state.content.buffer());
     state.suppress_editor_events.set(false);
 }

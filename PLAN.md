@@ -34,6 +34,7 @@ daadwerkelijk in de huidige code is gerealiseerd. Zie ook [README.md](README.md)
 - [x] Core Memos-integratie live getest tegen de doelserver en werkend.
 - [x] Veilige map-/spaceverwijdering met drie dialoogkeuzes: annuleren, map verwijderen met behoud van notities, of map en alle notities verwijderen. Note-moves/-deletions worden voor `FolderDeleted` gequeued.
 - [x] Titel en body vormen één gesynchroniseerd Markdown-document. Legacy-notities met losse titel worden bij bewerken naar een eerste H1 omgezet zonder de body te verliezen; ongewijzigde inhoud maakt geen nieuw sync-event.
+- [x] Editor toont inline vet/cursief/onderstrepen als opmaak en checklist-/bulletprefixen als glyphs; opslaan vertaalt dit terug naar Memos-Markdown.
 - [x] Drieweg-conflictdetectie bewaart basis, lokale en remote versie; de gebruiker kiest lokaal of server. Lokale deletes die botsen met serverwijzigingen zijn ook oplosbaar.
 - [x] Complete accountrefreshes bevestigen ontbrekende memo's met een directe GET; alleen 404 geldt als remote delete. Pending lokale wijzigingen worden als conflict bewaard.
 - [x] Onzekere creates en HTTP 409 reconciliëren via de stabiele memo-ID; alleen een exact overeenkomende remote resource wordt bevestigd.
@@ -46,8 +47,8 @@ daadwerkelijk in de huidige code is gerealiseerd. Zie ook [README.md](README.md)
 - [x] Alle 2.700 notities gepagineerd ophalen en correct sorteren; live bevestigd.
 - [x] Archiveren/terugzetten werkt remote; end-to-end getest op de echte server.
 - [x] Gedeelde Memos-spaces en niet-private notities uit de UI filteren; gedeelde data alleen in de sync-cache behouden.
-- [ ] WYSIWYG-engine kiezen en opmaak/checklists/undo-redo roundtrips testen.
-- [ ] Attachment-API onderzoeken; afbeeldingen invoegen, uploaden, koppelen en offline cachen.
+- [ ] WYSIWYG-editor afronden: blokopmaak, links/afbeeldingen en undo/redo-weergave in GTK; end-to-end roundtrips testen. Inline opmaak, checklist- en bulletacties zijn aangesloten.
+- [ ] Memos-attachments implementeren en live testen: v0.31 biedt upload- en memo-koppelendpoints; afbeeldingen invoegen, downloaden en offline cachen ontbreken nog.
 - [ ] Markdown-export met folders, metadata en afbeeldingen.
 - [ ] Expliciete onboarding/lokale import en veilig ontkoppelen met pending wijzigingen/export.
 - [ ] Smalle-vensternavigatie, onthouden paneelbreedtes/selectie, toegankelijkheid en zichtbare sync/conflictstatus.
@@ -66,7 +67,7 @@ attachment-functionaliteit moet nog worden onderzocht.
 - Persoonlijke groepering is het doel; samenwerking is geen doel van versie 1.
 - De hoofdeditor is WYSIWYG zoals Apple Notes, niet een Markdown-code-editor.
 - Checklists/todo's met aanklikbare checkboxes, bold, italic en afbeeldingen horen bij versie 1.
-- Onderstrepen valt buiten scope om bij het Markdown-formaat van Memos te blijven.
+- Onderstrepen wordt als beperkte `<u>...</u>`-extensie geschreven; compatibiliteit en weergave op de doelserver moeten live worden getest.
 - Een optionele Markdown-brontab mag, maar is niet nodig voor normaal gebruik.
 - Zonder backend werkt de app volledig lokaal.
 - Met backend gebruikt de app de bestaande Memos-API op Umbrel.
