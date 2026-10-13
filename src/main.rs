@@ -3709,9 +3709,40 @@ fn install_shortcuts(
 
     let undo_action = adw::gio::SimpleAction::new("undo", None);
     let state_for_undo = Rc::clone(state);
-    undo_action.connect_activate(move |_, _| undo_last_operation(&state_for_undo));
+    undo_action.connect_activate(move |_, _| {
+        if let Some(buffer) = focused_editor_buffer(&state_for_undo) {
+            if buffer.can_undo() {
+                buffer.undo();
+            }
+        } else {
+            undo_last_operation(&state_for_undo);
+        }
+    });
     window.add_action(&undo_action);
-    application.set_accels_for_action("win.undo", &["<Control>z"]);
+
+    let undo_keys = gtk::EventControllerKey::new();
+    undo_keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let state_for_undo_keys = Rc::clone(state);
+    undo_keys.connect_key_pressed(move |_, key, _, modifiers| {
+        if !modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK)
+            || !matches!(key, gtk::gdk::Key::z | gtk::gdk::Key::Z)
+        {
+            return gtk::glib::Propagation::Proceed;
+        }
+        if let Some(buffer) = focused_editor_buffer(&state_for_undo_keys) {
+            if modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
+                buffer.redo();
+            } else {
+                buffer.undo();
+            }
+        } else if !modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
+            undo_last_operation(&state_for_undo_keys);
+        } else {
+            return gtk::glib::Propagation::Proceed;
+        }
+        gtk::glib::Propagation::Stop
+    });
+    window.add_controller(undo_keys);
 
     let search_keys = gtk::EventControllerKey::new();
     let search_for_escape = state.search.downgrade();
@@ -3768,6 +3799,19 @@ fn connect_note_list_factory(state: &Rc<WindowState>) {
             item.set_child(None::<&gtk::Widget>);
         }
     });
+}
+
+fn focused_editor_buffer(state: &WindowState) -> Option<gtk::TextBuffer> {
+    if state.content.has_focus() {
+        return Some(state.content.buffer());
+    }
+    state
+        .note_window_editors
+        .borrow()
+        .values()
+        .filter_map(|editor| editor.upgrade())
+        .find(|editor| editor.has_focus())
+        .map(|editor| editor.buffer())
 }
 
 fn connect_events(state: &Rc<WindowState>, new_note: &gtk::Button) {
@@ -4975,11 +5019,38 @@ fn save_current(state: &Rc<WindowState>, content: &str) {
 
 fn editor_format_toolbar(editor: &gtk::TextView) -> gtk::Box {
     let buffer = editor.buffer();
+    buffer.set_enable_undo(true);
     let toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     toolbar.add_css_class("linked");
     toolbar.set_halign(gtk::Align::Start);
     toolbar.set_margin_start(44);
     toolbar.set_margin_top(8);
+
+    let undo_button = icon_button("edit-undo-symbolic", tr("editor.undo"));
+    undo_button.set_size_request(36, 36);
+    undo_button.set_sensitive(buffer.can_undo());
+    let undo_button_weak = undo_button.downgrade();
+    buffer.connect_notify_local(Some("can-undo"), move |buffer, _| {
+        if let Some(button) = undo_button_weak.upgrade() {
+            button.set_sensitive(buffer.can_undo());
+        }
+    });
+    let buffer_for_undo = buffer.clone();
+    undo_button.connect_clicked(move |_| buffer_for_undo.undo());
+    toolbar.append(&undo_button);
+
+    let redo_button = icon_button("edit-redo-symbolic", tr("editor.redo"));
+    redo_button.set_size_request(36, 36);
+    redo_button.set_sensitive(buffer.can_redo());
+    let redo_button_weak = redo_button.downgrade();
+    buffer.connect_notify_local(Some("can-redo"), move |buffer, _| {
+        if let Some(button) = redo_button_weak.upgrade() {
+            button.set_sensitive(buffer.can_redo());
+        }
+    });
+    let buffer_for_redo = buffer.clone();
+    redo_button.connect_clicked(move |_| buffer_for_redo.redo());
+    toolbar.append(&redo_button);
 
     for (icon, tooltip, mark) in [
         (
@@ -5037,6 +5108,7 @@ fn install_editor_format_shortcuts(editor: &gtk::TextView) {
     let buffer = editor.buffer();
     let editor_for_enter = editor.clone();
     let keys = gtk::EventControllerKey::new();
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
     keys.connect_key_pressed(move |_, key, _, modifiers| {
         if matches!(key, gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter)
             && !modifiers.intersects(
@@ -5053,6 +5125,9 @@ fn install_editor_format_shortcuts(editor: &gtk::TextView) {
         }
         let shifted = modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK);
         match key {
+            gtk::gdk::Key::z | gtk::gdk::Key::Z if shifted => buffer.redo(),
+            gtk::gdk::Key::z if !shifted => buffer.undo(),
+            gtk::gdk::Key::y | gtk::gdk::Key::Y if !shifted => buffer.redo(),
             gtk::gdk::Key::b if !shifted => apply_inline_style(&buffer, Mark::Bold),
             gtk::gdk::Key::i if !shifted => apply_inline_style(&buffer, Mark::Italic),
             gtk::gdk::Key::u if !shifted => apply_inline_style(&buffer, Mark::Underline),
@@ -5263,6 +5338,62 @@ fn markdown_from_editor_text(text: &str) -> String {
 #[cfg(test)]
 mod editor_format_tests {
     use super::*;
+
+    #[test]
+    fn editor_text_undo_and_redo_preserve_user_edits_only() -> Result<()> {
+        if std::env::var_os("MEMONOTES_EDITOR_FORMAT_TEST").is_none() {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "editor_format_tests::editor_text_undo_and_redo_preserve_user_edits_only",
+                    "--test-threads=1",
+                ])
+                .env("MEMONOTES_EDITOR_FORMAT_TEST", "1")
+                .status()?;
+            assert!(status.success());
+            return Ok(());
+        }
+        gtk::init()?;
+        let editor = gtk::TextView::new();
+        set_editor_view_content(&editor, "Title\nBody");
+        let toolbar = editor_format_toolbar(&editor);
+        let undo_button = toolbar
+            .first_child()
+            .unwrap()
+            .downcast::<gtk::Button>()
+            .unwrap();
+        let redo_button = undo_button
+            .next_sibling()
+            .unwrap()
+            .downcast::<gtk::Button>()
+            .unwrap();
+        let buffer = editor.buffer();
+        assert!(!buffer.can_undo());
+        assert!(!undo_button.is_sensitive());
+        assert!(!redo_button.is_sensitive());
+
+        buffer.insert_at_cursor(" edited");
+        assert!(buffer.can_undo());
+        assert!(undo_button.is_sensitive());
+        assert!(!redo_button.is_sensitive());
+        assert_eq!(markdown_from_editor_buffer(&buffer), "# Title\nBody edited");
+        buffer.undo();
+        assert_eq!(markdown_from_editor_buffer(&buffer), "# Title\nBody");
+        assert!(buffer.can_redo());
+        assert!(!undo_button.is_sensitive());
+        assert!(redo_button.is_sensitive());
+        buffer.redo();
+        assert_eq!(markdown_from_editor_buffer(&buffer), "# Title\nBody edited");
+        assert!(undo_button.is_sensitive());
+        assert!(!redo_button.is_sensitive());
+
+        set_editor_view_content(&editor, "Remote\nReplacement");
+        assert!(!buffer.can_undo());
+        assert!(!buffer.can_redo());
+        assert!(!undo_button.is_sensitive());
+        assert!(!redo_button.is_sensitive());
+        Ok(())
+    }
 
     #[test]
     fn task_and_bullet_prefixes_toggle_and_convert() {
@@ -5608,10 +5739,12 @@ fn set_editor_view_content(editor: &gtk::TextView, content: &str) {
     let mapped = editor_text_from_markdown(content);
     let rendered = render_markdown_source(&mapped);
     let (start, end) = buffer.bounds();
+    buffer.set_enable_undo(false);
     remove_editor_anchor_widgets(editor, start, end);
     buffer.set_text(&rendered.text);
     apply_rendered_spans(&buffer, &rendered.text, &rendered.spans);
     install_task_checkbuttons(editor);
+    buffer.set_enable_undo(true);
 }
 
 fn task_checkbox_checked_tag(buffer: &gtk::TextBuffer) -> gtk::TextTag {

@@ -47,6 +47,8 @@
   "note.restore": {"en":"Restore","de":"Wiederherstellen","fr":"Restaurer","nl":"Terugzetten","es":"Restaurar"},
   "note.delete_permanently": {"en":"Delete permanently","de":"Endgültig löschen","fr":"Supprimer définitivement","nl":"Definitief wissen","es":"Eliminar permanentemente"},
   "note.move_to_folder": {"en":"Move to folder","de":"In Ordner verschieben","fr":"Déplacer vers un dossier","nl":"Verplaats naar map","es":"Mover a carpeta"},
+  "editor.undo": {"en":"Undo","de":"Rückgängig","fr":"Annuler","nl":"Ongedaan maken","es":"Deshacer"},
+  "editor.redo": {"en":"Redo","de":"Wiederholen","fr":"Rétablir","nl":"Opnieuw uitvoeren","es":"Rehacer"},
   "editor.format.bold": {"en":"Bold (Ctrl+B)","de":"Fett (Strg+B)","fr":"Gras (Ctrl+B)","nl":"Vet (Ctrl+B)","es":"Negrita (Ctrl+B)"},
   "editor.format.italic": {"en":"Italic (Ctrl+I)","de":"Kursiv (Strg+I)","fr":"Italique (Ctrl+I)","nl":"Cursief (Ctrl+I)","es":"Cursiva (Ctrl+I)"},
   "editor.format.underline": {"en":"Underline (Ctrl+U)","de":"Unterstrichen (Strg+U)","fr":"Souligné (Ctrl+U)","nl":"Onderstrepen (Ctrl+U)","es":"Subrayado (Ctrl+U)"},

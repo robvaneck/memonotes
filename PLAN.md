@@ -1,6 +1,6 @@
 # Memonotes - product- en implementatieplan
 
-Oorspronkelijk plan: 2026-10-05. Stand bijgewerkt: 2026-10-12.
+Oorspronkelijk plan: 2026-10-05. Stand bijgewerkt: 2026-10-13.
 Status: GTK-desktopapp met SQLite, meerdere Memos-accounts, achtergrondophalen en
 automatische outbox-uploads. Sync bewaart basisversies, detecteert conflicten,
 reconcilieert bevestigde remote deletions en herstelt onzekere creates. De editor
@@ -34,7 +34,7 @@ daadwerkelijk in de huidige code is gerealiseerd. Zie ook [README.md](README.md)
 - [x] Core Memos-integratie live getest tegen de doelserver en werkend.
 - [x] Veilige map-/spaceverwijdering met drie dialoogkeuzes: annuleren, map verwijderen met behoud van notities, of map en alle notities verwijderen. Note-moves/-deletions worden voor `FolderDeleted` gequeued.
 - [x] Titel en body vormen één gesynchroniseerd Markdown-document. Legacy-notities met losse titel worden bij bewerken naar een eerste H1 omgezet zonder de body te verliezen; ongewijzigde inhoud maakt geen nieuw sync-event.
-- [x] Editor toont inline vet/cursief/onderstrepen als opmaak en checklist-/bulletprefixen als glyphs; opslaan vertaalt dit terug naar Memos-Markdown.
+- [x] Editor toont inline vet/cursief/onderstrepen als opmaak en checklist-/bulletprefixen als glyphs; GTK undo/redo is beschikbaar; opslaan vertaalt dit terug naar Memos-Markdown.
 - [x] Drieweg-conflictdetectie bewaart basis, lokale en remote versie; de gebruiker kiest lokaal of server. Lokale deletes die botsen met serverwijzigingen zijn ook oplosbaar.
 - [x] Complete accountrefreshes bevestigen ontbrekende memo's met een directe GET; alleen 404 geldt als remote delete. Pending lokale wijzigingen worden als conflict bewaard.
 - [x] Onzekere creates en HTTP 409 reconciliëren via de stabiele memo-ID; alleen een exact overeenkomende remote resource wordt bevestigd.
@@ -47,7 +47,8 @@ daadwerkelijk in de huidige code is gerealiseerd. Zie ook [README.md](README.md)
 - [x] Alle 2.700 notities gepagineerd ophalen en correct sorteren; live bevestigd.
 - [x] Archiveren/terugzetten werkt remote; end-to-end getest op de echte server.
 - [x] Gedeelde Memos-spaces en niet-private notities uit de UI filteren; gedeelde data alleen in de sync-cache behouden.
-- [ ] WYSIWYG-editor afronden: blokopmaak, links/afbeeldingen en undo/redo-weergave in GTK; end-to-end roundtrips testen. Inline opmaak, checklist- en bulletacties zijn aangesloten.
+- [x] GTK-editor undo/redo met focusbewuste Ctrl+Z-routering en bijgewerkte knopstatus.
+- [ ] WYSIWYG-editor afronden: blokopmaak, links/afbeeldingen en end-to-end roundtrips testen. Inline opmaak, checklist-, bullet- en undo/redo-acties zijn aangesloten.
 - [ ] Memos-attachments implementeren en live testen: v0.31 biedt upload- en memo-koppelendpoints; afbeeldingen invoegen, downloaden en offline cachen ontbreken nog.
 - [ ] Markdown-export met folders, metadata en afbeeldingen.
 - [ ] Expliciete onboarding/lokale import en veilig ontkoppelen met pending wijzigingen/export.
