@@ -1,307 +1,310 @@
-# Memonotes - product- en implementatieplan
+# Memonotes - product and implementation plan
 
-Oorspronkelijk plan: 2026-10-05. Stand bijgewerkt: 2026-10-13.
-Status: GTK-desktopapp met SQLite, meerdere Memos-accounts, achtergrondophalen en
-automatische outbox-uploads. Sync bewaart basisversies, detecteert conflicten,
-reconcilieert bevestigde remote deletions en herstelt onzekere creates. De editor
-ondersteunt WYSIWYG-opmaak en lokale inline afbeeldingen; Memos-attachment-sync,
-automatisch samenvoegen en live multi-client racevalidatie blijven open.
-Projectmap: /home/fedora/repos/memonotes.
-De onderstaande productafspraken beschrijven het doel; de checklist geeft aan wat
-daadwerkelijk in de huidige code is gerealiseerd. Zie ook [README.md](README.md).
+Original plan: 2026-10-05. Status updated: 2026-10-14.
+Status: GTK desktop app with SQLite, multiple Memos accounts, background fetching
+and automatic outbox uploads. Sync keeps base versions, detects conflicts,
+reconciles confirmed remote deletions and recovers uncertain creates. The editor
+supports WYSIWYG formatting and inline images that sync as Memos attachments;
+automatic merging and live multi-client race validation remain open.
+Project directory: /home/fedora/repos/memonotes.
+The product agreements below describe the goal; the checklist shows what is
+actually implemented in the current code. See also [README.md](README.md) and
+[FEATURES.md](FEATURES.md).
 
-## Huidige stand en todo's
+## Current status and todos
 
-### Gerealiseerd
+### Done
 
-- [x] Rust/GTK4/libadwaita-app met drie verstelbare panelen en inklapbare zijbalk.
-- [x] SQLite-opslag, lokale autosave, folders, zoeken, pinnen en archief/terugzetten.
-- [x] Gearchiveerde notities definitief wissen met bevestigingsdialoog en `NoteDeleted` via de adapter naar de Memos DELETE-API; geen undo voor definitief wissen.
-- [x] Undo voor archiveeracties; undo is niet persistent.
-- [x] Meervoudige notitieselectie en slepen naar een map.
-- [x] Losse bewerkbare notitievensters en toetsenbordnavigatie/sneltoetsen.
-- [x] 32 notitiekleuren met licht/donker-varianten en een Over-venster.
-- [x] Meerdere accounts beheren, inschakelen/uitschakelen, verbinding testen en PAT in GNOME Keyring bewaren.
-- [x] Memos-adapter met backend-onafhankelijke notitie- en foldermodellen; IMAP/Joplin zijn alleen keuzemogelijkheden, niet geimplementeerd.
-- [x] Memos-notities/spaces gepagineerd ophalen en transactioneel cachen per account (schema v11: remote-ID-links, sync-baselines en conflicts).
-- [x] Ophalen bij opstart, accountopslaan/inschakelen en elke 60 seconden bij zichtbaar hoofdvenster.
-- [x] Geselecteerde backendnotitie apart ophalen wanneer geen lokale notitie-events pending zijn.
-- [x] Bij openen van een Memos-map de space via GET en actieve notities met space-filter gepagineerd ophalen; pending lokale wijzigingen blijven beschermd.
-- [x] Duurzame outbox, accountrouting, remote-ID-links en bevestiging na succesvolle upload.
-- [x] Automatische uploads, een seconde debounce na tekstbewerking, opeenvolgende updates samenvoegen en capped exponential retry (30 seconden tot maximaal 15 minuten).
-- [x] Automatische netwerkdetectie zonder handmatige modus: offline API-calls pauzeren en na reconnect eerst ophalen/vergelijken, daarna veilige outbox-events uploaden.
-- [x] API-mapping voor notitie-CRUD/herstel, pinnen, archiveren, verplaatsen en mapaanmaak/hernoemen/verwijderen.
-- [x] Core Memos-integratie live getest tegen de doelserver en werkend.
-- [x] Veilige map-/spaceverwijdering met drie dialoogkeuzes: annuleren, map verwijderen met behoud van notities, of map en alle notities verwijderen. Note-moves/-deletions worden voor `FolderDeleted` gequeued.
-- [x] Titel en body vormen één gesynchroniseerd Markdown-document. Legacy-notities met losse titel worden bij bewerken naar een eerste H1 omgezet zonder de body te verliezen; ongewijzigde inhoud maakt geen nieuw sync-event.
-- [x] Editor toont inline vet/cursief/onderstrepen als opmaak, koppen H1-H6 en alineakeuze via de werkbalk, aanklikbare checklists, niet-selecteerbare bulletmarkeringen, GTK undo/redo en lokaal ingevoegde inline afbeeldingen die selecteerbaar, versleepbaar en via de hoeken te schalen zijn (verhouding blijft behouden); opslaan vertaalt dit terug naar Markdown. Afbeeldingsbestanden staan app-privé en gebruiken een lokale verwijzing.
-- [x] Drieweg-conflictdetectie bewaart basis, lokale en remote versie; de gebruiker kiest lokaal of server. Lokale deletes die botsen met serverwijzigingen zijn ook oplosbaar.
-- [x] Complete accountrefreshes bevestigen ontbrekende memo's met een directe GET; alleen 404 geldt als remote delete. Pending lokale wijzigingen worden als conflict bewaard.
-- [x] Onzekere creates en HTTP 409 reconciliëren via de stabiele memo-ID; alleen een exact overeenkomende remote resource wordt bevestigd.
-- [x] Handmatig synchroniseren en capped exponential retry voor tijdelijke fouten (30 seconden tot maximaal 15 minuten).
-- [x] API-fouttoasts met deduplicatie; achtergrondophalen/autosave zonder voortgangstoasts.
-- [x] Opslag/sync-tests en HTTP-mocktests; API-probe beschikbaar.
+- [x] Rust/GTK4/libadwaita app with three resizable panes and a collapsible sidebar.
+- [x] SQLite storage, local autosave, folders, search, pinning and archive/restore.
+- [x] Permanently delete archived notes with a confirmation dialog and `NoteDeleted` through the adapter to the Memos DELETE API; no undo for permanent deletion.
+- [x] Undo for archive actions; undo is not persistent.
+- [x] Multiple note selection and dragging to a folder.
+- [x] Separate editable note windows and keyboard navigation/shortcuts.
+- [x] 32 note colors with light/dark variants and an About window.
+- [x] Manage multiple accounts, enable/disable them, test the connection and store the PAT in GNOME Keyring.
+- [x] Memos adapter with backend-independent note and folder models; IMAP/Joplin are only options, not implemented.
+- [x] Paginated fetching of Memos notes/spaces and transactional caching per account (schema v12: remote-ID links, sync baselines and conflicts).
+- [x] Fetch at startup, on saving/enabling an account and every 60 seconds while the main window is visible.
+- [x] Fetch the selected backend note separately when no local note events are pending.
+- [x] When opening a Memos folder, fetch the space via GET and its active notes with a space filter, paginated; pending local changes stay protected.
+- [x] Durable outbox, account routing, remote-ID links and acknowledgement after successful upload.
+- [x] Automatic uploads, a one-second debounce after text edits, merging of consecutive updates and capped exponential retry (30 seconds up to 15 minutes).
+- [x] Automatic network detection without a manual mode: API calls pause offline; after reconnect, fetch and compare first, then upload safe outbox events.
+- [x] API mapping for note CRUD/restore, pinning, archiving, moving and folder create/rename/delete.
+- [x] Core Memos integration tested live against the target server and working.
+- [x] Safe folder/space deletion with three dialog choices: cancel, delete the folder but keep its notes, or delete the folder and all its notes. Note moves/deletions are queued before `FolderDeleted`.
+- [x] Title and body form one synchronized Markdown document. Legacy notes with a separate title are converted to a first H1 on edit without losing the body; unchanged content creates no new sync event.
+- [x] The editor shows inline bold/italic/underline as formatting, H1-H6 headings and paragraph choice via the toolbar, clickable checklists, non-selectable bullet markers, GTK undo/redo and locally inserted inline images that are selectable, draggable and resizable from the corners (aspect ratio is kept); saving translates this back to Markdown. Image files live in app-private storage and use a local reference.
+- [x] Three-way conflict detection keeps the base, local and remote versions; the user chooses local or server. Local deletes that collide with server changes can also be resolved.
+- [x] Complete account refreshes confirm missing memos with a direct GET; only a 404 counts as a remote delete. Pending local changes are kept as a conflict.
+- [x] Uncertain creates and HTTP 409 are reconciled through the stable memo ID; only an exactly matching remote resource is acknowledged.
+- [x] Manual sync and capped exponential retry for temporary failures (30 seconds up to 15 minutes).
+- [x] API error toasts with deduplication; background fetching/autosave without progress toasts.
+- [x] Storage/sync tests and HTTP mock tests; API probe available.
 
-### Nog te doen
+### Still to do
 
-- [x] Alle 2.700 notities gepagineerd ophalen en correct sorteren; live bevestigd.
-- [x] Archiveren/terugzetten werkt remote; end-to-end getest op de echte server.
-- [x] Gedeelde Memos-spaces en niet-private notities uit de UI filteren; gedeelde data alleen in de sync-cache behouden.
-- [x] GTK-editor undo/redo met focusbewuste Ctrl+Z-routering en bijgewerkte knopstatus.
-- [ ] WYSIWYG-editor afronden: overige blokopmaak en verdere end-to-end roundtrips testen. Inline opmaak, koppen/alinea's, checklist-, bullet-, link-, lokale afbeelding- en undo/redo-acties zijn aangesloten.
-- [ ] Memos-attachments live testen: uploaden (met koppeling aan de memo), downloaden en lokaal cachen zijn gebouwd en met mocktests gedekt (attachment-ID = lokale UUID, inhoud verwijst naar `/file/attachments/<id>/<bestand>`); live validatie tegen de doelserver, het opruimen van niet meer gebruikte attachments en afbeeldingen die buiten Memonotes zijn toegevoegd ontbreken.
-- [ ] Markdown-export met folders, metadata en afbeeldingen.
-- [ ] Expliciete onboarding/lokale import en veilig ontkoppelen met pending wijzigingen/export.
-- [ ] Smalle-vensternavigatie, onthouden paneelbreedtes/selectie, toegankelijkheid en zichtbare sync/conflictstatus.
-- [ ] Fedora/Flatpak-verpakking en netwerk/keyringtests in de sandbox.
+- [x] Fetch all 2,700 notes paginated and sort them correctly; confirmed live.
+- [x] Archive/restore works remotely; tested end to end on the real server.
+- [x] Filter shared Memos spaces and non-private notes out of the UI; keep shared data only in the sync cache.
+- [x] GTK editor undo/redo with focus-aware Ctrl+Z routing and updated button state.
+- [ ] Finish the WYSIWYG editor: remaining block formatting and further end-to-end roundtrip tests. Inline formatting, headings/paragraphs, checklist, bullet, link, local image and undo/redo actions are wired up.
+- [x] Memos attachments for inline images: upload linked to the memo in the same mutation (Memos 0.31 otherwise rejects with 400), download and cache locally, map images from the Memos web client (also without a file name) to local images, and unbind/delete attachments when the user removes the image from the note. Attachment ID = local UUID; content references `/file/attachments/<id>/<file>`; the width is stored in the alt text because Memos rejects URL fragments. Verified manually against the target server; bare anchor characters without an image are no longer saved to Markdown.
+- [x] Insert an image offline and upload it after reconnect: confirmed manually, one attachment on the server.
+- [ ] Validate image sync further: upload retries after an interrupted connection without duplicate/orphaned attachments, server file size limits and non-image attachment types.
+- [ ] Markdown export with folders, metadata and images.
+- [ ] Explicit onboarding/local import and safe unlinking with pending changes/export.
+- [ ] Narrow-window navigation, remembered pane widths/selection, accessibility and visible sync/conflict status.
+- [ ] Fedora/Flatpak packaging and network/keyring tests in the sandbox.
 
-Niet gebouwd en buiten de huidige versie 1-scope: space-leden/uitnodigingen,
-publiceren, PAT-beheer via de API, mobiel en React Native. De precieze
-attachment-functionaliteit moet nog worden onderzocht.
+Not built and outside the current version 1 scope: space members/invitations,
+publishing, PAT management through the API, mobile and React Native. File
+attachments other than images are not built.
 
-## 1. Bevestigde conclusies
+## 1. Confirmed conclusions
 
-- De app heet Memonotes en is gericht op de Linux/GNOME-ervaring, met Fedora als eerste doelplatform.
-- Desktoptechniek: Rust, GTK4 en libadwaita.
-- Apple Notes is het visuele referentiepunt: zijpaneel, notitielijst en notitiedetail/editor.
-- Geen submappen: in Memos-modus is een space precies een folder met daarin notes.
-- Persoonlijke groepering is het doel; samenwerking is geen doel van versie 1.
-- De hoofdeditor is WYSIWYG zoals Apple Notes, niet een Markdown-code-editor.
-- Checklists/todo's met aanklikbare checkboxes, bold, italic en afbeeldingen horen bij versie 1.
-- Onderstrepen wordt als beperkte `<u>...</u>`-extensie geschreven; compatibiliteit en weergave op de doelserver moeten live worden getest.
-- Een optionele Markdown-brontab mag, maar is niet nodig voor normaal gebruik.
-- Zonder backend werkt de app volledig lokaal.
-- Met backend gebruikt de app de bestaande Memos-API op Umbrel.
-- De gebruiker maakt zelf een app key aan in Memos en voert die in Memonotes in.
-- Uitgangspunt voor compatibiliteit: Memos 0.31.0.
-- Ook in Memos-modus moet offline lezen en bewerken mogelijk zijn, met latere synchronisatie.
-- Mobiel en React Native vallen buiten dit projectplan; ze bepalen nu geen architectuur of planning.
+- The app is called Memonotes and targets the Linux/GNOME experience, with Fedora as the first target platform.
+- Desktop stack: Rust, GTK4 and libadwaita.
+- Apple Notes is the visual reference: sidebar, note list and note detail/editor.
+- No sub-folders: in Memos mode a space is exactly one folder containing notes.
+- Personal organization is the goal; collaboration is not a goal of version 1.
+- The main editor is WYSIWYG like Apple Notes, not a Markdown code editor.
+- Checklists/todos with clickable checkboxes, bold, italic and images belong in version 1.
+- Underline is written as a limited `<u>...</u>` extension; compatibility and rendering on the target server must be tested live.
+- An optional Markdown source tab is allowed but not needed for normal use.
+- Without a backend the app works fully locally.
+- With a backend the app uses the existing Memos API on Umbrel.
+- The user creates an app key in Memos and enters it in Memonotes.
+- Compatibility baseline: Memos 0.31.0.
+- In Memos mode, offline reading and editing must also work, with later synchronization.
+- Mobile and React Native are outside this project plan; they do not drive architecture or planning now.
 
-## 2. Vormgeving en navigatie
+## 2. Design and navigation
 
-Doel: dezelfde herkenbare indeling en rustige interactie als Apple Notes.
-GTK/libadwaita levert wel Fedora-eigen vensterbediening, widgets en toegankelijkheid.
-Pixel-identieke macOS-controls worden niet automatisch beloofd; eigen branding en
-beschikbare Linux-fonts gebruiken, geen Apple-assets of Apple-fonts meeleveren.
+Goal: the same recognizable layout and calm interaction as Apple Notes.
+GTK/libadwaita does provide Fedora-native window controls, widgets and accessibility.
+Pixel-identical macOS controls are not promised; use own branding and available
+Linux fonts, and ship no Apple assets or Apple fonts.
 
-Voorgestelde brede desktopindeling:
+Proposed wide desktop layout:
 
 ```text
-| Zijpaneel           | Notitielijst          | Detail / editor             |
+| Sidebar            | Note list             | Detail / editor             |
 |--------------------|-----------------------|-----------------------------|
-| Op dit apparaat    | Zoeken                | Actiebalk                   |
-| of Memos-account   | Vastgepinde notities  | Titel                       |
-| Alle notities      | Titel, datum, snippet | Datum en opslagstatus       |
-| Zonder map         | Geselecteerde notitie | Notitie-inhoud              |
-| Mappen / spaces    | Overige notities      |                             |
-| Archief            |                       |                             |
-| Instellingen       |                       |                             |
+| On this device     | Search                | Action bar                  |
+| or Memos account   | Pinned notes          | Title                       |
+| All notes          | Title, date, snippet  | Date and save status        |
+| No folder          | Selected note         | Note content                |
+| Folders / spaces   | Other notes           |                             |
+| Archive            |                       |                             |
+| Settings           |                       |                             |
 ```
 
-- Verstelbare paneelbreedtes en onthouden selectie.
-- Bij smalle vensters opeenvolgende schermen met terugnavigatie in plaats van geplette kolommen.
-- Acties: nieuwe notitie, nieuwe map, verplaatsen, vastpinnen, archiveren en zoeken.
-- Lokale autosave met herkenbare status: opgeslagen, wacht op sync, offline, conflict of fout.
-- Licht/donker volgens systeeminstelling; bediening met toetsenbord en screenreader.
-- WYSIWYG als standaard: opgemaakte inhoud direct bewerken, zonder zichtbare Markdown-syntax.
-- Checklists/todo's met checkboxes die direct af te vinken zijn; status wordt opgeslagen en gesynchroniseerd.
-- Opmaakacties voor bold en italic, met herkenbare bediening en actieve selectiestatus.
-- Afbeeldingen invoegen en inline weergeven; bestandskeuze en plakken ondersteunen.
-- Undo/redo, selectie en normale toetsenbordbediening horen bij de editorproef.
-- Nieuwe notities slaan de titel als eerste H1 op voor Memos-compatibiliteit; bij bestaande notities blijft de inhoud ongewijzigd tot de gebruiker ze bewerkt.
-- Voorbeeldloze of lege notities krijgen een lokale weergavetitel; bestaande inhoud niet herschrijven.
+- Resizable pane widths and remembered selection.
+- On narrow windows, consecutive screens with back navigation instead of squashed columns.
+- Actions: new note, new folder, move, pin, archive and search.
+- Local autosave with a recognizable status: saved, waiting for sync, offline, conflict or error.
+- Light/dark following the system setting; keyboard and screen reader support.
+- WYSIWYG as the default: edit formatted content directly, without visible Markdown syntax.
+- Checklists/todos with checkboxes that can be ticked directly; the state is stored and synchronized.
+- Formatting actions for bold and italic, with recognizable controls and active selection state.
+- Insert and display images inline; support file picking and pasting.
+- Undo/redo, selection and normal keyboard operation belong to the editor prototype.
+- New notes store the title as the first H1 for Memos compatibility; existing notes keep their content unchanged until the user edits them.
+- Sample-less or empty notes get a local display title; do not rewrite existing content.
 
-Markdown blijft het uitwisselingsformaat met Memos, niet de normale gebruikersinterface.
-De editor gebruikt een bewezen rich-text-engine; de concrete GTK-integratie wordt in een
-klein prototype gekozen. GTK/libadwaita alleen levert niet automatisch deze complete editor.
-Eerst aantonen dat checklists, opmaak en afbeeldingen na opslaan en opnieuw openen behouden blijven.
-Geen opmaak stilzwijgend strippen of alleen lokaal bewaren als de server deze niet kan behouden.
+Markdown remains the exchange format with Memos, not the normal user interface.
+The editor uses a proven rich-text engine; the concrete GTK integration is chosen in a
+small prototype. GTK/libadwaita alone does not automatically provide this complete editor.
+First demonstrate that checklists, formatting and images survive saving and reopening.
+Never silently strip formatting or keep it only locally if the server cannot preserve it.
 
-Een Markdown-brontab is optioneel en nog niet besloten. Als die wordt toegevoegd, bewerken
-beide tabs dezelfde notitie; tabwisseling behoudt inhoud en toont geen verouderde versie.
-Onbekende Markdown/HTML uit Memos niet stilzwijgend verliezen bij een WYSIWYG-roundtrip.
-Onondersteunde inhoud intact bewaren en gericht waarschuwen als visuele bewerking niet veilig kan.
+A Markdown source tab is optional and not yet decided. If added, both tabs edit the
+same note; switching tabs preserves content and never shows a stale version.
+Do not silently lose unknown Markdown/HTML from Memos in a WYSIWYG roundtrip.
+Keep unsupported content intact and warn specifically if visual editing is not safe.
 
-## 3. Opslagkeuze en onboarding
+## 3. Storage choice and onboarding
 
-Eerste start bevat een expliciete keuze:
+The first start contains an explicit choice:
 
-1. Op dit apparaat: meteen starten, zonder account, sleutel of netwerkverzoeken.
-2. Memos verbinden: serveradres en persoonlijke app key invoeren, verbinding testen.
+1. On this device: start immediately, without an account, key or network requests.
+2. Connect Memos: enter the server address and personal app key, test the connection.
 
-In Instellingen > Opslag blijft het mogelijk later Memos te koppelen of los te koppelen.
-Huidige implementatie: meerdere Memos-accounts met aparte collecties; lokale notities
-blijven apart. De oorspronkelijke beperking tot een account is niet toegepast.
-Koppelen uploadt bestaande lokale notities nooit stilzwijgend. Een expliciete kopieer/importactie
-toont selectie en bestemming en bewaart de lokale originelen tot succes bevestigd is.
-Ontkoppelen waarschuwt voor niet-gesynchroniseerde wijzigingen en biedt export aan.
-Een onbereikbare server schakelt een Memos-collectie niet ongemerkt om naar lokale modus.
+In Settings > Storage it stays possible to connect or disconnect Memos later.
+Current implementation: multiple Memos accounts with separate collections; local notes
+stay separate. The original restriction to one account was not applied.
+Connecting never silently uploads existing local notes. An explicit copy/import action
+shows the selection and destination and keeps the local originals until success is confirmed.
+Disconnecting warns about unsynchronized changes and offers export.
+An unreachable server never silently switches a Memos collection to local mode.
 
-Lokale opslagvoorstel: SQLite voor notities, mappen, zoekindex en sync-administratie.
-Afbeeldingsbestanden lokaal in app-private opslag bewaren, met verwijzingen in SQLite.
-Lokale afbeeldingen blijven beschikbaar zonder backend; export neemt de bestanden mee.
-Opslag volgt XDG-locaties; in Flatpak de bijbehorende app-private locaties.
-Lokale data is niet automatisch versleuteld: schijfversleuteling en eventuele extra
-databaseversleuteling moeten afzonderlijk worden beoordeeld.
-Export naar Markdown met mapstructuur en metadata hoort bij de eerste release.
+Local storage proposal: SQLite for notes, folders, search index and sync administration.
+Keep image files in app-private local storage, with references in SQLite.
+Local images remain available without a backend; export includes the files.
+Storage follows XDG locations; in Flatpak the corresponding app-private locations.
+Local data is not automatically encrypted: disk encryption and optional additional
+database encryption must be assessed separately.
+Export to Markdown with folder structure and metadata belongs in the first release.
 
-## 4. Memos 0.31.0: gecontroleerde API-afspraken
+## 4. Memos 0.31.0: verified API agreements
 
-De upstream API-definities van tag v0.31.0 zijn geraadpleegd, niet de echte Umbrel-server.
-Een integratieproef tegen de gebruikersinstallatie blijft nodig voor release.
+The upstream API definitions of tag v0.31.0 were consulted, not the real Umbrel server.
+An integration test against the user's installation remains necessary for release.
 
-| Onderdeel | API / betekenis |
+| Area | API / meaning |
 | --- | --- |
-| Gebruiker controleren | `GET /api/v1/auth/me` |
-| Notities lezen / maken | `GET /api/v1/memos`, `POST /api/v1/memos` |
-| Notitie lezen / wijzigen / verwijderen | `GET`, `PATCH`, `DELETE /api/v1/memos/{id}` |
-| Mappen via spaces | `GET`, `POST /api/v1/spaces`; `GET`, `PATCH`, `DELETE /api/v1/spaces/{id}` |
-| App key | Personal Access Token (PAT), niet het kortlevende sessietoken |
-| Inhoud | Markdown; `property.title` wordt afgeleid uit de eerste H1 |
-| Groepering | Optioneel `space`-veld, bijvoorbeeld `spaces/{id}` |
-| Tags | Afgeleid uit inhoud en output-only; geen zelfstandig beschrijfbaar folderveld |
-| Updates | Field masks: alleen bedoelde velden wijzigen |
-| Lijsten | Paginering volledig verwerken; serverfilters en sortering expliciet kiezen |
-| Archief | State `ARCHIVED`; niet hetzelfde als een herstelbare prullenbak |
+| Verify user | `GET /api/v1/auth/me` |
+| Read / create notes | `GET /api/v1/memos`, `POST /api/v1/memos` |
+| Read / update / delete a note | `GET`, `PATCH`, `DELETE /api/v1/memos/{id}` |
+| Folders via spaces | `GET`, `POST /api/v1/spaces`; `GET`, `PATCH`, `DELETE /api/v1/spaces/{id}` |
+| App key | Personal Access Token (PAT), not the short-lived session token |
+| Content | Markdown; `property.title` is derived from the first H1 |
+| Grouping | Optional `space` field, for example `spaces/{id}` |
+| Tags | Derived from content and output-only; not an independently writable folder field |
+| Updates | Field masks: change only the intended fields |
+| Lists | Handle pagination completely; choose server filters and sorting explicitly |
+| Archive | State `ARCHIVED`; not the same as a recoverable trash |
 
-PAT-beheer bestaat onder `/api/v1/users/{user}/personalAccessTokens`.
-Memonotes maakt deze sleutel niet zelf aan; de gebruiker doet dat in Memos.
-Voorgestelde authenticatie is `Authorization: Bearer <PAT>`; dit expliciet testen
-tegen de doelinstallatie, inclusief verkeerde, verlopen en ingetrokken tokens.
+PAT management exists under `/api/v1/users/{user}/personalAccessTokens`.
+Memonotes does not create this key itself; the user does that in Memos.
+The proposed authentication is `Authorization: Bearer <PAT>`; test this explicitly
+against the target installation, including wrong, expired and revoked tokens.
 
-Veiligheid:
+Security:
 
-- Fedora: PAT opslaan via Secret Service/keyring, niet in SQLite, configuratie of logs.
-- Als de keyring niet beschikbaar is: duidelijke fout of alleen sessiegebruik, geen plaintext fallback.
-- HTTPS als standaard. HTTP voor een lokaal Umbrel-netwerk alleen na expliciete waarschuwing;
-  de sleutel en notities zijn daar niet transportversleuteld.
-- TLS-certificaatcontrole nooit stilzwijgend uitschakelen; token niet doorsturen naar andere hosts.
-- De gebruiker moet de server zelf kunnen bereiken, lokaal of via eigen beveiligde toegang.
-  Memonotes maakt Umbrel niet automatisch bereikbaar vanaf internet.
-- Rich-text-inhoud en afbeeldingen veilig verwerken; geen uitvoerbare HTML of scripts uit notities toelaten.
+- Fedora: store the PAT through the Secret Service/keyring, not in SQLite, configuration or logs.
+- If the keyring is unavailable: a clear error or session-only use, no plaintext fallback.
+- HTTPS by default. HTTP for a local Umbrel network only after an explicit warning;
+  the key and notes are not transport-encrypted there.
+- Never silently disable TLS certificate verification; do not forward the token to other hosts.
+- The user must be able to reach the server themselves, locally or through their own secured access.
+  Memonotes does not automatically make Umbrel reachable from the internet.
+- Process rich-text content and images safely; allow no executable HTML or scripts from notes.
 
-## 5. Besluit: een space is een folder
+## 5. Decision: a space is a folder
 
-Productbesluit: een Memos-space is een folder met daarin notes, zonder submappen.
-Technisch te toetsen: een space met alleen de eigenaar als lid werkt als persoonlijke map.
-Lokale mappen krijgen een lokale ID; Memos-mappen verwijzen naar een echte space-resource.
-Notities zonder `space` verschijnen in Zonder map. In versie 1 maximaal een map per notitie
-en geen geneste mappen: de geraadpleegde Space-definitie biedt geen parent-veld.
+Product decision: a Memos space is a folder containing notes, without sub-folders.
+To verify technically: a space with only the owner as member works as a personal folder.
+Local folders get a local ID; Memos folders refer to a real space resource.
+Notes without `space` appear under No folder. In version 1 at most one folder per note
+and no nested folders: the consulted Space definition offers no parent field.
 
-- Nieuwe Memonotes-notities standaard `PRIVATE`, ook wanneer ze in een space staan.
-- Mapverplaatsing verandert zichtbaarheid niet impliciet.
-- Gedeelde spaces en niet-private notities vallen buiten scope en worden niet in Memonotes getoond; de cache bewaart ze alleen voor sync-administratie.
-- Uitnodigingen, ledenbeheer en publiceren vallen buiten versie 1.
-- Space verwijderen kan volgens de API ook alle geplaatste notities wissen.
-  De bevestigingsdialoog biedt daarom drie keuzes: annuleren, de map verwijderen
-  en notities behouden, of de map met alle notities verwijderen. Bij behoud worden
-  notities eerst naar Zonder map verplaatst; bij verwijderen worden notities eerst
-  verwijderd. Pas daarna wordt `FolderDeleted` verwerkt. De core spaceflow is live
-  getest; gelijktijdige serverwijzigingen blijven onderdeel van de sync-validatie.
-- Discriminerende integratieproef: PAT gebruiken om een eigen space te maken, een PRIVATE
-  notitie eraan te koppelen, te hernoemen en vanuit een tweede client te lezen/verplaatsen.
-- Bij ongeschikte space-semantiek een alternatief voorstellen en opnieuw afstemmen;
-  geen verborgen metadata- of tagconventie introduceren zonder besluit.
+- New Memonotes notes are `PRIVATE` by default, also when they are in a space.
+- Moving to a folder does not implicitly change visibility.
+- Shared spaces and non-private notes are out of scope and are not shown in Memonotes; the cache keeps them only for sync administration.
+- Invitations, member management and publishing are outside version 1.
+- Deleting a space can, according to the API, also delete all placed notes.
+  The confirmation dialog therefore offers three choices: cancel, delete the folder
+  and keep the notes, or delete the folder with all its notes. When keeping, notes are
+  first moved to No folder; when deleting, notes are deleted first. Only then is
+  `FolderDeleted` processed. The core space flow has been tested live; concurrent
+  server changes remain part of the sync validation.
+- Discriminating integration test: use a PAT to create an own space, attach a PRIVATE
+  note, rename it and read/move it from a second client.
+- If the space semantics turn out to be unsuitable, propose an alternative and agree again;
+  do not introduce a hidden metadata or tag convention without a decision.
 
-## 6. Offline en synchronisatie
+## 6. Offline and synchronization
 
-De UI leest en schrijft altijd lokaal. In Memos-modus zijn SQLite en een duurzame
-outbox de lokale cache en wachtrij; Memos blijft de gedeelde server voor meerdere apparaten.
-Notitie opslaan en de bijbehorende wachtrijactie vormen samen een database-transactie.
+The UI always reads and writes locally. In Memos mode, SQLite and a durable
+outbox are the local cache and queue; Memos remains the shared server for multiple devices.
+Saving a note and the corresponding queue action form one database transaction.
 
-Voorgesteld minimaal model:
+Proposed minimal model:
 
-- Account: modus, serveradres, remote gebruikers-ID en verwijzing naar keyring-item.
-- Folder: lokale ID, account-ID, naam, optionele remote space-ID en sync-status.
-- Note: lokale ID, account-ID, folder-ID, Markdown, pin/state/visibility en remote memo-ID.
-- ImageAsset: lokale ID, bestandspad, media-type, optionele remote attachment-ID en upload/cache-status.
-- SyncMetadata: laatst gesynchroniseerde serverinhoud, remote update_time, lokale revisie.
-- Outbox: duurzame mutaties, doel-ID, payload, retry-status en afhankelijkheden.
-- Conflict: basisversie, lokale versie en remote versie voor herstel en vergelijking.
+- Account: mode, server address, remote user ID and reference to the keyring item.
+- Folder: local ID, account ID, name, optional remote space ID and sync status.
+- Note: local ID, account ID, folder ID, Markdown, pin/state/visibility and remote memo ID.
+- ImageAsset: local ID, file path, media type, optional remote attachment ID and upload/cache status.
+- SyncMetadata: last synchronized server content, remote update_time, local revision.
+- Outbox: durable mutations, target ID, payload, retry status and dependencies.
+- Conflict: base version, local version and remote version for recovery and comparison.
 
-Sync verloopt bij verbinden, terugkeer online, handmatig verversen en periodiek zolang
-de app draait. Netwerkwerk blokkeert nooit de GTK-mainloop.
-Paginering, backoff, authenticatiefouten en map-aanmaak voor notitie-aanmaak horen erbij.
-Afbeeldingen offline invoegen slaat het bestand lokaal op en maakt een duurzame uploadactie.
-Bij sync eerst de benodigde memo/attachment-resources aanmaken volgens de geteste Memos-API,
-daarna de definitieve afbeeldingsverwijzing publiceren; geen lokale bestandspaden naar de server sturen.
-Uploadretries en onderbroken uploads mogen geen dubbele of verweesde attachments opleveren.
-Gekoppelde afbeeldingen lokaal cachen voor offline lezen; ontbrekende bestanden zichtbaar melden.
-De attachment-API, limieten en URL/authenticatie moeten nog apart worden onderzocht en getest.
-Retries mogen geen dubbele notities maken: stabiele API-compatibele IDs gebruiken en
-na een onzekere create-uitkomst eerst de serverstatus opvragen. Dit is geïmplementeerd
-voor note creates; attachment-retries moeten dit later ook volgen.
-Een wijziging tijdens een upload wordt niet door de uploadbevestiging als gesynchroniseerd gemarkeerd.
+Sync runs on connecting, return online, manual refresh and periodically while
+the app runs. Network work never blocks the GTK main loop.
+Pagination, backoff, authentication errors and folder creation before note creation belong to it.
+Inserting images offline stores the file locally and creates a durable upload action.
+On sync, first create the required memo/attachment resources according to the tested Memos API,
+then publish the final image reference; never send local file paths to the server.
+Upload retries and interrupted uploads must not produce duplicate or orphaned attachments.
+Cache linked images locally for offline reading; report missing files visibly.
+The attachment API and URL/authentication are tested for images; server limits remain to be investigated.
+Retries must not create duplicate notes: use stable API-compatible IDs and
+query the server state first after an uncertain create outcome. This is implemented
+for note creates; attachment retries must follow this later.
+A change during an upload is not marked as synchronized by the upload acknowledgement.
 
-Conflicten niet oplossen met blind last-write-wins: basis, lokaal en remote vergelijken.
-De app bewaart die drie versies en laat de gebruiker lokaal of server behouden.
-Automatisch samenvoegen bestaat niet.
-De bekeken API-definities bewijzen geen atomische compare-and-swap; een read-before-write
-is dus geen volledige racebescherming. Dit onderzoeken in de integratieproef en expliciet
-testen met meerdere desktopclients en de Memos-webclient.
-Ontbrekende items in een gedeeltelijke lijst betekenen nooit automatisch verwijdering.
-Remote deletions worden alleen na directe GET-confirmatie verwerkt. Deletions met
-pending lokale edits of een gelijktijdige serveredit leiden tot herstel/conflict,
-niet stil dataverlies.
-De huidige app biedt archiveren en harde verwijdering vanuit het archief, met een
-undo-stack in het geheugen. `NoteRestored` maakt een verwijderde snapshot opnieuw
-aan; attachments, relaties en shares worden niet hersteld. Een robuust ontwerp
-voor verwijdering/herstel en een eventuele prullenbak blijft nodig.
+Do not resolve conflicts with blind last-write-wins: compare base, local and remote.
+The app keeps those three versions and lets the user keep local or server.
+Automatic merging does not exist.
+The API definitions consulted prove no atomic compare-and-swap; a read-before-write
+is therefore not complete race protection. Investigate this in the integration test and
+test it explicitly with multiple desktop clients and the Memos web client.
+Missing items in a partial list never automatically mean deletion.
+Remote deletions are processed only after direct GET confirmation. Deletions with
+pending local edits or a concurrent server edit lead to recovery/conflict,
+not silent data loss.
+The current app offers archiving and hard deletion from the archive, with an
+in-memory undo stack. `NoteRestored` recreates a deleted snapshot; attachments,
+relations and shares are not restored. A robust design for deletion/restore
+and a possible trash remains necessary.
 
-## 7. Linux/GNOME-architectuur
+## 7. Linux/GNOME architecture
 
-Desktoplagen: GTK/libadwaita UI -> Rust domeinlogica -> SQLite repository en Memos API-adapter.
-Geschikte bouwstenen evalueren: gtk-rs, libadwaita-rs, rusqlite, reqwest, serde,
-Secret Service-integratie, een bewezen rich-text-engine en Markdown-conversie.
-Geen eigen Markdown-parser schrijven; onbekende Memos-inhoud bij bewerken niet verliezen.
+Desktop layers: GTK/libadwaita UI -> Rust domain logic -> SQLite repository and Memos API adapter.
+Evaluate suitable building blocks: gtk-rs, libadwaita-rs, rusqlite, reqwest, serde,
+Secret Service integration, a proven rich-text engine and Markdown conversion.
+Do not write an own Markdown parser; do not lose unknown Memos content on edit.
 
-Het editorprototype bepaalt of een geschikte native editorintegratie volstaat of dat een
-ingebedde editor nodig is. Een ingebedde oplossing verandert de Rust/GTK-appshell niet,
-maar vraagt expliciete validatie van GNOME-integratie, focus, toegankelijkheid, veilige
-inhoudsverwerking en Flatpak-verpakking voordat die gekozen wordt.
-Geen cross-platform UI-framework, mobiele bindings of gedeelde React Native-core in scope.
-Focus op GNOME-vensterbediening, systeembestandkiezer, keyring, toetsenbord en Wayland.
-Memos-collecties kunnen via de server met andere clients synchroniseren; lokale-only collecties niet.
+The editor prototype determines whether a suitable native editor integration suffices or whether an
+embedded editor is needed. An embedded solution does not change the Rust/GTK app shell,
+but needs explicit validation of GNOME integration, focus, accessibility, safe
+content handling and Flatpak packaging before it is chosen.
+No cross-platform UI framework, mobile bindings or shared React Native core in scope.
+Focus on GNOME window controls, system file chooser, keyring, keyboard and Wayland.
+Memos collections can sync with other clients through the server; local-only collections cannot.
 
-## 8. Gefaseerde uitvoering en acceptatie
+## 8. Phased execution and acceptance
 
-1. API-proef: PAT, huidige gebruiker, CRUD, space-mapping, PRIVATE-gedrag, update masks,
-  paginering, archive, attachments en concurrent updates controleren op Memos 0.31.0.
-2. UI/editor-prototype: drie panelen, selectie, zoeken, WYSIWYG en adaptieve navigatie.
-  Checkboxes, bold/italic en inline afbeeldingen werkend tonen; roundtrip en
-  GNOME-integratie valideren voordat de editor-engine definitief wordt gekozen.
-3. Lokale MVP: SQLite, autosave, platte mappen, verplaatsen, pinnen, archief en export met afbeeldingen.
-   Starten zonder backend doet geen netwerkverzoeken; herstart en crash verliezen geen bevestigde saves.
-4. Memos-integratie: server/PAT-onboarding, keyring, ophalen en duurzame outbox.
-  Zonder netwerk tekst en afbeeldingen lezen/bewerken; na reconnect sync zonder duplicaten of stil verlies.
-5. Robuustheid en Fedora-release: sync-conflicten, tokenfouten, migraties, packaging.
-   Voorstel distributie: Flatpak; RPM pas bij behoefte. Netwerk en keyringtoegang in sandbox testen.
+1. API test: check PAT, current user, CRUD, space mapping, PRIVATE behavior, update masks,
+   pagination, archive, attachments and concurrent updates on Memos 0.31.0.
+2. UI/editor prototype: three panes, selection, search, WYSIWYG and adaptive navigation.
+   Show checkboxes, bold/italic and inline images working; validate roundtrip and
+   GNOME integration before the editor engine is finally chosen.
+3. Local MVP: SQLite, autosave, flat folders, moving, pinning, archive and export with images.
+   Starting without a backend makes no network requests; restart and crash lose no confirmed saves.
+4. Memos integration: server/PAT onboarding, keyring, fetching and durable outbox.
+   Without network, read/edit text and images; after reconnect, sync without duplicates or silent loss.
+5. Robustness and Fedora release: sync conflicts, token errors, migrations, packaging.
+   Distribution proposal: Flatpak; RPM only when needed. Test network and keyring access in the sandbox.
 
-Testdekking richt zich op opslagtransacties, herstart met pending outbox, verloren
-responses, retries, gelijktijdige edits, remote deletions en accountwissel.
-Editorchecks omvatten opmaak/checklist-roundtrips, afbeeldingen
-na herstart, offline afbeeldingsuploads, undo/redo en behoud van onbekende Memos-inhoud.
-UI-checks omvatten leegte/fout/offline-staten, paneelresizing, toetsenbordbediening en toegankelijkheid.
+Test coverage focuses on storage transactions, restart with pending outbox, lost
+responses, retries, concurrent edits, remote deletions and account switching.
+Editor checks include formatting/checklist roundtrips, images
+after restart, offline image uploads, undo/redo and preservation of unknown Memos content.
+UI checks include empty/error/offline states, pane resizing, keyboard operation and accessibility.
 
-## 9. Nog samen te besluiten
+## 9. Still to decide together
 
-- Een optionele Markdown-brontab toevoegen of uitsluitend WYSIWYG aanbieden?
-- Hoe dicht moet de vormgeving bij Apple Notes komen versus standaard libadwaita?
-- Naast bevestigde afbeeldingen ook andere bestandsbijlagen in versie 1?
-- Meerdere gekoppelde accounts, zoals nu gebouwd, definitief opnemen in versie 1?
+- Add an optional Markdown source tab or offer WYSIWYG only?
+- How close should the design be to Apple Notes versus standard libadwaita?
+- Besides confirmed images, also other file attachments in version 1?
+- Definitively include multiple linked accounts, as currently built, in version 1?
 
-Technische proeven, geen nog open productkeuzes: editor-engine,
-persoonlijke space-semantiek en veilige offline afbeeldingssync. Mobiel is buiten scope.
+Technical experiments, not open product choices: editor engine,
+personal space semantics and safe offline image sync. Mobile is out of scope.
 
-## 10. Bronnen en beperkingen
+## 10. Sources and limitations
 
 - https://raw.githubusercontent.com/usememos/memos/v0.31.0/proto/api/v1/memo_service.proto
 - https://raw.githubusercontent.com/usememos/memos/v0.31.0/proto/api/v1/auth_service.proto
 - https://raw.githubusercontent.com/usememos/memos/v0.31.0/proto/api/v1/space_service.proto
 - https://raw.githubusercontent.com/usememos/memos/v0.31.0/proto/api/v1/user_service.proto
 
-De app en lokale opslag/API-mocktests bestaan inmiddels in deze workspace.
-De huidige code is leidend voor de gerealiseerde checklist; de overige secties
-blijven productdoelen en acceptatiecriteria. Core live servercompatibiliteit is
-bevestigd; concurrente updates, attachment-gedrag en release/sandboxtests zijn
-nog niet gevalideerd.
+The app and local storage/API mock tests now exist in this workspace.
+The current code is authoritative for the implemented checklist; the other sections
+remain product goals and acceptance criteria. Core live server compatibility is
+confirmed; concurrent updates, attachment behavior and release/sandbox tests are
+not yet validated.

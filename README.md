@@ -1,10 +1,44 @@
 # Memonotes
 
-Memonotes is an early Linux/GNOME desktop app for local and Memos-backed notes.
-Status updated: 2026-10-12. The current GTK
-window has a three-pane layout, folder creation/navigation, note search, pinning,
-archive/restore, moving notes between folders, and pastel note colors backed by
-SQLite. Note colors adapt to light and dark appearance. Memos accounts can be
+A truly native Linux/GNOME notes app (Rust, GTK4, libadwaita) with an Apple
+Notes-style interface, built on a pluggable backend layer so one app can sync
+multiple accounts from different sources. It works fully offline today and
+syncs with your own [Memos](https://usememos.com) server, including Memos
+running on [Umbrel](https://umbrel.com). Status: early
+development, last updated 2026-10-14.
+
+## Why Memonotes
+
+- **Native Linux UI, not a web wrapper.** No Electron or embedded browser: a GTK4
+  and libadwaita interface that follows the GNOME look, light/dark mode, keyboard
+  conventions, system file chooser and keyring.
+- **Variable backend, many accounts.** The UI talks to a backend-independent
+  `BackendAdapter`, so storage is not tied to one service. Memos is implemented
+  today; the design leaves room for others (IMAP and Joplin are planned options,
+  not built yet). Add several accounts side by side, each syncing independently,
+  next to purely local notes.
+- **Your notes, your server.** Notes stay on your device and, if you choose, sync
+  with a self-hosted Memos instance (works with Memos on Umbrel). No third-party
+  cloud and no lock-in: content is stored as plain Markdown.
+- **Offline first.** Everything reads and writes locally; a durable outbox uploads
+  changes when the network returns. Local-only folders never touch the network.
+- **Sync that does not lose data.** Three-way conflict detection keeps the base,
+  local and server versions until you decide. Nothing is deleted because it is
+  missing from a list, and retries never create duplicates.
+- **WYSIWYG, not a Markdown editor.** Formatting, checklists, links and resizable
+  inline images are edited visually, while Markdown remains the exchange format.
+- **Fast and secure by default.** A virtualized list stays responsive with
+  thousands of notes, and access tokens live in GNOME Keyring.
+- **Multilingual.** English, German, French, Dutch and Spanish.
+
+See [FEATURES.md](FEATURES.md) for the full feature list and
+[PLAN.md](PLAN.md) for the roadmap and remaining gaps.
+
+## How it works
+
+### Accounts and fetching
+
+Memos accounts can be
 added in Settings; account details are stored in SQLite and PATs in GNOME
 Keyring. Multiple accounts are supported. Enabled Memos accounts fetch memos
 and spaces in the background at startup, after saving an account, when an
@@ -22,6 +56,9 @@ Shared spaces and notes with `PROTECTED`, `PUBLIC`, or `SPACE` visibility are
 hidden from the folder and note lists. They remain in the local sync cache for
 reconciliation, but filtering them does not delete anything on the Memos server;
 Memonotes does not support managing shared content.
+
+### Synchronization
+
 Local edits are uploaded automatically in ordered batches through a durable
 outbox. The scheduler runs once per second; text edits delay uploads for the
 account until one second after the last edit. GNOME/GIO network detection
@@ -33,6 +70,9 @@ outbox events are uploaded. A **Sync now** control also starts a refresh and
 clears scheduled retry delays. Transient failures use capped exponential
 backoff. There is no manual online/offline switch. Offline changes survive app
 restarts.
+
+### Editor
+
 The editor shows the complete note without a separate title field. The first
 line uses H1 styling without displaying its Markdown heading marker.
 Saving normalizes the first line as a Markdown H1 (`# Title`), so the UI and
@@ -44,16 +84,19 @@ local notes with separate titles are combined on their next edit without
 discarding the body.
 The editor supports inline formatting, headings, lists, links, and selectable,
 draggable local inline images that can be resized from their corners while
-keeping their aspect ratio (the width is stored as `#w=<pixels>` in the image URL). Picked image files are stored in app-private data and referenced by a
+keeping their aspect ratio (the width travels in the image alt text). Picked image files are stored in app-private data and referenced by a
 Memonotes-only URI. For Memos accounts, the image is uploaded as an attachment
 (its ID is the local file's UUID), linked to the memo, and the memo content
 references `/file/attachments/<id>/<file>`; fetched memos with such references
 download the file into the local image directory. Attachments added by other
-clients are not mapped yet, and unused attachments are not removed remotely.
+clients are mapped to local images, and attachments whose images the user
+removes from a note are unbound and deleted remotely.
 Two-way text synchronization detects divergent local/server edits and keeps both versions
 until the user chooses which to keep. Stable-ID creates are reconciled after
 errors or HTTP 409 by fetching that ID and acknowledging only an exact match.
 Automatic merging and live multi-client race validation remain open.
+
+### Notes and folders
 
 Notes can be opened in separate editable windows. Keyboard shortcuts include
 new note/folder, search, close, quit, and undo for archive operations.
@@ -69,7 +112,6 @@ from unexpectedly deleting notes the user chose to keep.
 The note list supports multiple selection and dragging notes into folders.
 It uses GTK's native virtualized `ListView`: only visible rows and an offscreen
 buffer have widgets, and sidebar resizing keeps text at its normal font size.
-See [PLAN.md](PLAN.md) for the current implementation checklist and release gaps.
 
 ## Translations
 
@@ -149,7 +191,8 @@ live validation.
 
 ### Remaining API and sync gaps
 
-- Attachment upload/download/linking/deletion and offline image caching are missing.
+- Image attachment retries, server size limits, and non-image attachments still
+  need validation or are not implemented.
 - Full note visibility and space roles are not retained or editable. The cache
 	stores only whether a note or space is shared, for filtering. Updates leave
 	server visibility unchanged.
