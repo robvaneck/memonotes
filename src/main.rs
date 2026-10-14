@@ -9,6 +9,7 @@ use memonotes::editor_document::{
     markdown_preview_text, normalize_link_url, render_markdown_source,
 };
 use memonotes::i18n::tr;
+use memonotes::markdown_io;
 use memonotes::{
     BackendAccount, FolderDeleteMode, Note, NoteFilter, Store, SyncConflictResolution,
     SyncedNoteState,
@@ -195,6 +196,7 @@ struct WindowState {
     api_errors: RefCell<HashMap<String, String>>,
     account_statuses: RefCell<HashMap<String, bool>>,
     account_indicators: RefCell<HashMap<String, gtk::Box>>,
+    account_alerts: RefCell<HashMap<String, gtk::Button>>,
     loading_accounts: RefCell<HashSet<String>>,
     loading_memos: RefCell<HashSet<String>>,
     loading_folders: RefCell<HashSet<(String, String)>>,
@@ -363,6 +365,7 @@ fn build_window(application: &Application) -> Result<()> {
         api_errors: RefCell::new(HashMap::new()),
         account_statuses: RefCell::new(HashMap::new()),
         account_indicators: RefCell::new(HashMap::new()),
+        account_alerts: RefCell::new(HashMap::new()),
         loading_accounts: RefCell::new(HashSet::new()),
         loading_memos: RefCell::new(HashSet::new()),
         loading_folders: RefCell::new(HashSet::new()),
@@ -642,6 +645,15 @@ fn api_timeout(
 }
 
 fn show_api_error(state: &WindowState, key: &str, message: &str) {
+    show_api_error_with_action(state, key, message, None);
+}
+
+fn show_api_error_with_action(
+    state: &WindowState,
+    key: &str,
+    message: &str,
+    action: Option<Box<dyn Fn()>>,
+) {
     if state
         .api_errors
         .borrow()
@@ -660,6 +672,10 @@ fn show_api_error(state: &WindowState, key: &str, message: &str) {
     let toast = adw::Toast::new(message);
     toast.set_use_markup(false);
     toast.set_timeout(8);
+    if let Some(action) = action {
+        toast.set_button_label(Some(tr("sync.problems.open_note")));
+        toast.connect_button_clicked(move |_| action());
+    }
     state.toast_overlay.add_toast(toast.clone());
     *state.api_toast.borrow_mut() = Some(toast);
 }
@@ -761,6 +777,17 @@ fn handle_backend_error(
     message: &str,
     error: &anyhow::Error,
 ) {
+    handle_backend_error_with_action(state, account_id, key, message, error, None);
+}
+
+fn handle_backend_error_with_action(
+    state: &WindowState,
+    account_id: &str,
+    key: &str,
+    message: &str,
+    error: &anyhow::Error,
+    action: Option<Box<dyn Fn()>>,
+) {
     set_account_online(state, account_id, false);
     if !adw::gio::NetworkMonitor::default().is_network_available()
         || memonotes::memos::is_connection_error(error)
@@ -775,7 +802,31 @@ fn handle_backend_error(
             .insert(account_id.to_owned());
         return;
     }
-    show_api_error(state, key, message);
+    show_api_error_with_action(state, key, message, action);
+}
+
+fn open_rejected_note_action(state: &Rc<WindowState>, account_id: &str) -> Option<Box<dyn Fn()>> {
+    let rejection = state
+        .store
+        .borrow()
+        .sync_rejections(account_id)
+        .ok()?
+        .into_iter()
+        .find(|rejection| rejection.is_note)?;
+    let weak_state = Rc::downgrade(state);
+    Some(Box::new(move || {
+        let Some(state) = weak_state.upgrade() else {
+            return;
+        };
+        if let Some(window) = state
+            .note_list
+            .view
+            .root()
+            .and_downcast::<ApplicationWindow>()
+        {
+            navigate_to_note(&state, &window, &rejection.item_id);
+        }
+    }))
 }
 
 fn watch_backend_network(state: &Rc<WindowState>, window: &ApplicationWindow) {
@@ -929,6 +980,7 @@ fn upload_backend_events(state: &Rc<WindowState>) -> Result<()> {
                 }
             };
             state.uploading_accounts.borrow_mut().remove(&account.id);
+            refresh_account_alert(&state, &account.id);
             match result {
                 Ok(count) => {
                     if count > 0 {
@@ -966,7 +1018,7 @@ fn upload_backend_events(state: &Rc<WindowState>) -> Result<()> {
                             .borrow_mut()
                             .insert(account.id.clone(), Instant::now() + retry_delay);
                     }
-                    handle_backend_error(
+                    handle_backend_error_with_action(
                         &state,
                         &account.id,
                         &format!("upload:{}", account.id),
@@ -976,8 +1028,11 @@ fn upload_backend_events(state: &Rc<WindowState>) -> Result<()> {
                             error = format!("{error:#}")
                         ),
                         &error,
+                        memonotes::memos::is_bad_request(&error)
+                            .then(|| open_rejected_note_action(&state, &account.id))
+                            .flatten(),
                     );
-                    if !connection_error {
+                    if !connection_error && !memonotes::memos::is_bad_request(&error) {
                         if let Some(window) = state
                             .note_list
                             .view
@@ -1698,6 +1753,14 @@ fn install_app_menu(
     state: &Rc<WindowState>,
 ) {
     let menu = adw::gio::Menu::new();
+    menu.append(
+        Some(tr("markdown.menu.import")),
+        Some("win.markdown-import"),
+    );
+    menu.append(
+        Some(tr("markdown.menu.export")),
+        Some("win.markdown-export"),
+    );
     menu.append(Some(tr("settings.title")), Some("win.settings"));
     menu.append(Some(tr("about.title")), Some("win.about"));
     more_button.set_menu_model(Some(&menu));
@@ -1791,6 +1854,461 @@ fn install_app_menu(
         show_about_window(&window_for_about);
     });
     window.add_action(&about_action);
+
+    let import_action = adw::gio::SimpleAction::new("markdown-import", None);
+    let window_for_import = window.clone();
+    let state_for_import = Rc::clone(state);
+    import_action.connect_activate(move |_, _| {
+        choose_markdown_import(&state_for_import, &window_for_import);
+    });
+    window.add_action(&import_action);
+
+    let export_action = adw::gio::SimpleAction::new("markdown-export", None);
+    let window_for_export = window.clone();
+    let state_for_export = Rc::clone(state);
+    export_action.connect_activate(move |_, _| {
+        choose_markdown_export(&state_for_export, &window_for_export);
+    });
+    window.add_action(&export_action);
+}
+
+fn markdown_account_choices(state: &WindowState) -> Result<Vec<(Option<String>, String)>> {
+    let mut choices = vec![(None, tr("sidebar.on_this_device").to_owned())];
+    choices.extend(
+        state
+            .store
+            .borrow()
+            .backend_accounts()?
+            .into_iter()
+            .filter(|account| account.provider == "memos")
+            .map(|account| (Some(account.id), account.label)),
+    );
+    Ok(choices)
+}
+
+fn choose_markdown_import(state: &Rc<WindowState>, window: &ApplicationWindow) {
+    let chooser = gtk::FileChooserNative::new(
+        Some(tr("markdown.import.title")),
+        Some(window),
+        gtk::FileChooserAction::Open,
+        Some(tr("markdown.import.choose")),
+        Some(tr("action.cancel")),
+    );
+    chooser.set_select_multiple(true);
+    let filter = gtk::FileFilter::new();
+    filter.set_name(Some("Markdown"));
+    filter.add_mime_type("text/markdown");
+    filter.add_pattern("*.md");
+    filter.add_pattern("*.MD");
+    chooser.add_filter(&filter);
+
+    let state = Rc::clone(state);
+    let window = window.clone();
+    chooser.connect_response(move |chooser, response| {
+        if response != gtk::ResponseType::Accept {
+            chooser.hide();
+            return;
+        }
+        let files = chooser.files();
+        let mut paths = Vec::new();
+        for index in 0..files.n_items() {
+            if let Some(path) = files
+                .item(index)
+                .and_downcast::<gio::File>()
+                .and_then(|file| file.path())
+            {
+                paths.push(path);
+            }
+        }
+        chooser.hide();
+        if paths.is_empty() {
+            return;
+        }
+        show_markdown_import_destination(&state, &window, paths);
+    });
+    chooser.show();
+}
+
+fn update_markdown_folder_choices(
+    state: &WindowState,
+    account_id: Option<&str>,
+    model: &gtk::StringList,
+    options: &Rc<RefCell<Vec<Option<String>>>>,
+) -> Result<()> {
+    let folders: Vec<_> = state
+        .store
+        .borrow()
+        .folders()?
+        .into_iter()
+        .filter(|folder| folder.account_id.as_deref() == account_id)
+        .collect();
+    let mut labels = vec![tr("folder.unfiled").to_owned()];
+    let mut folder_ids = vec![None];
+    for folder in folders {
+        labels.push(folder.name);
+        folder_ids.push(Some(folder.id));
+    }
+    let labels: Vec<_> = labels.iter().map(String::as_str).collect();
+    model.splice(0, model.n_items(), &labels);
+    options.replace(folder_ids);
+    Ok(())
+}
+
+fn show_markdown_import_destination(
+    state: &Rc<WindowState>,
+    window: &ApplicationWindow,
+    paths: Vec<PathBuf>,
+) {
+    let accounts = match markdown_account_choices(state) {
+        Ok(accounts) => accounts,
+        Err(error) => {
+            state.toast_overlay.add_toast(adw::Toast::new(&format!(
+                "{}: {error:#}",
+                tr("markdown.error.accounts")
+            )));
+            return;
+        }
+    };
+    let dialog = gtk::Dialog::builder()
+        .modal(true)
+        .transient_for(window)
+        .title(tr("markdown.import.destination"))
+        .build();
+    dialog.add_button(tr("action.cancel"), gtk::ResponseType::Cancel);
+    dialog.add_button(tr("markdown.import"), gtk::ResponseType::Accept);
+    dialog.set_default_response(gtk::ResponseType::Accept);
+    let content = dialog.content_area();
+    content.set_spacing(12);
+    content.set_margin_top(18);
+    content.set_margin_bottom(18);
+    content.set_margin_start(18);
+    content.set_margin_end(18);
+
+    let account_labels: Vec<_> = accounts.iter().map(|(_, label)| label.as_str()).collect();
+    let account_model = gtk::StringList::new(&account_labels);
+    let account_dropdown = gtk::DropDown::new(Some(account_model), None::<&gtk::Expression>);
+    let folder_model = gtk::StringList::new(&[tr("folder.unfiled")]);
+    let folder_dropdown = gtk::DropDown::new(Some(folder_model.clone()), None::<&gtk::Expression>);
+    let folder_options = Rc::new(RefCell::new(vec![None]));
+    if let Some((account_id, _)) = accounts.first()
+        && let Err(error) = update_markdown_folder_choices(
+            state,
+            account_id.as_deref(),
+            &folder_model,
+            &folder_options,
+        )
+    {
+        state
+            .toast_overlay
+            .add_toast(adw::Toast::new(&format!("{error:#}")));
+    }
+    content.append(&markdown_dialog_row(
+        tr("markdown.destination.account"),
+        &account_dropdown,
+    ));
+    content.append(&markdown_dialog_row(
+        tr("markdown.destination.folder"),
+        &folder_dropdown,
+    ));
+
+    let folders_for_account = Rc::clone(&folder_options);
+    let state_for_account = Rc::clone(state);
+    let folder_model_for_account = folder_model.clone();
+    let folder_dropdown_for_account = folder_dropdown.clone();
+    let accounts_for_account = accounts.clone();
+    account_dropdown.connect_selected_notify(move |dropdown| {
+        let Some((account_id, _)) = accounts_for_account.get(dropdown.selected() as usize) else {
+            return;
+        };
+        if update_markdown_folder_choices(
+            &state_for_account,
+            account_id.as_deref(),
+            &folder_model_for_account,
+            &folders_for_account,
+        )
+        .is_ok()
+        {
+            folder_dropdown_for_account.set_selected(0);
+        }
+    });
+
+    let state = Rc::clone(state);
+    let window = window.clone();
+    dialog.connect_response(move |dialog, response| {
+        if response == gtk::ResponseType::Accept {
+            let account_index = account_dropdown.selected() as usize;
+            if let Some((account_id, account_label)) = accounts.get(account_index) {
+                let folder_id = folder_options
+                    .borrow()
+                    .get(folder_dropdown.selected() as usize)
+                    .cloned()
+                    .flatten();
+                start_markdown_import(
+                    &state,
+                    &window,
+                    paths.clone(),
+                    account_id.clone(),
+                    account_label.clone(),
+                    folder_id,
+                );
+            }
+        }
+        dialog.close();
+    });
+    dialog.present();
+}
+
+fn markdown_dialog_row(label: &str, dropdown: &gtk::DropDown) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    row.append(&gtk::Label::new(Some(label)));
+    row.append(dropdown);
+    row
+}
+
+fn start_markdown_import(
+    state: &Rc<WindowState>,
+    window: &ApplicationWindow,
+    paths: Vec<PathBuf>,
+    account_id: Option<String>,
+    account_label: String,
+    folder_id: Option<String>,
+) {
+    state
+        .toast_overlay
+        .add_toast(adw::Toast::new(&memonotes::tr_format!(
+            "markdown.import.started",
+            count = paths.len().to_string(),
+            account = account_label.clone()
+        )));
+    let database = match database_path() {
+        Ok(path) => path,
+        Err(error) => {
+            state
+                .toast_overlay
+                .add_toast(adw::Toast::new(&format!("{error:#}")));
+            return;
+        }
+    };
+    let (sender, receiver) = mpsc::channel();
+    let worker_account_id = account_id.clone();
+    thread::spawn(move || {
+        let result = (|| -> Result<Vec<String>> {
+            let markdown = markdown_io::read_markdown_files(&paths)?;
+            Store::open(database)?.import_markdown_notes(
+                worker_account_id.as_deref(),
+                folder_id.as_deref(),
+                &markdown,
+            )
+        })();
+        let _ = sender.send(result);
+    });
+
+    let weak_state = Rc::downgrade(state);
+    let weak_window = window.downgrade();
+    gtk::glib::timeout_add_local(Duration::from_millis(50), move || {
+        let (Some(state), Some(window)) = (weak_state.upgrade(), weak_window.upgrade()) else {
+            return gtk::glib::ControlFlow::Break;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(ids)) => {
+                state
+                    .active_filter
+                    .replace(ActiveNoteFilter::All(account_id.clone()));
+                state.search.set_text("");
+                if let Err(error) =
+                    populate_sidebar(&state, &window).and_then(|()| refresh_notes(&state))
+                {
+                    state
+                        .toast_overlay
+                        .add_toast(adw::Toast::new(&format!("{error:#}")));
+                }
+                if let Some(id) = ids.first()
+                    && let Ok(Some(note)) = state.store.borrow().note(id)
+                {
+                    show_note(&state, &note);
+                }
+                if let Some(account_id) = &account_id {
+                    state
+                        .upload_after
+                        .borrow_mut()
+                        .insert(account_id.clone(), Instant::now());
+                }
+                state
+                    .toast_overlay
+                    .add_toast(adw::Toast::new(&memonotes::tr_format!(
+                        "markdown.import.complete",
+                        count = ids.len().to_string(),
+                        account = account_label.clone()
+                    )));
+                gtk::glib::ControlFlow::Break
+            }
+            Ok(Err(error)) => {
+                state
+                    .toast_overlay
+                    .add_toast(adw::Toast::new(&memonotes::tr_format!(
+                        "markdown.import.failed",
+                        error = format!("{error:#}")
+                    )));
+                gtk::glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                state
+                    .toast_overlay
+                    .add_toast(adw::Toast::new(tr("markdown.import.interrupted")));
+                gtk::glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+        }
+    });
+}
+
+fn choose_markdown_export(state: &Rc<WindowState>, window: &ApplicationWindow) {
+    let accounts = match markdown_account_choices(state) {
+        Ok(accounts) => accounts,
+        Err(error) => {
+            state
+                .toast_overlay
+                .add_toast(adw::Toast::new(&format!("{error:#}")));
+            return;
+        }
+    };
+    let dialog = gtk::Dialog::builder()
+        .modal(true)
+        .transient_for(window)
+        .title(tr("markdown.export.account"))
+        .build();
+    dialog.add_button(tr("action.cancel"), gtk::ResponseType::Cancel);
+    dialog.add_button(tr("action.continue"), gtk::ResponseType::Accept);
+    let labels: Vec<_> = accounts.iter().map(|(_, label)| label.as_str()).collect();
+    let model = gtk::StringList::new(&labels);
+    let dropdown = gtk::DropDown::new(Some(model), None::<&gtk::Expression>);
+    dialog.content_area().append(&markdown_dialog_row(
+        tr("markdown.destination.account"),
+        &dropdown,
+    ));
+    let state = Rc::clone(state);
+    let window = window.clone();
+    dialog.connect_response(move |dialog, response| {
+        if response == gtk::ResponseType::Accept
+            && let Some((account_id, account_label)) = accounts.get(dropdown.selected() as usize)
+        {
+            choose_markdown_export_path(&state, &window, account_id.clone(), account_label.clone());
+        }
+        dialog.close();
+    });
+    dialog.present();
+}
+
+fn choose_markdown_export_path(
+    state: &Rc<WindowState>,
+    window: &ApplicationWindow,
+    account_id: Option<String>,
+    account_label: String,
+) {
+    let chooser = gtk::FileChooserNative::new(
+        Some(tr("markdown.export.title")),
+        Some(window),
+        gtk::FileChooserAction::Save,
+        Some(tr("markdown.export.save")),
+        Some(tr("action.cancel")),
+    );
+    chooser.set_current_name("memonotes-export.zip");
+    let filter = gtk::FileFilter::new();
+    filter.set_name(Some("ZIP archive"));
+    filter.add_pattern("*.zip");
+    chooser.add_filter(&filter);
+    let state = Rc::clone(state);
+    let window = window.clone();
+    chooser.connect_response(move |chooser, response| {
+        if response == gtk::ResponseType::Accept
+            && let Some(destination) = chooser.file().and_then(|file| file.path())
+        {
+            start_markdown_export(
+                &state,
+                &window,
+                account_id.clone(),
+                account_label.clone(),
+                destination,
+            );
+        }
+        chooser.hide();
+    });
+    chooser.show();
+}
+
+fn start_markdown_export(
+    state: &Rc<WindowState>,
+    window: &ApplicationWindow,
+    account_id: Option<String>,
+    account_label: String,
+    destination: PathBuf,
+) {
+    state
+        .toast_overlay
+        .add_toast(adw::Toast::new(&memonotes::tr_format!(
+            "markdown.export.started",
+            account = account_label.clone()
+        )));
+    let database = match database_path() {
+        Ok(path) => path,
+        Err(error) => {
+            state
+                .toast_overlay
+                .add_toast(adw::Toast::new(&format!("{error:#}")));
+            return;
+        }
+    };
+    let (sender, receiver) = mpsc::channel();
+    let worker_destination = destination.clone();
+    thread::spawn(move || {
+        let result = (|| -> Result<()> {
+            let store = Store::open(database)?;
+            let image_directory = memonotes::images::image_directory()?;
+            markdown_io::export_account_zip(
+                &store,
+                account_id.as_deref(),
+                &account_label,
+                &image_directory,
+                &worker_destination,
+            )
+        })();
+        let _ = sender.send(result);
+    });
+
+    let weak_state = Rc::downgrade(state);
+    let weak_window = window.downgrade();
+    gtk::glib::timeout_add_local(Duration::from_millis(50), move || {
+        let (Some(state), Some(_window)) = (weak_state.upgrade(), weak_window.upgrade()) else {
+            return gtk::glib::ControlFlow::Break;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(())) => {
+                state
+                    .toast_overlay
+                    .add_toast(adw::Toast::new(&memonotes::tr_format!(
+                        "markdown.export.complete",
+                        path = destination.display().to_string()
+                    )));
+                gtk::glib::ControlFlow::Break
+            }
+            Ok(Err(error)) => {
+                state
+                    .toast_overlay
+                    .add_toast(adw::Toast::new(&memonotes::tr_format!(
+                        "markdown.export.failed",
+                        error = format!("{error:#}")
+                    )));
+                gtk::glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                state
+                    .toast_overlay
+                    .add_toast(adw::Toast::new(tr("markdown.export.interrupted")));
+                gtk::glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+        }
+    });
 }
 
 fn language_selection(preference: Option<&str>) -> u32 {
@@ -2123,7 +2641,7 @@ fn show_about_window(parent: &ApplicationWindow) {
             .title(tr("about.developer_credit"))
             .build(),
     );
-    let bitcoin_address = "bc1sfsdfsdfsdfsdfsdfx4";
+    let bitcoin_address = "bc1qakjs0c48rm2860v9v3xnk8n6q3ry3u8vhmfwpg";
     let bitcoin_row = adw::ActionRow::builder()
         .title(tr("about.bitcoin_wallet"))
         .subtitle(bitcoin_address)
@@ -3080,12 +3598,13 @@ fn populate_sidebar(state: &Rc<WindowState>, window: &ApplicationWindow) -> Resu
     }
     state.sidebar_entries.borrow_mut().clear();
     state.account_indicators.borrow_mut().clear();
+    state.account_alerts.borrow_mut().clear();
 
     let show_headings = sections.iter().any(|(account_id, _)| account_id.is_some());
     for (account_id, label) in sections {
         if show_headings {
-            let indicator = append_sidebar_heading(items, &label, account_id.is_some());
-            if let (Some(account_id), Some(indicator)) = (&account_id, indicator) {
+            let heading = append_sidebar_heading(items, &label, account_id.is_some());
+            if let (Some(account_id), Some((indicator, alert))) = (&account_id, heading) {
                 update_account_indicator(
                     &indicator,
                     state.account_statuses.borrow().get(account_id).copied(),
@@ -3094,6 +3613,27 @@ fn populate_sidebar(state: &Rc<WindowState>, window: &ApplicationWindow) -> Resu
                     .account_indicators
                     .borrow_mut()
                     .insert(account_id.clone(), indicator);
+                let weak_state = Rc::downgrade(state);
+                let weak_window = window.downgrade();
+                let alert_account_id = account_id.clone();
+                let alert_label = label.clone();
+                alert.connect_clicked(move |_| {
+                    if let (Some(state), Some(window)) =
+                        (weak_state.upgrade(), weak_window.upgrade())
+                    {
+                        show_sync_problems_dialog(
+                            &state,
+                            &window,
+                            &alert_account_id,
+                            &alert_label,
+                        );
+                    }
+                });
+                state
+                    .account_alerts
+                    .borrow_mut()
+                    .insert(account_id.clone(), alert);
+                refresh_account_alert(state, account_id);
             }
         }
         append_sidebar_item(
@@ -3192,7 +3732,235 @@ fn set_account_online(state: &WindowState, account_id: &str, online: bool) {
     }
 }
 
-fn append_sidebar_heading(list: &gtk::ListBox, title: &str, remote: bool) -> Option<gtk::Box> {
+fn refresh_account_alert(state: &WindowState, account_id: &str) {
+    let Some(alert) = state.account_alerts.borrow().get(account_id).cloned() else {
+        return;
+    };
+    let has_problems = state
+        .store
+        .borrow()
+        .sync_rejections(account_id)
+        .is_ok_and(|rejections| !rejections.is_empty());
+    alert.set_visible(has_problems);
+}
+
+fn navigate_to_note(state: &Rc<WindowState>, window: &ApplicationWindow, note_id: &str) {
+    let note = state.store.borrow().note(note_id).ok().flatten();
+    let Some(note) = note else {
+        state
+            .toast_overlay
+            .add_toast(adw::Toast::new(tr("sync.problems.note_missing")));
+        return;
+    };
+    let filter = if note.archived {
+        ActiveNoteFilter::Archive(note.account_id.clone())
+    } else {
+        ActiveNoteFilter::All(note.account_id.clone())
+    };
+    state.active_filter.replace(filter);
+    state.search.set_text("");
+    if let Err(error) = populate_sidebar(state, window).and_then(|()| refresh_notes(state)) {
+        state
+            .toast_overlay
+            .add_toast(adw::Toast::new(&format!("{error:#}")));
+        return;
+    }
+    state.note_list.select(note_id, true);
+    *state.selection_anchor.borrow_mut() = Some(note_id.to_owned());
+    state.note_list.scroll_to(note_id);
+    show_note_by_id(state, note_id);
+}
+
+fn show_sync_problems_dialog(
+    state: &Rc<WindowState>,
+    window: &ApplicationWindow,
+    account_id: &str,
+    account_label: &str,
+) {
+    let rejections = match state.store.borrow().sync_rejections(account_id) {
+        Ok(rejections) => rejections,
+        Err(error) => {
+            show_api_error(
+                state,
+                &format!("rejections:{account_id}"),
+                &memonotes::tr_format!(
+                    "sync.error.read_local_status_failed",
+                    error = format!("{error:#}")
+                ),
+            );
+            return;
+        }
+    };
+    refresh_account_alert(state, account_id);
+    if rejections.is_empty() {
+        return;
+    }
+    let dialog = gtk::Dialog::builder()
+        .modal(true)
+        .transient_for(window)
+        .title(tr("sync.problems.title"))
+        .default_width(520)
+        .default_height(420)
+        .build();
+    dialog.add_button(tr("action.close"), gtk::ResponseType::Close);
+    dialog.connect_response(|dialog, _| dialog.close());
+    let content = dialog.content_area();
+    content.set_spacing(12);
+    content.set_margin_top(18);
+    content.set_margin_bottom(18);
+    content.set_margin_start(18);
+    content.set_margin_end(18);
+    content.append(
+        &gtk::Label::builder()
+            .label(memonotes::tr_format!(
+                "sync.problems.description",
+                account = account_label
+            ))
+            .wrap(true)
+            .xalign(0.0)
+            .build(),
+    );
+
+    let list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .css_classes(["boxed-list"])
+        .build();
+    for rejection in rejections {
+        let title_text = if rejection.title.trim().is_empty() {
+            tr("note.new").to_owned()
+        } else {
+            rejection.title.clone()
+        };
+        let title = gtk::Label::builder()
+            .label(&title_text)
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .css_classes(["heading"])
+            .build();
+        let title_widget: gtk::Widget = if rejection.is_note {
+            let open = gtk::Button::builder()
+                .child(&title)
+                .css_classes(["flat"])
+                .hexpand(true)
+                .halign(gtk::Align::Start)
+                .tooltip_text(tr("sync.problems.open_note"))
+                .build();
+            let weak_dialog = dialog.downgrade();
+            let state = Rc::clone(state);
+            let window = window.clone();
+            let note_id = rejection.item_id.clone();
+            open.connect_clicked(move |_| {
+                if let Some(dialog) = weak_dialog.upgrade() {
+                    dialog.close();
+                }
+                let state = Rc::clone(&state);
+                let window = window.clone();
+                let note_id = note_id.clone();
+                gtk::glib::idle_add_local_once(move || navigate_to_note(&state, &window, &note_id));
+            });
+            open.upcast()
+        } else {
+            title.set_hexpand(true);
+            title.upcast()
+        };
+        let copy = gtk::Button::builder()
+            .icon_name("edit-copy-symbolic")
+            .css_classes(["flat"])
+            .valign(gtk::Align::Center)
+            .tooltip_text(tr("sync.problems.copy_error"))
+            .build();
+        let copied_text = format!("{title_text}: {}", rejection.message);
+        copy.connect_clicked(move |button| {
+            button.clipboard().set_text(&copied_text);
+            button.set_icon_name("object-select-symbolic");
+            let weak_button = button.downgrade();
+            gtk::glib::timeout_add_local_once(Duration::from_millis(1500), move || {
+                if let Some(button) = weak_button.upgrade() {
+                    button.set_icon_name("edit-copy-symbolic");
+                }
+            });
+        });
+        let header = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
+            .build();
+        let discard = gtk::Button::builder()
+            .icon_name("edit-delete-symbolic")
+            .css_classes(["flat"])
+            .valign(gtk::Align::Center)
+            .tooltip_text(tr("sync.problems.discard"))
+            .build();
+        header.append(&title_widget);
+        header.append(&copy);
+        header.append(&discard);
+        let message = gtk::Label::builder()
+            .label(&rejection.message)
+            .selectable(true)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .xalign(0.0)
+            .css_classes(["caption"])
+            .build();
+        let body = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(4)
+            .margin_top(8)
+            .margin_bottom(10)
+            .margin_start(12)
+            .margin_end(12)
+            .build();
+        body.append(&header);
+        body.append(&message);
+        let row = gtk::ListBoxRow::builder()
+            .child(&body)
+            .activatable(false)
+            .build();
+        list.append(&row);
+        let weak_row = row.downgrade();
+        let weak_list = list.downgrade();
+        let weak_dialog = dialog.downgrade();
+        let state = Rc::clone(state);
+        let account_id = account_id.to_owned();
+        let item_id = rejection.item_id.clone();
+        discard.connect_clicked(move |_| {
+            if let Err(error) = state
+                .store
+                .borrow()
+                .discard_sync_rejection(&account_id, &item_id)
+            {
+                show_api_error(
+                    &state,
+                    &format!("rejections:{account_id}"),
+                    &format!("{error:#}"),
+                );
+                return;
+            }
+            refresh_account_alert(&state, &account_id);
+            if let (Some(list), Some(row)) = (weak_list.upgrade(), weak_row.upgrade()) {
+                list.remove(&row);
+                if list.first_child().is_none()
+                    && let Some(dialog) = weak_dialog.upgrade()
+                {
+                    dialog.close();
+                }
+            }
+        });
+    }
+    content.append(
+        &gtk::ScrolledWindow::builder()
+            .child(&list)
+            .vexpand(true)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .build(),
+    );
+    dialog.present();
+}
+
+fn append_sidebar_heading(
+    list: &gtk::ListBox,
+    title: &str,
+    remote: bool,
+) -> Option<(gtk::Box, gtk::Button)> {
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(8)
@@ -3211,6 +3979,15 @@ fn append_sidebar_heading(list: &gtk::ListBox, title: &str, remote: bool) -> Opt
     label.add_css_class("dim-label");
     content.append(&label);
     let indicator = remote.then(|| {
+        let alert = gtk::Button::builder()
+            .icon_name("dialog-warning-symbolic")
+            .css_classes(["flat", "circular"])
+            .valign(gtk::Align::Center)
+            .tooltip_text(tr("sync.problems.title"))
+            .visible(false)
+            .build();
+        alert.update_property(&[gtk::accessible::Property::Label(tr("sync.problems.title"))]);
+        content.append(&alert);
         let indicator = gtk::Box::builder()
             .width_request(8)
             .height_request(8)
@@ -3221,7 +3998,7 @@ fn append_sidebar_heading(list: &gtk::ListBox, title: &str, remote: bool) -> Opt
             .build();
         update_account_indicator(&indicator, None);
         content.append(&indicator);
-        indicator
+        (indicator, alert)
     });
     let row = gtk::ListBoxRow::builder()
         .child(&content)
@@ -4114,7 +4891,9 @@ fn connect_events(state: &Rc<WindowState>, new_note: &gtk::Button) {
         let Some(editor) = content_for_change.upgrade() else {
             return;
         };
-        if editor.has_css_class("editor-image-moving") {
+        if editor.has_css_class("editor-image-moving")
+            || editor.has_css_class("editor-content-replacing")
+        {
             return;
         }
         style_note_heading(buffer);
@@ -5074,7 +5853,9 @@ fn open_note_window(application: &gtk::Application, state: &Rc<WindowState>, not
         let Some(editor) = content_for_change.upgrade() else {
             return;
         };
-        if editor.has_css_class("editor-image-moving") {
+        if editor.has_css_class("editor-image-moving")
+            || editor.has_css_class("editor-content-replacing")
+        {
             return;
         }
         style_note_heading(buffer);
@@ -5886,7 +6667,8 @@ fn position_editor_image_handles(editor: &gtk::TextView, picture: &gtk::Picture)
 
 const IMAGE_HANDLE_DIRECTIONS: [i32; 4] = [-1, 1, -1, 1];
 
-const IMAGE_HANDLE_CURSORS: [&str; 4] = ["nwse-resize", "nesw-resize", "nesw-resize", "nwse-resize"];
+const IMAGE_HANDLE_CURSORS: [&str; 4] =
+    ["nwse-resize", "nesw-resize", "nesw-resize", "nwse-resize"];
 
 // Hit-tests against the positions we assigned, since allocations lag behind while resizing.
 fn image_handle_index_at(editor: &gtk::TextView, x: f64, y: f64) -> Option<usize> {
@@ -6556,7 +7338,14 @@ fn install_editor_format_shortcuts(
     install_bullet_selection_guard(editor);
     let auto_linking = Rc::new(Cell::new(false));
     let auto_linking_for_change = Rc::clone(&auto_linking);
+    let editor_for_auto_link = editor.downgrade();
     buffer.connect_changed(move |buffer| {
+        let Some(editor) = editor_for_auto_link.upgrade() else {
+            return;
+        };
+        if editor.has_css_class("editor-content-replacing") {
+            return;
+        }
         if auto_linking_for_change.replace(true) {
             return;
         }
@@ -8766,6 +9555,7 @@ fn apply_rendered_spans(
     images: &[ImageSpan],
 ) {
     let (start, end) = buffer.bounds();
+    let char_offsets = memonotes::editor_document::byte_to_char_offsets(text);
     remove_link_tags(buffer, &start, &end);
     let marks = [
         Mark::Bold,
@@ -8786,8 +9576,8 @@ fn apply_rendered_spans(
         let Some(mark) = span.mark else {
             continue;
         };
-        let start_offset = text[..span.range.start].chars().count() as i32;
-        let end_offset = text[..span.range.end].chars().count() as i32;
+        let start_offset = char_offsets[span.range.start] as i32;
+        let end_offset = char_offsets[span.range.end] as i32;
         let start = buffer.iter_at_offset(start_offset);
         let end = buffer.iter_at_offset(end_offset);
         if let Some((_, tag)) = tags.iter().find(|(tag_mark, _)| *tag_mark == mark) {
@@ -8796,21 +9586,21 @@ fn apply_rendered_spans(
     }
 
     for heading in headings {
-        let start_offset = text[..heading.range.start].chars().count() as i32;
-        let end_offset = text[..heading.range.end].chars().count() as i32;
+        let start_offset = char_offsets[heading.range.start] as i32;
+        let end_offset = char_offsets[heading.range.end] as i32;
         let start = buffer.iter_at_offset(start_offset);
         let end = buffer.iter_at_offset(end_offset);
         buffer.apply_tag(&heading_style_tag(buffer, heading.level), &start, &end);
     }
 
     for link in links {
-        let start = buffer.iter_at_offset(text[..link.range.start].chars().count() as i32);
-        let end = buffer.iter_at_offset(text[..link.range.end].chars().count() as i32);
+        let start = buffer.iter_at_offset(char_offsets[link.range.start] as i32);
+        let end = buffer.iter_at_offset(char_offsets[link.range.end] as i32);
         buffer.apply_tag(&link_tag(buffer, &link.url), &start, &end);
     }
 
     for image in images.iter().rev() {
-        let offset = text[..image.range.start].chars().count() as i32;
+        let offset = char_offsets[image.range.start] as i32;
         let mut start = buffer.iter_at_offset(offset);
         let mut end = start;
         end.forward_char();
@@ -8861,6 +9651,7 @@ fn set_editor_view_content(editor: &gtk::TextView, content: &str) {
         &rendered.images,
     );
     install_task_checkbuttons(editor);
+    auto_link_plain_urls(&buffer);
     buffer.set_enable_undo(true);
     editor.remove_css_class("editor-content-replacing");
 }

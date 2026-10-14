@@ -13,6 +13,28 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const ATTACHMENT_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_ATTACHMENT_BYTES: usize = 30 * 1024 * 1024;
 
+#[derive(Debug)]
+struct MemosHttpError {
+    status: reqwest::StatusCode,
+    message: String,
+}
+
+impl std::fmt::Display for MemosHttpError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for MemosHttpError {}
+
+pub fn is_bad_request(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<MemosHttpError>()
+            .is_some_and(|error| error.status == reqwest::StatusCode::BAD_REQUEST)
+    })
+}
+
 fn base64_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -370,11 +392,13 @@ impl MemosClient {
                 .and_then(|body| body.get("message")?.as_str().map(str::to_owned))
                 .filter(|message| !message.is_empty());
             let error = crate::tr_format!("api.memos.error.mutation_http_status", status = status);
-            bail!(match message {
-                Some(message) =>
-                    format!("{error}: {}", message.chars().take(300).collect::<String>()),
+            let message = match message {
+                Some(message) => {
+                    format!("{error}: {}", message.chars().take(300).collect::<String>())
+                }
                 None => error,
-            });
+            };
+            return Err(anyhow::Error::new(MemosHttpError { status, message }));
         }
         Ok(response
             .text()
@@ -494,6 +518,38 @@ mod tests {
         assert!(!is_connection_error(&anyhow::anyhow!(
             "Memos API gaf HTTP 401"
         )));
+        Ok(())
+    }
+
+    #[test]
+    fn mutation_bad_request_status_is_preserved_for_sync_handling() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let server = thread::spawn(move || -> Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            let mut reader = BufReader::new(stream.try_clone()?);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                reader.read_line(&mut line)?;
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            stream.write_all(
+                b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 26\r\nConnection: close\r\n\r\n{\"message\":\"invalid memo\"}",
+            )?;
+            Ok(())
+        });
+
+        let client = MemosClient::new(&format!("http://{address}"), "probe-token")?;
+        let error = client
+            .send_mutation(Method::POST, "memos", &[], Some(&serde_json::json!({})))
+            .unwrap_err();
+
+        assert!(is_bad_request(&error));
+        assert!(error.to_string().contains("invalid memo"));
+        server.join().expect("mock server thread panicked")?;
         Ok(())
     }
 

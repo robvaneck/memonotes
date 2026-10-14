@@ -1211,6 +1211,62 @@ mod tests {
     }
 
     #[test]
+    fn rejected_event_does_not_block_other_notes() -> Result<()> {
+        let store = crate::Store::open(":memory:")?;
+        let (url, server) = mock_server(vec![400, 204])?;
+        store.add_backend_account("one", "Werk", "memos", &url)?;
+        let memos = ["a", "b"].map(|name| Memo {
+            id: format!("memos/{name}"),
+            content: "Origineel".to_owned(),
+            title: None,
+            folder_id: None,
+            pinned: false,
+            archived: false,
+            is_shared: false,
+            updated_at: None,
+        });
+        store.import_backend_snapshot("one", &[], &memos)?;
+        let notes = store.notes(&crate::NoteFilter {
+            account_id: Some("one".to_owned()),
+            ..Default::default()
+        })?;
+        let (first, second) = (&notes[0], &notes[1]);
+        store.save_note(&first.id, "Eerste", "")?;
+        store.save_note(&second.id, "Tweede", "")?;
+        let account = store.backend_accounts()?.remove(0);
+        let adapter = MemosAdapter::new(&url, "test-token")?;
+
+        let error = store.sync_backend_events(&account, &adapter).unwrap_err();
+
+        assert!(crate::memos::is_bad_request(&error));
+        let requests = server.join().expect("mock server thread panicked")?;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].body.as_ref().unwrap()["content"], "Tweede");
+        let remaining = store.pending_sync_events(100)?;
+        assert_eq!(remaining.len(), 1);
+        assert!(matches!(&remaining[0].event,
+            SyncEvent::NoteUpdated { note } if note.id == first.id));
+        let rejections = store.sync_rejections("one")?;
+        assert_eq!(rejections.len(), 1);
+        assert_eq!(rejections[0].item_id, first.id);
+        assert!(rejections[0].is_note);
+
+        store.discard_sync_rejection("one", &first.id)?;
+        assert!(store.sync_rejections("one")?.is_empty());
+        assert!(store.pending_sync_events(100)?.is_empty());
+        assert!(store.note(&first.id)?.is_some());
+        store.save_note(&first.id, "Korter", "")?;
+        let (retry_url, retry_server) = mock_server(vec![204])?;
+        let retry_adapter = MemosAdapter::new(&retry_url, "test-token")?;
+        assert_eq!(store.sync_backend_events(&account, &retry_adapter)?, 1);
+        let requests = retry_server.join().expect("mock server thread panicked")?;
+        assert_eq!(requests[0].body.as_ref().unwrap()["content"], "Korter");
+        assert!(store.pending_sync_events(100)?.is_empty());
+        assert!(store.sync_rejections("one")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn images_removed_from_the_text_are_pruned_even_when_added_by_another_client() -> Result<()> {
         let mut note = note_snapshot();
         note.content = "# Titel".to_owned();

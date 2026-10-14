@@ -53,7 +53,8 @@ actually implemented in the current code. See also [README.md](README.md) and
 - [x] Memos attachments for inline images: upload linked to the memo in the same mutation (Memos 0.31 otherwise rejects with 400), download and cache locally, map images from the Memos web client (also without a file name) to local images, and unbind/delete attachments when the user removes the image from the note. Attachment ID = local UUID; content references `/file/attachments/<id>/<file>`; the width is stored in the alt text because Memos rejects URL fragments. Verified manually against the target server; bare anchor characters without an image are no longer saved to Markdown.
 - [x] Insert an image offline and upload it after reconnect: confirmed manually, one attachment on the server.
 - [ ] Validate image sync further: upload retries after an interrupted connection without duplicate/orphaned attachments, server file size limits and non-image attachment types.
-- [ ] Markdown export with folders, metadata and images.
+- [x] Import one or many Markdown files (including large batches) into a selected account and folder/space. Every import creates new notes; existing notes are never overwritten.
+- [x] Export a selected account to a ZIP with one directory per folder/space and its Markdown files; include metadata and images.
 - [ ] Explicit onboarding/local import and safe unlinking with pending changes/export.
 - [ ] Narrow-window navigation, remembered pane widths/selection, accessibility and visible sync/conflict status.
 - [ ] Fedora/Flatpak packaging and network/keyring tests in the sandbox.
@@ -146,7 +147,15 @@ Local images remain available without a backend; export includes the files.
 Storage follows XDG locations; in Flatpak the corresponding app-private locations.
 Local data is not automatically encrypted: disk encryption and optional additional
 database encryption must be assessed separately.
-Export to Markdown with folder structure and metadata belongs in the first release.
+Markdown import and export belong in the first release. Import lets the user select
+one or many `.md` files and choose both the destination account (including On this
+device) and destination folder/space. Export first asks which account or local
+collection to export, then creates a ZIP containing one directory per folder/space
+and the corresponding Markdown files. Folder names and Markdown content must be
+preserved safely in archive paths. Image files and note metadata should be included
+in export. Imports create new notes and queue Memos destinations through the normal
+sync flow. Relative image paths and app-specific metadata in incoming Markdown are
+not imported yet; image and metadata roundtrip support remains a follow-up.
 
 ## 4. Memos 0.31.0: verified API agreements
 
@@ -273,7 +282,7 @@ Memos collections can sync with other clients through the server; local-only col
 2. UI/editor prototype: three panes, selection, search, WYSIWYG and adaptive navigation.
    Show checkboxes, bold/italic and inline images working; validate roundtrip and
    GNOME integration before the editor engine is finally chosen.
-3. Local MVP: SQLite, autosave, flat folders, moving, pinning, archive and export with images.
+3. Local MVP: SQLite, autosave, flat folders, moving, pinning, archive, batch Markdown import and ZIP export.
    Starting without a backend makes no network requests; restart and crash lose no confirmed saves.
 4. Memos integration: server/PAT onboarding, keyring, fetching and durable outbox.
    Without network, read/edit text and images; after reconnect, sync without duplicates or silent loss.
@@ -288,6 +297,7 @@ UI checks include empty/error/offline states, pane resizing, keyboard operation 
 
 ## 9. Still to decide together
 
+- How should Markdown imports resolve relative image files and app-specific metadata?
 - Add an optional Markdown source tab or offer WYSIWYG only?
 - How close should the design be to Apple Notes versus standard libadwaita?
 - Besides confirmed images, also other file attachments in version 1?

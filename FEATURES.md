@@ -33,7 +33,8 @@ see [PLAN.md](PLAN.md) for the roadmap and [README.md](README.md) for technical 
 - Undo and redo, including for image changes.
 - The first line is the title (H1) and is saved as Markdown so Memos derives the same title.
 - Existing content stays unchanged until you edit it; unknown content is not silently stripped.
-- Markdown export with folders, metadata and images *(open)*.
+- Batch import of one or many Markdown files into a selected local or Memos account and folder/space; each import creates new notes.
+- Export a selected account as a ZIP grouped by folder/space, including Markdown files, metadata and local images. Relative image paths in imported Markdown are not imported yet.
 
 ## Local-first storage
 

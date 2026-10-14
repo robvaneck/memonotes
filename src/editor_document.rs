@@ -17,6 +17,18 @@ pub struct RenderedMarkdown {
     pub images: Vec<ImageSpan>,
 }
 
+pub fn byte_to_char_offsets(text: &str) -> Vec<usize> {
+    let mut offsets = vec![0; text.len() + 1];
+    let mut char_offset = 0;
+    for (byte_offset, character) in text.char_indices() {
+        let end_offset = byte_offset + character.len_utf8();
+        offsets[byte_offset..end_offset].fill(char_offset);
+        char_offset += 1;
+        offsets[end_offset] = char_offset;
+    }
+    offsets
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeadingSpan {
     pub range: Range<usize>,
@@ -49,20 +61,41 @@ pub fn render_markdown_source(markdown: &str) -> RenderedMarkdown {
     hidden_ranges.extend(source_links.iter().flat_map(|link| link.hidden.clone()));
     let source_images = markdown_image_ranges(markdown);
     hidden_ranges.extend(source_images.iter().map(|image| image.range.clone()));
+    hidden_ranges.sort_unstable_by_key(|range| range.start);
+    let mut merged_hidden_ranges: Vec<Range<usize>> = Vec::with_capacity(hidden_ranges.len());
+    for range in hidden_ranges {
+        if let Some(previous) = merged_hidden_ranges.last_mut()
+            && range.start <= previous.end
+        {
+            previous.end = previous.end.max(range.end);
+        } else {
+            merged_hidden_ranges.push(range);
+        }
+    }
+
     let mut output = String::with_capacity(markdown.len());
     let mut output_offsets = vec![0; markdown.len() + 1];
+    let mut hidden_range_index = 0;
+    let mut image_index = 0;
 
     for (byte_offset, character) in markdown.char_indices() {
         let end_offset = byte_offset + character.len_utf8();
-        let hidden = hidden_ranges
-            .iter()
-            .any(|range| range.start <= byte_offset && byte_offset < range.end);
+        while merged_hidden_ranges
+            .get(hidden_range_index)
+            .is_some_and(|range| range.end <= byte_offset)
+        {
+            hidden_range_index += 1;
+        }
+        let hidden = merged_hidden_ranges
+            .get(hidden_range_index)
+            .is_some_and(|range| range.start <= byte_offset && byte_offset < range.end);
         output_offsets[byte_offset] = output.len();
         if source_images
-            .iter()
-            .any(|image| image.range.start == byte_offset)
+            .get(image_index)
+            .is_some_and(|image| image.range.start == byte_offset)
         {
             output.push('\u{fffc}');
+            image_index += 1;
         }
         if !hidden {
             output.push(character);
@@ -1260,6 +1293,32 @@ mod tests {
             .unwrap();
         assert_eq!(&rendered.text[bold.range.clone()], "bold");
         assert_eq!(rendered.text[..bold.range.start].chars().count(), 2);
+    }
+
+    #[test]
+    fn byte_to_char_offsets_handles_multibyte_text() {
+        let offsets = byte_to_char_offsets("éx");
+
+        assert_eq!(offsets[0], 0);
+        assert_eq!(offsets[2], 1);
+        assert_eq!(offsets[3], 2);
+    }
+
+    #[test]
+    fn markdown_rendering_handles_twenty_kilobytes_with_many_formatting_spans() {
+        let markdown = "**word** ".repeat(2_500);
+
+        let rendered = render_markdown_source(&markdown);
+
+        assert_eq!(rendered.text, "word ".repeat(2_500));
+        assert_eq!(
+            rendered
+                .spans
+                .iter()
+                .filter(|span| span.mark == Some(Mark::Bold))
+                .count(),
+            2_500
+        );
     }
 
     #[test]

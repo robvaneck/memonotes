@@ -24,6 +24,7 @@ serde_json = "1"
 libsecret = "0.8"
 gio = "0.21"
 pulldown-cmark = "0.13"
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tempfile = "3"

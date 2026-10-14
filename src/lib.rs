@@ -12,6 +12,7 @@ pub mod credentials;
 pub mod editor_document;
 pub mod i18n;
 pub mod images;
+pub mod markdown_io;
 pub mod memo;
 pub mod memos;
 
@@ -21,6 +22,8 @@ const NOTE_COLOR_IDS: [&str; 36] = [
     "jade", "green", "grass", "bronze", "gold", "brown", "orange", "amber", "yellow", "lime",
     "mint", "sky", "rose", "peach", "lemon", "lilac",
 ];
+
+const MEMOS_CONTENT_LIMIT_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Serialize)]
 pub struct Folder {
@@ -157,6 +160,16 @@ pub struct SyncOutboxEntry {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct SyncRejection {
+    pub account_id: String,
+    pub item_id: String,
+    // Folders have no note to navigate to.
+    pub is_note: bool,
+    pub title: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct BackendAccount {
     pub id: String,
     pub label: String,
@@ -243,6 +256,15 @@ impl Store {
                 remote_name TEXT NOT NULL,
                 local_id TEXT NOT NULL,
                 PRIMARY KEY (account_id, remote_name)
+            );
+            CREATE TABLE IF NOT EXISTS sync_rejections (
+                account_id TEXT NOT NULL REFERENCES backend_accounts(id) ON DELETE CASCADE,
+                item_id TEXT NOT NULL,
+                is_note INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                message TEXT NOT NULL,
+                failed_at INTEGER NOT NULL,
+                PRIMARY KEY (account_id, item_id)
             );",
         )?;
         if version < 10 {
@@ -439,6 +461,65 @@ impl Store {
         append_sync_event(&transaction, SyncEvent::NoteCreated { note: note.into() })?;
         transaction.commit()?;
         Ok(id)
+    }
+
+    pub fn import_markdown_notes(
+        &self,
+        account_id: Option<&str>,
+        folder_id: Option<&str>,
+        notes: &[(String, String)],
+    ) -> Result<Vec<String>> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let is_memos_remote = if let Some(account_id) = account_id {
+            transaction
+                .query_row(
+                    "SELECT provider FROM backend_accounts WHERE id = ?1",
+                    [account_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .as_deref()
+                == Some("memos")
+        } else {
+            false
+        };
+        if let Some(folder_id) = folder_id {
+            ensure_folder_in_account(&transaction, folder_id, account_id)?;
+        }
+        let mut ids = Vec::with_capacity(notes.len());
+        for (file_name, content) in notes {
+            if is_memos_remote {
+                let remote_size = images::to_remote_content(content).len();
+                if remote_size > MEMOS_CONTENT_LIMIT_BYTES {
+                    bail!(
+                        "{}",
+                        crate::tr_format!(
+                            "markdown.import.memos_content_too_large",
+                            file = file_name,
+                            size = remote_size.to_string(),
+                            limit = MEMOS_CONTENT_LIMIT_BYTES.to_string()
+                        )
+                    );
+                }
+            }
+            let id = Uuid::new_v4().to_string();
+            let (markdown_title, _) = memo::editor_parts(content);
+            let title = if markdown_title.trim().is_empty() {
+                file_name.trim()
+            } else {
+                markdown_title.trim()
+            };
+            transaction.execute(
+                "INSERT INTO notes (id, account_id, folder_id, content, title, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![id, account_id, folder_id, content, title, timestamp()?],
+            )?;
+            let note = load_note(&transaction, &id)?;
+            append_sync_event(&transaction, SyncEvent::NoteCreated { note: note.into() })?;
+            ids.push(id);
+        }
+        transaction.commit()?;
+        Ok(ids)
     }
 
     pub fn save_note(&self, id: &str, content: &str, title: &str) -> Result<()> {
@@ -686,20 +767,66 @@ impl Store {
                     continue;
                 }
             }
-            if let Some((sequences, previous)) = batches.last_mut() {
-                if matches!((&*previous, &event),
-                    (SyncEvent::NoteUpdated { note: before }, SyncEvent::NoteUpdated { note: after })
-                    if before.id == after.id)
-                {
-                    sequences.push(sequence);
-                    *previous = event;
-                    continue;
+            // A newer update supersedes an earlier pending update of the same note, even when
+            // other notes' events sit in between, so a rejected update can be replaced by an edit.
+            let mut sequences = vec![sequence];
+            if let SyncEvent::NoteUpdated { note } = &event {
+                let last_for_note = batches.iter().rposition(|(_, previous)| {
+                    matches!(previous,
+                        SyncEvent::NoteCreated { note: other }
+                        | SyncEvent::NoteUpdated { note: other }
+                        | SyncEvent::NoteArchived { note: other }
+                        | SyncEvent::NoteUnarchived { note: other }
+                        | SyncEvent::NoteDeleted { note: other }
+                        | SyncEvent::NoteRestored { note: other } if other.id == note.id)
+                });
+                if let Some(index) = last_for_note {
+                    if matches!(batches[index].1, SyncEvent::NoteUpdated { .. }) {
+                        let (mut earlier, _) = batches.remove(index);
+                        earlier.extend(sequences);
+                        sequences = earlier;
+                    }
                 }
             }
-            batches.push((vec![sequence], event));
+            batches.push((sequences, event));
         }
         let mut sent = 0;
+        // Local IDs of notes/folders the server rejected; their later events stay queued in order.
+        let mut rejected_ids: HashSet<String> = HashSet::new();
+        let mut first_rejection = None;
         for (sequences, mut event) in batches {
+            let (own_id, parent_folder_id, label, is_note) = match &event {
+                SyncEvent::FolderCreated { folder } | SyncEvent::FolderUpdated { folder } => {
+                    (folder.id.clone(), None, folder.name.clone(), false)
+                }
+                SyncEvent::FolderDeleted { folder_id } => {
+                    (folder_id.clone(), None, folder_id.clone(), false)
+                }
+                SyncEvent::NoteCreated { note }
+                | SyncEvent::NoteUpdated { note }
+                | SyncEvent::NoteArchived { note }
+                | SyncEvent::NoteUnarchived { note }
+                | SyncEvent::NoteDeleted { note }
+                | SyncEvent::NoteRestored { note } => {
+                    let title = note.title.trim();
+                    let title = if title.is_empty() {
+                        note.content.lines().next().unwrap_or_default().trim()
+                    } else {
+                        title
+                    };
+                    (
+                        note.id.clone(),
+                        note.folder_id.clone(),
+                        title.chars().take(60).collect(),
+                        true,
+                    )
+                }
+            };
+            if rejected_ids.contains(&own_id)
+                || parent_folder_id.is_some_and(|id| rejected_ids.contains(&id))
+            {
+                continue;
+            }
             if !account.enabled
                 || account.provider != "memos"
                 || !self
@@ -767,7 +894,32 @@ impl Store {
                 }
                 _ => None,
             };
-            adapter.apply_event_with_base(&event, base_content.as_deref())?;
+            if let Err(error) = adapter.apply_event_with_base(&event, base_content.as_deref()) {
+                if !memos::is_bad_request(&error) {
+                    return Err(error);
+                }
+                self.connection.execute(
+                    "INSERT INTO sync_rejections (account_id, item_id, is_note, title, message, failed_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT(account_id, item_id) DO UPDATE SET
+                        title = excluded.title, message = excluded.message,
+                        failed_at = excluded.failed_at",
+                    params![
+                        account.id,
+                        own_id,
+                        is_note,
+                        label,
+                        format!("{error:#}"),
+                        timestamp()?
+                    ],
+                )?;
+                rejected_ids.insert(own_id);
+                first_rejection.get_or_insert(error.context(crate::tr_format!(
+                    "api.memos.error.item_rejected",
+                    item = label
+                )));
+                continue;
+            }
             let transaction = self.connection.unchecked_transaction()?;
             if let Some((note_id, state)) = note_sync_state {
                 if let Some(state) = state {
@@ -786,6 +938,10 @@ impl Store {
                     params![account.id, remote_name, local_id],
                 )?;
             }
+            transaction.execute(
+                "DELETE FROM sync_rejections WHERE account_id = ?1 AND item_id = ?2",
+                params![account.id, own_id],
+            )?;
             for sequence in sequences {
                 self.changed(
                     transaction
@@ -795,7 +951,10 @@ impl Store {
             transaction.commit()?;
             sent += 1;
         }
-        Ok(sent)
+        match first_rejection {
+            Some(error) => Err(error),
+            None => Ok(sent),
+        }
     }
 
     pub fn has_backend_events(&self, account_id: &str) -> Result<bool> {
@@ -1304,6 +1463,54 @@ impl Store {
 
     pub fn import_backend_memo(&self, account_id: &str, memo: &memo::Memo) -> Result<()> {
         self.import_backend_snapshot(account_id, &[], std::slice::from_ref(memo))
+    }
+
+    // Rejections whose event is no longer queued (edited away, deleted) are dropped.
+    pub fn sync_rejections(&self, account_id: &str) -> Result<Vec<SyncRejection>> {
+        self.connection.execute(
+            "DELETE FROM sync_rejections WHERE account_id = ?1 AND NOT EXISTS(
+                SELECT 1 FROM sync_outbox WHERE COALESCE(
+                    json_extract(payload, '$.snapshot.note.id'),
+                    json_extract(payload, '$.snapshot.folder.id'),
+                    json_extract(payload, '$.snapshot.folder_id')
+                ) = sync_rejections.item_id)",
+            [account_id],
+        )?;
+        let mut statement = self.connection.prepare(
+            "SELECT item_id, is_note, title, message FROM sync_rejections
+             WHERE account_id = ?1 ORDER BY failed_at, item_id",
+        )?;
+        let rows = statement.query_map([account_id], |row| {
+            Ok(SyncRejection {
+                account_id: account_id.to_owned(),
+                item_id: row.get(0)?,
+                is_note: row.get(1)?,
+                title: row.get(2)?,
+                message: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    // Stops retrying a rejected item: drops its queued events but keeps the local data.
+    pub fn discard_sync_rejection(&self, account_id: &str, item_id: &str) -> Result<()> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let removed = transaction.execute(
+            "DELETE FROM sync_rejections WHERE account_id = ?1 AND item_id = ?2",
+            params![account_id, item_id],
+        )?;
+        if removed > 0 {
+            transaction.execute(
+                "DELETE FROM sync_outbox WHERE COALESCE(
+                    json_extract(payload, '$.snapshot.note.id'),
+                    json_extract(payload, '$.snapshot.folder.id'),
+                    json_extract(payload, '$.snapshot.folder_id')
+                ) = ?1",
+                [item_id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn sync_conflicts(&self, account_id: &str) -> Result<Vec<SyncConflict>> {

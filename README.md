@@ -200,6 +200,10 @@ live validation.
 	and are outside the current version 1 scope.
 - Explicit server list filters/sorting and live multi-client conflict testing remain open.
 
+## Support
+
+Bitcoin donations: `bc1qakjs0c48rm2860v9v3xnk8n6q3ry3u8vhmfwpg`
+
 ## Fedora build prerequisites
 
 Install the GTK development packages:
