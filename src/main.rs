@@ -864,6 +864,7 @@ fn upload_backend_events(state: &Rc<WindowState>) -> Result<()> {
     {
         if !backend_available(state, &account.id)
             || state.loading_accounts.borrow().contains(&account.id)
+            || !state.loading_memos.borrow().is_empty()
             || state
                 .loading_folders
                 .borrow()
@@ -893,14 +894,7 @@ fn upload_backend_events(state: &Rc<WindowState>) -> Result<()> {
             .get(&account.id)
             .copied();
         if outbox_revision_needs_refresh(checked_revision, current_revision) {
-            if let Some(window) = state
-                .note_list
-                .view
-                .root()
-                .and_downcast::<ApplicationWindow>()
-            {
-                load_backend_accounts(state, &window);
-            }
+            precheck_pending_notes(state, account, current_revision);
             continue;
         }
         let path = database_path()?;
@@ -998,6 +992,127 @@ fn upload_backend_events(state: &Rc<WindowState>) -> Result<()> {
         });
     }
     Ok(())
+}
+
+// Compares only the notes about to be uploaded with the server, instead of a full refresh.
+fn precheck_pending_notes(state: &Rc<WindowState>, account: BackendAccount, revision: i64) {
+    let notes = match state
+        .store
+        .borrow()
+        .pending_existing_note_resources(&account.id)
+    {
+        Ok(notes) => notes,
+        Err(error) => {
+            show_api_error(
+                state,
+                &format!("upload:{}", account.id),
+                &memonotes::tr_format!("api.memos.error.save_failed", error = format!("{error:#}")),
+            );
+            return;
+        }
+    };
+    if notes.is_empty() {
+        state
+            .checked_outbox_revision
+            .borrow_mut()
+            .insert(account.id.clone(), revision);
+        return;
+    }
+    if !state
+        .loading_accounts
+        .borrow_mut()
+        .insert(account.id.clone())
+    {
+        return;
+    }
+    let (sender, receiver) = mpsc::channel();
+    let worker_account = account.clone();
+    thread::spawn(move || {
+        let result = (|| -> Result<Vec<(String, Option<memonotes::memo::Memo>)>> {
+            let token = memonotes::credentials::lookup_token(&worker_account.id)?
+                .context(tr("api.memos.error.token_missing"))?;
+            let adapter = MemosAdapter::new(&worker_account.server_url, &token)?;
+            notes
+                .into_iter()
+                .map(|(note_id, name)| Ok((note_id, adapter.get_memo_if_exists(&name)?)))
+                .collect()
+        })();
+        let _ = sender.send(result);
+    });
+    let weak_state = Rc::downgrade(state);
+    api_timeout(state, Duration::from_millis(50), move || {
+        let Some(state) = weak_state.upgrade() else {
+            return gtk::glib::ControlFlow::Break;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return gtk::glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err(anyhow::anyhow!(tr("api.memos.error.save_interrupted")))
+            }
+        };
+        state.loading_accounts.borrow_mut().remove(&account.id);
+        let result = result.and_then(|checked| {
+            let current = state.store.borrow().backend_accounts()?;
+            if !current.iter().any(|current| current == &account) {
+                return Ok(());
+            }
+            set_account_online(&state, &account.id, true);
+            let mut memos = Vec::new();
+            let mut deletions = Vec::new();
+            for (note_id, memo) in checked {
+                match memo {
+                    Some(memo) => memos.push(memo),
+                    None => deletions.push(note_id),
+                }
+            }
+            state.store.borrow().import_complete_backend_snapshot(
+                &account.id,
+                &[],
+                &memos,
+                &deletions,
+            )?;
+            state
+                .checked_outbox_revision
+                .borrow_mut()
+                .insert(account.id.clone(), revision);
+            refresh_notes(&state)?;
+            if let Some(window) = state
+                .note_list
+                .view
+                .root()
+                .and_downcast::<ApplicationWindow>()
+            {
+                show_next_sync_conflict(&state, &window, &account.id);
+            }
+            Ok(())
+        });
+        if let Err(error) = result {
+            let connection_error = !adw::gio::NetworkMonitor::default().is_network_available()
+                || memonotes::memos::is_connection_error(&error);
+            if !connection_error {
+                let retry_delay = next_sync_retry_delay(&state, &account.id);
+                state
+                    .upload_after
+                    .borrow_mut()
+                    .insert(account.id.clone(), Instant::now() + retry_delay);
+            }
+            handle_backend_error(
+                &state,
+                &account.id,
+                &format!("upload:{}", account.id),
+                &memonotes::tr_format!(
+                    "api.memos.error.account_upload_failed",
+                    account = account.label,
+                    error = format!("{error:#}")
+                ),
+                &error,
+            );
+        } else if let Err(error) = upload_backend_events(&state) {
+            eprintln!("{error:#}");
+        }
+        gtk::glib::ControlFlow::Break
+    });
 }
 
 fn load_backend_accounts(state: &Rc<WindowState>, window: &ApplicationWindow) {
@@ -3992,15 +4107,22 @@ fn connect_events(state: &Rc<WindowState>, new_note: &gtk::Button) {
     let content_for_change = state.content.downgrade();
     let buffer = state.content.buffer();
     let handler = buffer.connect_changed(move |buffer| {
-        if content_for_change
-            .upgrade()
-            .is_some_and(|editor| editor.has_css_class("editor-image-moving"))
-        {
+        let Some(editor) = content_for_change.upgrade() else {
+            return;
+        };
+        if editor.has_css_class("editor-image-moving") {
             return;
         }
         style_note_heading(buffer);
         let markdown = markdown_from_editor_buffer(buffer);
         save_current(&state_for_content, &markdown);
+        if editor.has_css_class("editor-image-commit") {
+            let note_id = state_for_content.note_id.borrow().clone();
+            let account_id = note_id
+                .and_then(|id| state_for_content.store.borrow().note(&id).ok().flatten())
+                .and_then(|note| note.account_id);
+            upload_now(&state_for_content, account_id.as_deref());
+        }
     });
     track_signal(state, &buffer, handler);
 
@@ -4945,10 +5067,10 @@ fn open_note_window(application: &gtk::Application, state: &Rc<WindowState>, not
     let note_id = note.id.clone();
     let state_for_content = Rc::downgrade(state);
     let content_handler = buffer.connect_changed(move |buffer| {
-        if content_for_change
-            .upgrade()
-            .is_some_and(|editor| editor.has_css_class("editor-image-moving"))
-        {
+        let Some(editor) = content_for_change.upgrade() else {
+            return;
+        };
+        if editor.has_css_class("editor-image-moving") {
             return;
         }
         style_note_heading(buffer);
@@ -4956,6 +5078,16 @@ fn open_note_window(application: &gtk::Application, state: &Rc<WindowState>, not
             return;
         };
         save_detached_note(&state, &note_id, buffer);
+        if editor.has_css_class("editor-image-commit") {
+            let account_id = state
+                .store
+                .borrow()
+                .note(&note_id)
+                .ok()
+                .flatten()
+                .and_then(|note| note.account_id);
+            upload_now(&state, account_id.as_deref());
+        }
     });
     let handlers = RefCell::new(Some(content_handler));
     let buffer_for_destroy = buffer.downgrade();
@@ -5014,6 +5146,17 @@ fn refresh_open_note_windows(state: &Rc<WindowState>) {
         set_editor_view_content(&editor, &note.editor_document());
         style_note_heading(&buffer);
         state.suppress_detached_editor_events.set(previous_suppress);
+    }
+}
+
+// Image moves and resizes are deliberate, so they skip the typing debounce.
+fn upload_now(state: &Rc<WindowState>, account_id: Option<&str>) {
+    let Some(account_id) = account_id else {
+        return;
+    };
+    state.upload_after.borrow_mut().remove(account_id);
+    if let Err(error) = upload_backend_events(state) {
+        eprintln!("{error:#}");
     }
 }
 
@@ -5351,7 +5494,9 @@ fn finish_editor_image_change(
         history.redo.clear();
     }
     editor.remove_css_class("editor-image-moving");
+    editor.add_css_class("editor-image-commit");
     buffer.emit_by_name::<()>("changed", &[]);
+    editor.remove_css_class("editor-image-commit");
     image_history.borrow_mut().internal_change = false;
 }
 

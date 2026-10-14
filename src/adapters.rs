@@ -230,7 +230,7 @@ impl MemosAdapter {
 
     // Serves remote attachments as local image files so stored content keeps local references.
     fn localize_images(&self, remote: RemoteMemo) -> RemoteMemo {
-        if crate::images::remote_images(&remote.content).is_empty() {
+        if crate::images::remote_images(&remote.content, &self.client.origin()).is_empty() {
             return remote;
         }
         match crate::images::image_directory() {
@@ -247,23 +247,40 @@ impl MemosAdapter {
         directory: &std::path::Path,
         mut remote: RemoteMemo,
     ) -> RemoteMemo {
-        for name in crate::images::remote_images(&remote.content) {
-            if let Err(error) = self.download_image(directory, &name) {
+        let origin = self.client.origin();
+        for image in crate::images::remote_images(&remote.content, &origin) {
+            if let Err(error) = self.download_image(directory, &image) {
                 eprintln!("{error:#}");
             }
         }
-        remote.content = crate::images::to_local_content(&remote.content);
+        remote.content = crate::images::to_local_content(&remote.content, &origin);
         remote
     }
 
-    fn download_image(&self, directory: &std::path::Path, name: &str) -> Result<()> {
-        let path = directory.join(name);
+    fn download_image(
+        &self,
+        directory: &std::path::Path,
+        image: &crate::images::ImageRef,
+    ) -> Result<()> {
+        let path = directory.join(&image.local);
         if path.exists() {
             return Ok(());
         }
-        let id = crate::images::attachment_id(name)
-            .context(tr("api.memos.error.invalid_resource_id"))?;
-        let bytes = self.client.download_attachment(id, name)?;
+        let bytes = match self.client.download_attachment(&image.id, &image.file) {
+            Ok(bytes) => bytes,
+            // Without a filename in the URL, retry with the name the server stores.
+            Err(error) if image.file.is_empty() => {
+                let filename = self.client.attachment_filename(&image.id).ok().flatten();
+                match filename {
+                    Some(filename) => self
+                        .client
+                        .download_attachment(&image.id, &filename)
+                        .map_err(|_| error)?,
+                    None => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        };
         std::fs::create_dir_all(directory)?;
         let partial = path.with_extension("part");
         std::fs::write(&partial, bytes)?;
@@ -285,22 +302,21 @@ impl MemosAdapter {
         content: &str,
     ) -> Result<Vec<String>> {
         let mut names = Vec::new();
-        for name in crate::images::local_images(content) {
-            let id = crate::images::attachment_id(&name)
-                .context(tr("api.memos.error.invalid_resource_id"))?;
+        for image in crate::images::local_images(content) {
+            // Attachments made elsewhere are already bound to the memo.
+            if !crate::images::is_uploadable(&image) {
+                continue;
+            }
+            let (id, name) = (image.id.as_str(), image.local.as_str());
             if !self.client.attachment_exists(id)? {
-                let path = directory.join(&name);
+                let path = directory.join(name);
                 if !path.is_file() {
                     continue;
                 }
                 let bytes =
                     std::fs::read(&path).context(tr("api.memos.error.image_read_failed"))?;
-                self.client.upload_attachment(
-                    id,
-                    &name,
-                    crate::images::mime_type(&name),
-                    &bytes,
-                )?;
+                self.client
+                    .upload_attachment(id, name, crate::images::mime_type(name), &bytes)?;
             }
             names.push(format!("attachments/{id}"));
         }
@@ -365,8 +381,8 @@ impl MemosAdapter {
             return Ok(());
         };
         let referenced: HashSet<String> = crate::images::local_images(&note.content)
-            .iter()
-            .filter_map(|name| crate::images::attachment_id(name).map(str::to_owned))
+            .into_iter()
+            .map(|image| image.id)
             .collect();
         let mut kept = Vec::new();
         let mut stale = Vec::new();
@@ -884,7 +900,7 @@ mod tests {
         let body = requests[3].body.as_ref().unwrap();
         assert_eq!(
             body["content"],
-            format!("# Titel\n\n![foto](/file/attachments/{id}/{NAME}#w=320)")
+            format!("# Titel\n\n![foto|320](/file/attachments/{id}/{NAME})")
         );
         assert_eq!(
             body["attachments"],
@@ -948,6 +964,69 @@ mod tests {
     }
 
     #[test]
+    fn attachments_without_filename_in_the_url_are_downloaded_with_a_fallback() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let (url, server) = mock_server_with_responses(vec![
+            (404, String::new()),
+            (200, r#"{"filename":"my photo.png"}"#.to_owned()),
+            (200, "bytes".to_owned()),
+        ])?;
+        let adapter = MemosAdapter::new(&url, "test-token")?;
+        let remote = RemoteMemo {
+            content: "![it](/file/attachments/Jd54omtoGCZew7ZpEiqu7g)".to_owned(),
+            ..remote_memo(None)
+        };
+
+        let localized = adapter.localize_images_into(directory.path(), remote);
+
+        assert_eq!(
+            localized.content,
+            "![it](memonotes-image://memos_Jd54omtoGCZew7ZpEiqu7g)"
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join("memos_Jd54omtoGCZew7ZpEiqu7g"))?,
+            b"bytes"
+        );
+        let requests = server.join().expect("mock server thread panicked")?;
+        let paths: Vec<_> = requests.iter().map(|request| request.url.path()).collect();
+        assert_eq!(
+            paths,
+            [
+                "/memos-server/file/attachments/Jd54omtoGCZew7ZpEiqu7g",
+                "/memos-server/api/v1/attachments/Jd54omtoGCZew7ZpEiqu7g",
+                "/memos-server/file/attachments/Jd54omtoGCZew7ZpEiqu7g/my%20photo.png",
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn web_attachments_are_downloaded_under_encoded_local_names() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let (url, server) = mock_server_with_responses(vec![(200, "bytes".to_owned())])?;
+        let adapter = MemosAdapter::new(&url, "test-token")?;
+        let remote = RemoteMemo {
+            content: "![foto](/file/attachments/abc123/photo.png)".to_owned(),
+            ..remote_memo(None)
+        };
+
+        let localized = adapter.localize_images_into(directory.path(), remote);
+
+        let local = "memos_abc123_70686f746f2e706e67";
+        assert_eq!(
+            localized.content,
+            format!("![foto](memonotes-image://{local})")
+        );
+        assert_eq!(std::fs::read(directory.path().join(local))?, b"bytes");
+        let requests = server.join().expect("mock server thread panicked")?;
+        assert_eq!(
+            requests[0].url.path(),
+            "/memos-server/file/attachments/abc123/photo.png"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn remote_images_are_downloaded_and_mapped_to_local_references() -> Result<()> {
         const NAME: &str = "550e8400-e29b-41d4-a716-446655440000.png";
         let id = &NAME[..36];
@@ -955,7 +1034,7 @@ mod tests {
         let (url, server) = mock_server_with_responses(vec![(200, "bytes".to_owned())])?;
         let adapter = MemosAdapter::new(&url, "test-token")?;
         let remote = RemoteMemo {
-            content: format!("![foto](/file/attachments/{id}/{NAME}#w=320)"),
+            content: format!("![foto|320](/file/attachments/{id}/{NAME})"),
             ..remote_memo(None)
         };
 
@@ -1097,6 +1176,41 @@ mod tests {
         store.save_note(&note.id, "Offline wijziging", "")?;
         assert!(store.sync_backend_events(&account, &retry_adapter).is_err());
         assert!(store.has_backend_events("one")?);
+        Ok(())
+    }
+
+    #[test]
+    fn only_pending_notes_that_exist_remotely_are_prechecked() -> Result<()> {
+        let store = crate::Store::open(":memory:")?;
+        store.add_backend_account("one", "Werk", "memos", "http://127.0.0.1:9")?;
+        let memo = Memo {
+            id: "memos/remote-memo".to_owned(),
+            content: "Origineel".to_owned(),
+            title: None,
+            folder_id: None,
+            pinned: false,
+            archived: false,
+            is_shared: false,
+            updated_at: None,
+        };
+        store.import_backend_snapshot("one", &[], &[memo])?;
+        let existing = store
+            .notes(&crate::NoteFilter {
+                account_id: Some("one".to_owned()),
+                ..Default::default()
+            })?
+            .remove(0);
+        store.save_note(&existing.id, "Gewijzigd", "")?;
+        store.save_note(&existing.id, "Nogmaals gewijzigd", "")?;
+        let created = store.create_note(Some("one"), None)?;
+        store.save_note(&created, "Nieuw", "")?;
+        store.create_note(None, None)?;
+
+        assert_eq!(
+            store.pending_existing_note_resources("one")?,
+            [(existing.id.clone(), "memos/remote-memo".to_owned())]
+        );
+        assert!(store.pending_existing_note_resources("other")?.is_empty());
         Ok(())
     }
 

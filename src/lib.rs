@@ -816,6 +816,45 @@ impl Store {
         )?)
     }
 
+    // Notes with pending changes that already exist remotely, as (local ID, memo name).
+    pub fn pending_existing_note_resources(
+        &self,
+        account_id: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT payload FROM sync_outbox ORDER BY sequence")?;
+        let payloads = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        let mut not_yet_remote = HashSet::new();
+        let mut existing = Vec::new();
+        for payload in payloads {
+            match serde_json::from_str::<SyncEvent>(&payload)? {
+                SyncEvent::NoteCreated { note } | SyncEvent::NoteRestored { note } => {
+                    not_yet_remote.insert(note.id);
+                }
+                SyncEvent::NoteUpdated { note }
+                | SyncEvent::NoteArchived { note }
+                | SyncEvent::NoteUnarchived { note }
+                | SyncEvent::NoteDeleted { note } => {
+                    if note.account_id.as_deref() == Some(account_id)
+                        && !not_yet_remote.contains(&note.id)
+                        && !existing.iter().any(|(id, _)| id == &note.id)
+                    {
+                        let name = self.backend_memo_name(account_id, &note.id)?;
+                        existing.push((note.id, name));
+                    }
+                }
+                SyncEvent::FolderCreated { .. }
+                | SyncEvent::FolderUpdated { .. }
+                | SyncEvent::FolderDeleted { .. } => {}
+            }
+        }
+        Ok(existing)
+    }
+
     pub fn outbox_revision(&self) -> Result<i64> {
         Ok(self.connection.query_row(
             "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'sync_outbox'), 0)",
@@ -1447,7 +1486,14 @@ fn load_note_sync_base(
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|state| serde_json::from_str(&state).map_err(Into::into))
+        .map(|state| {
+            serde_json::from_str::<SyncedNoteState>(&state)
+                .map(|mut state| {
+                    state.content = images::normalize_local_content(&state.content);
+                    state
+                })
+                .map_err(Into::into)
+        })
         .transpose()
 }
 

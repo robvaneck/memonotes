@@ -244,10 +244,16 @@ impl MemosClient {
         .map(|_| ())
     }
 
+    // `filename` may be empty (`/file/attachments/<id>`) and is used verbatim otherwise.
     pub fn download_attachment(&self, id: &str, filename: &str) -> Result<Vec<u8>> {
         let mut endpoint = self.api_base.clone();
         let base_path = self.api_base.path().trim_end_matches("/api/v1");
-        endpoint.set_path(&format!("{base_path}/file/attachments/{id}/{filename}"));
+        let suffix = if filename.is_empty() {
+            String::new()
+        } else {
+            format!("/{filename}")
+        };
+        endpoint.set_path(&format!("{base_path}/file/attachments/{id}{suffix}"));
         let response = self
             .client
             .get(endpoint)
@@ -276,6 +282,25 @@ impl MemosClient {
         Ok(bytes.to_vec())
     }
 
+    // Percent-encoded filename, usable as a URL path segment.
+    pub fn attachment_filename(&self, id: &str) -> Result<Option<String>> {
+        let attachment = self.get_json(self.endpoint(&format!("attachments/{id}"))?)?;
+        Ok(attachment
+            .get("filename")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .map(|name| {
+                name.bytes()
+                    .map(|byte| match byte {
+                        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'~' | b'-' => {
+                            char::from(byte).to_string()
+                        }
+                        _ => format!("%{byte:02X}"),
+                    })
+                    .collect()
+            }))
+    }
+
     pub fn memo_attachment_names(&self, memo_id: &str) -> Result<Vec<String>> {
         let attachments: Vec<RemoteAttachment> =
             self.list_pages(&format!("memos/{memo_id}/attachments"), "attachments")?;
@@ -284,6 +309,14 @@ impl MemosClient {
 
     pub fn uses_plain_http(&self) -> bool {
         self.api_base.scheme() == "http"
+    }
+
+    // Server base URL without trailing slash, as used in absolute attachment links.
+    pub fn origin(&self) -> String {
+        let mut base = self.api_base.clone();
+        let path = base.path().trim_end_matches("/api/v1").to_owned();
+        base.set_path(&path);
+        base.as_str().trim_end_matches('/').to_owned()
     }
 
     pub(crate) fn send_mutation(
