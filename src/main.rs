@@ -6481,6 +6481,24 @@ fn install_editor_format_shortcuts(
             }
         }
     });
+    // Dragged or pasted text carries anchor characters without their widget; drop them.
+    let editor_for_insert = editor.downgrade();
+    buffer.connect_insert_text(move |buffer, iter, text| {
+        if !text.contains('\u{fffc}') {
+            return;
+        }
+        let Some(editor) = editor_for_insert.upgrade() else {
+            return;
+        };
+        if editor.has_css_class("editor-content-replacing") {
+            return;
+        }
+        buffer.stop_signal_emission_by_name("insert-text");
+        let cleaned = text.replace('\u{fffc}', "");
+        if !cleaned.is_empty() {
+            buffer.insert(iter, &cleaned);
+        }
+    });
     let auto_linking = Rc::new(Cell::new(false));
     let auto_linking_for_change = Rc::clone(&auto_linking);
     buffer.connect_changed(move |buffer| {
@@ -7612,6 +7630,39 @@ mod editor_format_tests {
     }
 
     #[test]
+    fn bare_anchor_characters_never_enter_or_leave_the_editor() -> Result<()> {
+        if std::env::var_os("MEMONOTES_EDITOR_FORMAT_TEST").is_none() {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "editor_format_tests::bare_anchor_characters_never_enter_or_leave_the_editor",
+                    "--test-threads=1",
+                ])
+                .env("MEMONOTES_EDITOR_FORMAT_TEST", "1")
+                .status()?;
+            assert!(status.success());
+            return Ok(());
+        }
+        gtk::init()?;
+        let editor = gtk::TextView::new();
+        install_editor_format_shortcuts(&editor, new_editor_image_history());
+        set_editor_view_content(&editor, "Title\nzonder\u{fffc}afbeelding");
+        let buffer = editor.buffer();
+        assert_eq!(
+            markdown_from_editor_buffer(&buffer),
+            "# Title\nzonderafbeelding"
+        );
+
+        let mut end = buffer.end_iter();
+        buffer.insert(&mut end, " en\u{fffc} meer");
+        assert_eq!(
+            markdown_from_editor_buffer(&buffer),
+            "# Title\nzonderafbeelding en meer"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn image_drop_snaps_after_line_text_and_shows_a_cursor_indicator() -> Result<()> {
         if std::env::var_os("MEMONOTES_EDITOR_FORMAT_TEST").is_none() {
             let status = std::process::Command::new(std::env::current_exe()?)
@@ -8554,6 +8605,8 @@ fn remove_editor_anchor_widgets(
 }
 
 fn set_editor_view_content(editor: &gtk::TextView, content: &str) {
+    let content = content.replace('\u{fffc}', "");
+    let content = content.as_str();
     let buffer = editor.buffer();
     let (title, body) = memonotes::memo::editor_parts(content);
     if markdown_from_editor_buffer(&buffer) == memonotes::memo::editor_content(title, body) {
@@ -8796,6 +8849,10 @@ fn serialize_inline_range(
             })
         {
             runs.push((None, Vec::new(), String::new(), Some(image)));
+            continue;
+        }
+        // An anchor without an image widget must never reach the saved Markdown.
+        if *character == '\u{fffc}' {
             continue;
         }
         let marks: Vec<_> = tags

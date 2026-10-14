@@ -759,7 +759,15 @@ impl Store {
                     }
                 }
             };
-            adapter.apply_event(&event)?;
+            let event_is_update = matches!(&event, SyncEvent::NoteUpdated { .. });
+            let base_content = match (event_is_update, &note_sync_state) {
+                (true, Some((note_id, _))) => {
+                    load_note_sync_base(&self.connection, &account.id, note_id)?
+                        .map(|state| state.content)
+                }
+                _ => None,
+            };
+            adapter.apply_event_with_base(&event, base_content.as_deref())?;
             let transaction = self.connection.unchecked_transaction()?;
             if let Some((note_id, state)) = note_sync_state {
                 if let Some(state) = state {

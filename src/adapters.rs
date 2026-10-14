@@ -13,6 +13,10 @@ pub trait BackendAdapter: Send {
     fn list_memos(&self) -> Result<Vec<Memo>>;
     fn list_folders(&self) -> Result<Vec<MemoFolder>>;
     fn apply_event(&self, event: &SyncEvent) -> Result<()>;
+    // `base_content` is the last synced content of the note, when known.
+    fn apply_event_with_base(&self, event: &SyncEvent, _base_content: Option<&str>) -> Result<()> {
+        self.apply_event(event)
+    }
 }
 
 struct MemosMutation {
@@ -338,7 +342,33 @@ impl MemosAdapter {
         Ok(bound)
     }
 
-    fn send_event(&self, event: &SyncEvent, attachments: &[String]) -> Result<()> {
+    fn apply_with_base(&self, event: &SyncEvent, base_content: Option<&str>) -> Result<()> {
+        let content_note = match event {
+            SyncEvent::NoteCreated { note }
+            | SyncEvent::NoteRestored { note }
+            | SyncEvent::NoteUpdated { note } => Some(note),
+            _ => None,
+        };
+        let attachments = match content_note {
+            Some(note) => {
+                let uploaded = self.upload_images(&note.content)?;
+                if uploaded.is_empty() {
+                    uploaded
+                } else {
+                    self.memo_attachments(event, &uploaded)?
+                }
+            }
+            None => Vec::new(),
+        };
+        self.send_event(event, &attachments, base_content)
+    }
+
+    fn send_event(
+        &self,
+        event: &SyncEvent,
+        attachments: &[String],
+        base_content: Option<&str>,
+    ) -> Result<()> {
         let mut mutation = MemosMutation::from_event(event)?;
         mutation.bind_attachments(attachments);
         let created_note = match event {
@@ -370,16 +400,30 @@ impl MemosAdapter {
             mutation.body.as_ref(),
         )?;
         if let SyncEvent::NoteUpdated { note } = event {
-            self.remove_stale_attachments(note, &response)?;
+            self.remove_stale_attachments(note, &response, base_content)?;
         }
         Ok(())
     }
 
-    // Only Memonotes-managed attachments (`<id>/<id>.<ext>`) are pruned; others stay bound.
-    fn remove_stale_attachments(&self, note: &NoteSnapshot, memo: &Value) -> Result<()> {
+    // Attachments are pruned when they were in the last synced content and the note no longer
+    // uses them, or when Memonotes made them itself (`<id>/<id>.<ext>`). Others stay bound.
+    fn remove_stale_attachments(
+        &self,
+        note: &NoteSnapshot,
+        memo: &Value,
+        base_content: Option<&str>,
+    ) -> Result<()> {
         let Some(bound) = memo.get("attachments").and_then(Value::as_array) else {
             return Ok(());
         };
+        let removed_from_text: HashSet<String> = base_content
+            .map(|content| {
+                crate::images::local_images(content)
+                    .into_iter()
+                    .map(|image| image.id)
+                    .collect()
+            })
+            .unwrap_or_default();
         let referenced: HashSet<String> = crate::images::local_images(&note.content)
             .into_iter()
             .map(|image| image.id)
@@ -396,7 +440,7 @@ impl MemosAdapter {
                 .and_then(Value::as_str)
                 .and_then(crate::images::attachment_id)
                 == Some(id);
-            if managed && !referenced.contains(id) {
+            if (managed || removed_from_text.contains(id)) && !referenced.contains(id) {
                 stale.push(id.to_owned());
             } else {
                 kept.push(json!({"name": name}));
@@ -435,24 +479,11 @@ impl MemosAdapter {
 
 impl BackendAdapter for MemosAdapter {
     fn apply_event(&self, event: &SyncEvent) -> Result<()> {
-        let content_note = match event {
-            SyncEvent::NoteCreated { note }
-            | SyncEvent::NoteRestored { note }
-            | SyncEvent::NoteUpdated { note } => Some(note),
-            _ => None,
-        };
-        let attachments = match content_note {
-            Some(note) => {
-                let uploaded = self.upload_images(&note.content)?;
-                if uploaded.is_empty() {
-                    uploaded
-                } else {
-                    self.memo_attachments(event, &uploaded)?
-                }
-            }
-            None => Vec::new(),
-        };
-        self.send_event(event, &attachments)
+        self.apply_with_base(event, None)
+    }
+
+    fn apply_event_with_base(&self, event: &SyncEvent, base_content: Option<&str>) -> Result<()> {
+        self.apply_with_base(event, base_content)
     }
 
     fn check_connection(&self) -> Result<()> {
@@ -868,7 +899,7 @@ mod tests {
         let uploaded = adapter.upload_images_from(directory.path(), &note.content)?;
         assert_eq!(uploaded, [format!("attachments/{id}")]);
         let bound = adapter.memo_attachments(&event, &uploaded)?;
-        adapter.send_event(&event, &bound)?;
+        adapter.send_event(&event, &bound, None)?;
 
         let requests = server.join().expect("mock server thread panicked")?;
         let base = "/memos-server/api/v1";
@@ -1176,6 +1207,43 @@ mod tests {
         store.save_note(&note.id, "Offline wijziging", "")?;
         assert!(store.sync_backend_events(&account, &retry_adapter).is_err());
         assert!(store.has_backend_events("one")?);
+        Ok(())
+    }
+
+    #[test]
+    fn images_removed_from_the_text_are_pruned_even_when_added_by_another_client() -> Result<()> {
+        let mut note = note_snapshot();
+        note.content = "# Titel".to_owned();
+        let updated = json!({
+            "name": format!("memos/{}", note.id),
+            "attachments": [
+                {"name": "attachments/Jd54omtoGCZew7ZpEiqu7g", "filename": "photo.png"},
+                {"name": "attachments/gallery", "filename": "other.png"},
+            ],
+        })
+        .to_string();
+        let (url, server) = mock_server_with_responses(vec![
+            (200, updated),
+            (200, "{}".to_owned()),
+            (200, "{}".to_owned()),
+        ])?;
+        let adapter = MemosAdapter::new(&url, "test-token")?;
+
+        adapter.apply_event_with_base(
+            &SyncEvent::NoteUpdated { note: note.clone() },
+            Some("# Titel\n\n![it](memonotes-image://memos_Jd54omtoGCZew7ZpEiqu7g)"),
+        )?;
+
+        let requests = server.join().expect("mock server thread panicked")?;
+        assert_eq!(
+            requests[1].body.as_ref().unwrap()["attachments"],
+            json!([{"name": "attachments/gallery"}])
+        );
+        assert_eq!(requests[2].method, "DELETE");
+        assert_eq!(
+            requests[2].url.path(),
+            "/memos-server/api/v1/attachments/Jd54omtoGCZew7ZpEiqu7g"
+        );
         Ok(())
     }
 
