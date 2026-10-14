@@ -42,9 +42,15 @@ API's computed title property; the list preview omits that title line.
 Imported content stays unchanged until edited. Existing
 local notes with separate titles are combined on their next edit without
 discarding the body.
-The editor is currently plain text;
-WYSIWYG formatting and images are not implemented yet. Basic two-way text
-synchronization detects divergent local/server edits and keeps both versions
+The editor supports inline formatting, headings, lists, links, and selectable,
+draggable local inline images that can be resized from their corners while
+keeping their aspect ratio (the width is stored as `#w=<pixels>` in the image URL). Picked image files are stored in app-private data and referenced by a
+Memonotes-only URI. For Memos accounts, the image is uploaded as an attachment
+(its ID is the local file's UUID), linked to the memo, and the memo content
+references `/file/attachments/<id>/<file>`; fetched memos with such references
+download the file into the local image directory. Attachments added by other
+clients are not mapped yet, and unused attachments are not removed remotely.
+Two-way text synchronization detects divergent local/server edits and keeps both versions
 until the user chooses which to keep. Stable-ID creates are reconciled after
 errors or HTTP 409 by fetching that ID and acknowledging only an exact match.
 Automatic merging and live multi-client race validation remain open.

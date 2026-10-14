@@ -14,6 +14,7 @@ pub struct RenderedMarkdown {
     pub spans: Vec<MarkupSpan>,
     pub headings: Vec<HeadingSpan>,
     pub links: Vec<LinkSpan>,
+    pub images: Vec<ImageSpan>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,6 +29,13 @@ pub struct LinkSpan {
     pub url: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageSpan {
+    pub range: Range<usize>,
+    pub url: String,
+    pub alt: String,
+}
+
 pub fn render_markdown_source(markdown: &str) -> RenderedMarkdown {
     let source_spans = markdown_style_spans(markdown);
     let (source_headings, heading_markers) = markdown_heading_ranges(markdown);
@@ -39,6 +47,8 @@ pub fn render_markdown_source(markdown: &str) -> RenderedMarkdown {
     hidden_ranges.extend(heading_markers);
     let source_links = markdown_link_ranges(markdown);
     hidden_ranges.extend(source_links.iter().flat_map(|link| link.hidden.clone()));
+    let source_images = markdown_image_ranges(markdown);
+    hidden_ranges.extend(source_images.iter().map(|image| image.range.clone()));
     let mut output = String::with_capacity(markdown.len());
     let mut output_offsets = vec![0; markdown.len() + 1];
 
@@ -48,6 +58,12 @@ pub fn render_markdown_source(markdown: &str) -> RenderedMarkdown {
             .iter()
             .any(|range| range.start <= byte_offset && byte_offset < range.end);
         output_offsets[byte_offset] = output.len();
+        if source_images
+            .iter()
+            .any(|image| image.range.start == byte_offset)
+        {
+            output.push('\u{fffc}');
+        }
         if !hidden {
             output.push(character);
         }
@@ -92,13 +108,62 @@ pub fn render_markdown_source(markdown: &str) -> RenderedMarkdown {
             })
         })
         .collect();
+    let images = source_images
+        .into_iter()
+        .map(|image| {
+            let start = output_offsets[image.range.start];
+            ImageSpan {
+                range: start..start + '\u{fffc}'.len_utf8(),
+                url: image.url,
+                alt: image.alt,
+            }
+        })
+        .collect();
 
     RenderedMarkdown {
         text: output,
         spans,
         headings,
         links,
+        images,
     }
+}
+
+struct SourceImage {
+    range: Range<usize>,
+    url: String,
+    alt: String,
+}
+
+fn markdown_image_ranges(markdown: &str) -> Vec<SourceImage> {
+    let options = Options::ENABLE_TASKLISTS | Options::ENABLE_STRIKETHROUGH;
+    let mut images = Vec::new();
+    let mut open: Option<SourceImage> = None;
+
+    for (event, range) in Parser::new_ext(markdown, options).into_offset_iter() {
+        match event {
+            Event::Start(Tag::Image { dest_url, .. }) => {
+                open = Some(SourceImage {
+                    range: range.start..range.end,
+                    url: dest_url.to_string(),
+                    alt: String::new(),
+                });
+            }
+            Event::Text(text) | Event::Code(text) => {
+                if let Some(image) = open.as_mut() {
+                    image.alt.push_str(&text);
+                }
+            }
+            Event::End(TagEnd::Image) => {
+                if let Some(mut image) = open.take() {
+                    image.range.end = range.end;
+                    images.push(image);
+                }
+            }
+            _ => {}
+        }
+    }
+    images
 }
 
 struct SourceLink {
@@ -158,12 +223,15 @@ pub fn normalize_link_url(input: &str) -> Option<String> {
         None if input.contains('@') && !input.contains('/') => format!("mailto:{input}"),
         None => format!("https://{input}"),
     };
-    is_openable_link(&url)
-        .then(|| url.split_whitespace().collect::<Vec<_>>().join("%20"))
+    is_openable_link(&url).then(|| url.split_whitespace().collect::<Vec<_>>().join("%20"))
 }
 
 pub fn is_openable_link(url: &str) -> bool {
-    let scheme = url.split(':').next().unwrap_or_default().to_ascii_lowercase();
+    let scheme = url
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     matches!(scheme.as_str(), "http" | "https" | "mailto") && url.len() > scheme.len() + 1
 }
 
@@ -191,7 +259,9 @@ fn markdown_heading_ranges(markdown: &str) -> (Vec<(Range<usize>, u8)>, Vec<Rang
     let mut offset = 0;
 
     for line_with_ending in markdown.split_inclusive('\n') {
-        let line = line_with_ending.strip_suffix('\n').unwrap_or(line_with_ending);
+        let line = line_with_ending
+            .strip_suffix('\n')
+            .unwrap_or(line_with_ending);
         let trimmed = line.trim_start_matches(' ');
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
             fenced_code = !fenced_code;
@@ -200,7 +270,10 @@ fn markdown_heading_ranges(markdown: &str) -> (Vec<(Range<usize>, u8)>, Vec<Rang
             let marker_length = trimmed.bytes().take_while(|byte| *byte == b'#').count();
             if indentation <= 3
                 && (1..=6).contains(&marker_length)
-                && trimmed.as_bytes().get(marker_length).is_some_and(u8::is_ascii_whitespace)
+                && trimmed
+                    .as_bytes()
+                    .get(marker_length)
+                    .is_some_and(u8::is_ascii_whitespace)
             {
                 let content_start = offset + indentation + marker_length + 1;
                 let content_end = offset + line.len();
@@ -1191,20 +1264,33 @@ mod tests {
 
     #[test]
     fn markdown_rendering_hides_link_syntax_and_reports_link_ranges() {
-        let rendered = render_markdown_source("é [**site**](https://example.test/a_(b)) and <https://x.test>");
+        let rendered =
+            render_markdown_source("é [**site**](https://example.test/a_(b)) and <https://x.test>");
 
         assert_eq!(rendered.text, "é site and https://x.test");
         assert_eq!(rendered.links.len(), 2);
         assert_eq!(&rendered.text[rendered.links[0].range.clone()], "site");
         assert_eq!(rendered.links[0].url, "https://example.test/a_(b)");
-        assert_eq!(&rendered.text[rendered.links[1].range.clone()], "https://x.test");
+        assert_eq!(
+            &rendered.text[rendered.links[1].range.clone()],
+            "https://x.test"
+        );
     }
 
     #[test]
     fn link_urls_are_normalized_and_restricted_to_safe_schemes() {
-        assert_eq!(normalize_link_url(" example.test/a b "), Some("https://example.test/a%20b".into()));
-        assert_eq!(normalize_link_url("me@example.test"), Some("mailto:me@example.test".into()));
-        assert_eq!(normalize_link_url("http://example.test"), Some("http://example.test".into()));
+        assert_eq!(
+            normalize_link_url(" example.test/a b "),
+            Some("https://example.test/a%20b".into())
+        );
+        assert_eq!(
+            normalize_link_url("me@example.test"),
+            Some("mailto:me@example.test".into())
+        );
+        assert_eq!(
+            normalize_link_url("http://example.test"),
+            Some("http://example.test".into())
+        );
         assert_eq!(normalize_link_url("javascript:alert(1)"), None);
         assert_eq!(normalize_link_url("  "), None);
         assert!(!is_openable_link("file:///etc/passwd"));

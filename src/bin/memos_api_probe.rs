@@ -5,10 +5,7 @@ use memonotes::i18n::tr;
 fn main() -> Result<()> {
     let adapter = MemosAdapter::from_env()?;
     if adapter.uses_plain_http() {
-        eprintln!(
-            "{}",
-            tr("api.memos.warning.insecure_http_transport")
-        );
+        eprintln!("{}", tr("api.memos.warning.insecure_http_transport"));
     }
     adapter.check_connection()?;
     let memos = adapter.list_memos()?;

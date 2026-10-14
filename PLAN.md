@@ -4,8 +4,8 @@ Oorspronkelijk plan: 2026-10-05. Stand bijgewerkt: 2026-10-13.
 Status: GTK-desktopapp met SQLite, meerdere Memos-accounts, achtergrondophalen en
 automatische outbox-uploads. Sync bewaart basisversies, detecteert conflicten,
 reconcilieert bevestigde remote deletions en herstelt onzekere creates. De editor
-is nog platte tekst; WYSIWYG en afbeeldingen zijn nog niet gebouwd. Automatisch
-samenvoegen en live multi-client racevalidatie blijven open.
+ondersteunt WYSIWYG-opmaak en lokale inline afbeeldingen; Memos-attachment-sync,
+automatisch samenvoegen en live multi-client racevalidatie blijven open.
 Projectmap: /home/fedora/repos/memonotes.
 De onderstaande productafspraken beschrijven het doel; de checklist geeft aan wat
 daadwerkelijk in de huidige code is gerealiseerd. Zie ook [README.md](README.md).
@@ -34,7 +34,7 @@ daadwerkelijk in de huidige code is gerealiseerd. Zie ook [README.md](README.md)
 - [x] Core Memos-integratie live getest tegen de doelserver en werkend.
 - [x] Veilige map-/spaceverwijdering met drie dialoogkeuzes: annuleren, map verwijderen met behoud van notities, of map en alle notities verwijderen. Note-moves/-deletions worden voor `FolderDeleted` gequeued.
 - [x] Titel en body vormen één gesynchroniseerd Markdown-document. Legacy-notities met losse titel worden bij bewerken naar een eerste H1 omgezet zonder de body te verliezen; ongewijzigde inhoud maakt geen nieuw sync-event.
-- [x] Editor toont inline vet/cursief/onderstrepen als opmaak, koppen H1-H6 en alineakeuze via de werkbalk, aanklikbare checklists, niet-selecteerbare bulletmarkeringen en GTK undo/redo; opslaan vertaalt dit terug naar Memos-Markdown. Tab/Shift+Tab springen lijstitems in/uit; Enter behoudt het niveau en springt bij een leeg genest item eerst uit.
+- [x] Editor toont inline vet/cursief/onderstrepen als opmaak, koppen H1-H6 en alineakeuze via de werkbalk, aanklikbare checklists, niet-selecteerbare bulletmarkeringen, GTK undo/redo en lokaal ingevoegde inline afbeeldingen die selecteerbaar, versleepbaar en via de hoeken te schalen zijn (verhouding blijft behouden); opslaan vertaalt dit terug naar Markdown. Afbeeldingsbestanden staan app-privé en gebruiken een lokale verwijzing.
 - [x] Drieweg-conflictdetectie bewaart basis, lokale en remote versie; de gebruiker kiest lokaal of server. Lokale deletes die botsen met serverwijzigingen zijn ook oplosbaar.
 - [x] Complete accountrefreshes bevestigen ontbrekende memo's met een directe GET; alleen 404 geldt als remote delete. Pending lokale wijzigingen worden als conflict bewaard.
 - [x] Onzekere creates en HTTP 409 reconciliëren via de stabiele memo-ID; alleen een exact overeenkomende remote resource wordt bevestigd.
@@ -48,8 +48,8 @@ daadwerkelijk in de huidige code is gerealiseerd. Zie ook [README.md](README.md)
 - [x] Archiveren/terugzetten werkt remote; end-to-end getest op de echte server.
 - [x] Gedeelde Memos-spaces en niet-private notities uit de UI filteren; gedeelde data alleen in de sync-cache behouden.
 - [x] GTK-editor undo/redo met focusbewuste Ctrl+Z-routering en bijgewerkte knopstatus.
-- [ ] WYSIWYG-editor afronden: overige blokopmaak, afbeeldingen en verdere end-to-end roundtrips testen. Inline opmaak, koppen/alinea's, checklist-, bullet-, link- en undo/redo-acties zijn aangesloten.
-- [ ] Memos-attachments implementeren en live testen: v0.31 biedt upload- en memo-koppelendpoints; afbeeldingen invoegen, downloaden en offline cachen ontbreken nog.
+- [ ] WYSIWYG-editor afronden: overige blokopmaak en verdere end-to-end roundtrips testen. Inline opmaak, koppen/alinea's, checklist-, bullet-, link-, lokale afbeelding- en undo/redo-acties zijn aangesloten.
+- [ ] Memos-attachments live testen: uploaden (met koppeling aan de memo), downloaden en lokaal cachen zijn gebouwd en met mocktests gedekt (attachment-ID = lokale UUID, inhoud verwijst naar `/file/attachments/<id>/<bestand>`); live validatie tegen de doelserver, het opruimen van niet meer gebruikte attachments en afbeeldingen die buiten Memonotes zijn toegevoegd ontbreken.
 - [ ] Markdown-export met folders, metadata en afbeeldingen.
 - [ ] Expliciete onboarding/lokale import en veilig ontkoppelen met pending wijzigingen/export.
 - [ ] Smalle-vensternavigatie, onthouden paneelbreedtes/selectie, toegankelijkheid en zichtbare sync/conflictstatus.

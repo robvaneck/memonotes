@@ -23,6 +23,24 @@ struct MemosMutation {
 }
 
 impl MemosMutation {
+    fn bind_attachments(&mut self, attachments: &[String]) {
+        if attachments.is_empty() {
+            return;
+        }
+        let Some(body) = self.body.as_mut() else {
+            return;
+        };
+        body["attachments"] = attachments
+            .iter()
+            .map(|name| json!({"name": name}))
+            .collect();
+        for (key, value) in &mut self.query {
+            if *key == "updateMask" {
+                *value = format!("{value},attachments");
+            }
+        }
+    }
+
     fn from_event(event: &SyncEvent) -> Result<Self> {
         match event {
             SyncEvent::FolderCreated { folder } | SyncEvent::FolderUpdated { folder } => {
@@ -145,7 +163,7 @@ fn memo_body(note: &NoteSnapshot) -> Result<Value> {
         .map(|folder_id| resource_id(folder_id, "spaces").map(|id| format!("spaces/{id}")))
         .transpose()?;
     Ok(json!({
-        "content": note.content,
+        "content": crate::images::to_remote_content(&note.content),
         "pinned": note.pinned,
         "state": memo_state(note.archived),
         "space": space,
@@ -175,7 +193,7 @@ impl MemosAdapter {
 
     pub fn get_memo(&self, name: &str) -> Result<Memo> {
         let id = resource_id(name, "memos")?;
-        let remote = self.client.get_memo(id)?;
+        let remote = self.localize_images(self.client.get_memo(id)?);
         let shared_space = self.remote_space_is_shared(remote.space.as_deref())?;
         memo_from_remote(remote, shared_space)
     }
@@ -185,6 +203,7 @@ impl MemosAdapter {
         let Some(remote) = self.client.get_memo_if_exists(id)? else {
             return Ok(None);
         };
+        let remote = self.localize_images(remote);
         let shared_space = self.remote_space_is_shared(remote.space.as_deref())?;
         Ok(Some(memo_from_remote(remote, shared_space)?))
     }
@@ -205,22 +224,107 @@ impl MemosAdapter {
         self.client
             .list_space_memos(id)?
             .into_iter()
-            .map(|remote| memo_from_remote(remote, is_shared))
+            .map(|remote| memo_from_remote(self.localize_images(remote), is_shared))
             .collect()
     }
 
-    fn remote_space_is_shared(&self, name: Option<&str>) -> Result<bool> {
-        let Some(name) = name.filter(|name| !name.is_empty()) else {
-            return Ok(false);
-        };
-        let id = resource_id(name, "spaces")?;
-        Ok(self.client.get_space(id)?.member_count != 1)
+    // Serves remote attachments as local image files so stored content keeps local references.
+    fn localize_images(&self, remote: RemoteMemo) -> RemoteMemo {
+        if crate::images::remote_images(&remote.content).is_empty() {
+            return remote;
+        }
+        match crate::images::image_directory() {
+            Ok(directory) => self.localize_images_into(&directory, remote),
+            Err(error) => {
+                eprintln!("{error:#}");
+                remote
+            }
+        }
     }
-}
 
-impl BackendAdapter for MemosAdapter {
-    fn apply_event(&self, event: &SyncEvent) -> Result<()> {
-        let mutation = MemosMutation::from_event(event)?;
+    fn localize_images_into(
+        &self,
+        directory: &std::path::Path,
+        mut remote: RemoteMemo,
+    ) -> RemoteMemo {
+        for name in crate::images::remote_images(&remote.content) {
+            if let Err(error) = self.download_image(directory, &name) {
+                eprintln!("{error:#}");
+            }
+        }
+        remote.content = crate::images::to_local_content(&remote.content);
+        remote
+    }
+
+    fn download_image(&self, directory: &std::path::Path, name: &str) -> Result<()> {
+        let path = directory.join(name);
+        if path.exists() {
+            return Ok(());
+        }
+        let id = crate::images::attachment_id(name)
+            .context(tr("api.memos.error.invalid_resource_id"))?;
+        let bytes = self.client.download_attachment(id, name)?;
+        std::fs::create_dir_all(directory)?;
+        let partial = path.with_extension("part");
+        std::fs::write(&partial, bytes)?;
+        std::fs::rename(partial, path)?;
+        Ok(())
+    }
+
+    // Returns the attachment names that the memo should link to.
+    fn upload_images(&self, content: &str) -> Result<Vec<String>> {
+        if crate::images::local_images(content).is_empty() {
+            return Ok(Vec::new());
+        }
+        self.upload_images_from(&crate::images::image_directory()?, content)
+    }
+
+    fn upload_images_from(
+        &self,
+        directory: &std::path::Path,
+        content: &str,
+    ) -> Result<Vec<String>> {
+        let mut names = Vec::new();
+        for name in crate::images::local_images(content) {
+            let id = crate::images::attachment_id(&name)
+                .context(tr("api.memos.error.invalid_resource_id"))?;
+            if !self.client.attachment_exists(id)? {
+                let path = directory.join(&name);
+                if !path.is_file() {
+                    continue;
+                }
+                let bytes =
+                    std::fs::read(&path).context(tr("api.memos.error.image_read_failed"))?;
+                self.client.upload_attachment(
+                    id,
+                    &name,
+                    crate::images::mime_type(&name),
+                    &bytes,
+                )?;
+            }
+            names.push(format!("attachments/{id}"));
+        }
+        Ok(names)
+    }
+
+    // Memos rejects content that embeds an attachment not bound to the memo in the same mutation.
+    fn memo_attachments(&self, event: &SyncEvent, attachments: &[String]) -> Result<Vec<String>> {
+        let SyncEvent::NoteUpdated { note } = event else {
+            return Ok(attachments.to_vec());
+        };
+        let id = resource_id(&note.id, "memos")?;
+        let mut bound = self.client.memo_attachment_names(id)?;
+        for name in attachments {
+            if !bound.contains(name) {
+                bound.push(name.clone());
+            }
+        }
+        Ok(bound)
+    }
+
+    fn send_event(&self, event: &SyncEvent, attachments: &[String]) -> Result<()> {
+        let mut mutation = MemosMutation::from_event(event)?;
+        mutation.bind_attachments(attachments);
         let created_note = match event {
             SyncEvent::NoteCreated { note } | SyncEvent::NoteRestored { note } => Some(note),
             _ => None,
@@ -243,12 +347,96 @@ impl BackendAdapter for MemosAdapter {
                 }
             };
         }
-        self.client.send_mutation(
+        let response = self.client.send_mutation_json(
             mutation.method,
             &mutation.resource,
             &mutation.query,
             mutation.body.as_ref(),
-        )
+        )?;
+        if let SyncEvent::NoteUpdated { note } = event {
+            self.remove_stale_attachments(note, &response)?;
+        }
+        Ok(())
+    }
+
+    // Only Memonotes-managed attachments (`<id>/<id>.<ext>`) are pruned; others stay bound.
+    fn remove_stale_attachments(&self, note: &NoteSnapshot, memo: &Value) -> Result<()> {
+        let Some(bound) = memo.get("attachments").and_then(Value::as_array) else {
+            return Ok(());
+        };
+        let referenced: HashSet<String> = crate::images::local_images(&note.content)
+            .iter()
+            .filter_map(|name| crate::images::attachment_id(name).map(str::to_owned))
+            .collect();
+        let mut kept = Vec::new();
+        let mut stale = Vec::new();
+        for attachment in bound {
+            let Some(name) = attachment.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let id = name.strip_prefix("attachments/").unwrap_or(name);
+            let managed = attachment
+                .get("filename")
+                .and_then(Value::as_str)
+                .and_then(crate::images::attachment_id)
+                == Some(id);
+            if managed && !referenced.contains(id) {
+                stale.push(id.to_owned());
+            } else {
+                kept.push(json!({"name": name}));
+            }
+        }
+        if stale.is_empty() {
+            return Ok(());
+        }
+        let memo_name = format!("memos/{}", resource_id(&note.id, "memos")?);
+        self.client.send_mutation(
+            Method::PATCH,
+            &memo_name,
+            &[("updateMask", "attachments".to_owned())],
+            Some(&json!({"name": memo_name, "attachments": kept})),
+        )?;
+        for id in stale {
+            // A failed delete only leaves an unbound attachment behind.
+            if let Err(error) =
+                self.client
+                    .send_mutation(Method::DELETE, &format!("attachments/{id}"), &[], None)
+            {
+                eprintln!("{error:#}");
+            }
+        }
+        Ok(())
+    }
+
+    fn remote_space_is_shared(&self, name: Option<&str>) -> Result<bool> {
+        let Some(name) = name.filter(|name| !name.is_empty()) else {
+            return Ok(false);
+        };
+        let id = resource_id(name, "spaces")?;
+        Ok(self.client.get_space(id)?.member_count != 1)
+    }
+}
+
+impl BackendAdapter for MemosAdapter {
+    fn apply_event(&self, event: &SyncEvent) -> Result<()> {
+        let content_note = match event {
+            SyncEvent::NoteCreated { note }
+            | SyncEvent::NoteRestored { note }
+            | SyncEvent::NoteUpdated { note } => Some(note),
+            _ => None,
+        };
+        let attachments = match content_note {
+            Some(note) => {
+                let uploaded = self.upload_images(&note.content)?;
+                if uploaded.is_empty() {
+                    uploaded
+                } else {
+                    self.memo_attachments(event, &uploaded)?
+                }
+            }
+            None => Vec::new(),
+        };
+        self.send_event(event, &attachments)
     }
 
     fn check_connection(&self) -> Result<()> {
@@ -267,6 +455,7 @@ impl BackendAdapter for MemosAdapter {
             .list_memos()?
             .into_iter()
             .map(|remote| {
+                let remote = self.localize_images(remote);
                 let shared_space = remote
                     .space
                     .as_ref()
@@ -304,7 +493,7 @@ fn remote_matches_note(remote: &RemoteMemo, note: &NoteSnapshot) -> bool {
         format!("memos/{}", note.id)
     };
     remote.name == expected_name
-        && remote.content == note.content
+        && remote.content == crate::images::to_remote_content(&note.content)
         && remote.pinned == note.pinned
         && state_matches
         && remote_space == expected_space
@@ -637,6 +826,152 @@ mod tests {
             assert_eq!(&request.body, body);
             assert_eq!(request.authorization, "Bearer test-token");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn local_images_are_uploaded_and_bound_in_the_memo_mutation() -> Result<()> {
+        const NAME: &str = "550e8400-e29b-41d4-a716-446655440000.png";
+        let id = &NAME[..36];
+        let directory = tempfile::tempdir()?;
+        std::fs::write(directory.path().join(NAME), b"fo")?;
+        let mut note = note_snapshot();
+        note.content = format!("# Titel\n\n![foto](memonotes-image://{NAME}#w=320)");
+        let (url, server) = mock_server_with_responses(vec![
+            (404, String::new()),
+            (200, "{}".to_owned()),
+            (
+                200,
+                r#"{"attachments":[{"name":"attachments/other"}]}"#.to_owned(),
+            ),
+            (200, "{}".to_owned()),
+        ])?;
+        let adapter = MemosAdapter::new(&url, "test-token")?;
+        let event = SyncEvent::NoteUpdated { note: note.clone() };
+
+        let uploaded = adapter.upload_images_from(directory.path(), &note.content)?;
+        assert_eq!(uploaded, [format!("attachments/{id}")]);
+        let bound = adapter.memo_attachments(&event, &uploaded)?;
+        adapter.send_event(&event, &bound)?;
+
+        let requests = server.join().expect("mock server thread panicked")?;
+        let base = "/memos-server/api/v1";
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(requests[0].url.path(), format!("{base}/attachments/{id}"));
+        assert_eq!(requests[1].method, "POST");
+        assert_eq!(requests[1].url.path(), format!("{base}/attachments"));
+        assert_eq!(
+            requests[1].url.query_pairs().next().unwrap(),
+            ("attachmentId".into(), id.into())
+        );
+        assert_eq!(
+            requests[1].body,
+            Some(json!({"filename": NAME, "type": "image/png", "content": "Zm8="}))
+        );
+        assert_eq!(requests[2].method, "GET");
+        assert_eq!(
+            requests[2].url.path(),
+            format!("{base}/memos/{}/attachments", note.id)
+        );
+        assert_eq!(requests[3].method, "PATCH");
+        assert_eq!(
+            requests[3].url.query_pairs().next().unwrap(),
+            (
+                "updateMask".into(),
+                "content,pinned,state,space,attachments".into()
+            )
+        );
+        let body = requests[3].body.as_ref().unwrap();
+        assert_eq!(
+            body["content"],
+            format!("# Titel\n\n![foto](/file/attachments/{id}/{NAME}#w=320)")
+        );
+        assert_eq!(
+            body["attachments"],
+            json!([{"name": "attachments/other"}, {"name": format!("attachments/{id}")}])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn removed_images_are_unbound_and_deleted_but_foreign_attachments_stay() -> Result<()> {
+        const NAME: &str = "550e8400-e29b-41d4-a716-446655440000.png";
+        let id = &NAME[..36];
+        let mut note = note_snapshot();
+        note.content = "# Titel".to_owned();
+        let updated = json!({
+            "name": format!("memos/{}", note.id),
+            "attachments": [
+                {"name": format!("attachments/{id}"), "filename": NAME},
+                {"name": "attachments/web", "filename": "photo.png"},
+            ],
+        })
+        .to_string();
+        let (url, server) = mock_server_with_responses(vec![
+            (200, updated),
+            (200, "{}".to_owned()),
+            (200, "{}".to_owned()),
+        ])?;
+        let adapter = MemosAdapter::new(&url, "test-token")?;
+
+        adapter.apply_event(&SyncEvent::NoteUpdated { note: note.clone() })?;
+
+        let requests = server.join().expect("mock server thread panicked")?;
+        let base = "/memos-server/api/v1";
+        assert_eq!(requests[1].method, "PATCH");
+        assert_eq!(requests[1].url.path(), format!("{base}/memos/{}", note.id));
+        assert_eq!(
+            requests[1].url.query_pairs().next().unwrap(),
+            ("updateMask".into(), "attachments".into())
+        );
+        assert_eq!(
+            requests[1].body.as_ref().unwrap()["attachments"],
+            json!([{"name": "attachments/web"}])
+        );
+        assert_eq!(requests[2].method, "DELETE");
+        assert_eq!(requests[2].url.path(), format!("{base}/attachments/{id}"));
+        Ok(())
+    }
+
+    #[test]
+    fn created_memos_carry_their_attachments_in_the_create_body() -> Result<()> {
+        let mut mutation = MemosMutation::from_event(&SyncEvent::NoteCreated {
+            note: note_snapshot(),
+        })?;
+        mutation.bind_attachments(&["attachments/one".to_owned()]);
+        assert_eq!(
+            mutation.body.unwrap()["attachments"],
+            json!([{"name": "attachments/one"}])
+        );
+        assert_eq!(mutation.query, [("memoId", note_snapshot().id)]);
+        Ok(())
+    }
+
+    #[test]
+    fn remote_images_are_downloaded_and_mapped_to_local_references() -> Result<()> {
+        const NAME: &str = "550e8400-e29b-41d4-a716-446655440000.png";
+        let id = &NAME[..36];
+        let directory = tempfile::tempdir()?;
+        let (url, server) = mock_server_with_responses(vec![(200, "bytes".to_owned())])?;
+        let adapter = MemosAdapter::new(&url, "test-token")?;
+        let remote = RemoteMemo {
+            content: format!("![foto](/file/attachments/{id}/{NAME}#w=320)"),
+            ..remote_memo(None)
+        };
+
+        let localized = adapter.localize_images_into(directory.path(), remote);
+
+        assert_eq!(
+            localized.content,
+            format!("![foto](memonotes-image://{NAME}#w=320)")
+        );
+        let stored = directory.path().join(NAME);
+        assert_eq!(std::fs::read(stored)?, b"bytes");
+        let requests = server.join().expect("mock server thread panicked")?;
+        assert_eq!(
+            requests[0].url.path(),
+            format!("/memos-server/file/attachments/{id}/{NAME}")
+        );
         Ok(())
     }
 

@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use libadwaita as adw;
 use memonotes::adapters::{BackendAdapter, MemosAdapter};
 use memonotes::editor_document::{
-    LinkSpan, Mark, MarkupSpan, is_openable_link, markdown_inline_text, markdown_link,
+    ImageSpan, LinkSpan, Mark, MarkupSpan, is_openable_link, markdown_inline_text, markdown_link,
     markdown_preview_text, normalize_link_url, render_markdown_source,
 };
 use memonotes::i18n::tr;
@@ -76,6 +76,57 @@ enum ActiveNoteFilter {
 #[derive(Clone)]
 enum UndoOperation {
     Archive(Note),
+}
+
+#[derive(Clone)]
+struct EditorSnapshot {
+    markdown: String,
+    cursor: i32,
+}
+
+#[derive(Clone)]
+struct EditorImageChange {
+    before: EditorSnapshot,
+    after: EditorSnapshot,
+}
+
+#[derive(Default)]
+struct EditorImageHistory {
+    undo: Vec<EditorImageChange>,
+    redo: Vec<EditorImageChange>,
+    internal_change: bool,
+    handles: Vec<gtk::Widget>,
+    handle_positions: Vec<(i32, i32)>,
+    resize_target: Option<gtk::glib::WeakRef<gtk::Widget>>,
+    resize_gesture: Option<gtk::GestureDrag>,
+    pending_delete: Option<EditorSnapshot>,
+}
+
+type SharedEditorImageHistory = Rc<RefCell<EditorImageHistory>>;
+
+fn new_editor_image_history() -> SharedEditorImageHistory {
+    Rc::new(RefCell::new(EditorImageHistory::default()))
+}
+
+thread_local! {
+    static EDITOR_HISTORIES: RefCell<Vec<(gtk::glib::WeakRef<gtk::TextView>, SharedEditorImageHistory)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+fn register_editor_image_history(editor: &gtk::TextView, history: &SharedEditorImageHistory) {
+    EDITOR_HISTORIES.with_borrow_mut(|entries| {
+        entries.retain(|(weak, _)| weak.upgrade().is_some());
+        entries.push((editor.downgrade(), Rc::clone(history)));
+    });
+}
+
+fn editor_image_history(editor: &gtk::TextView) -> Option<SharedEditorImageHistory> {
+    EDITOR_HISTORIES.with_borrow(|entries| {
+        entries
+            .iter()
+            .find(|(weak, _)| weak.upgrade().as_ref() == Some(editor))
+            .map(|(_, history)| Rc::clone(history))
+    })
 }
 
 impl ActiveNoteFilter {
@@ -400,9 +451,10 @@ fn build_window(application: &Application) -> Result<()> {
 
     let editor = gtk::Box::new(gtk::Orientation::Vertical, 12);
     editor.add_css_class("note-detail-surface");
-    let format_toolbar = editor_format_toolbar(&content);
+    let image_history = new_editor_image_history();
+    let format_toolbar = editor_format_toolbar(&content, Rc::clone(&image_history));
     editor.append(&format_toolbar);
-    install_editor_format_shortcuts(&content);
+    install_editor_format_shortcuts(&content, image_history);
     let editor_actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     editor_actions.append(&pin_button);
     editor_actions.append(&archive_button);
@@ -1906,7 +1958,7 @@ fn show_about_window(parent: &ApplicationWindow) {
     header.pack_end(&close_controls);
 
     let about_content = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    let app_icon = gtk::Image::from_file(concat!(env!("CARGO_MANIFEST_DIR"), "/icon.svg"));
+    let app_icon = gtk::Image::from_file(concat!(env!("CARGO_MANIFEST_DIR"), "/icon11.svg"));
     app_icon.set_pixel_size(128);
     app_icon.add_css_class("icon-dropshadow");
     app_icon.set_halign(gtk::Align::Center);
@@ -3381,7 +3433,10 @@ fn note_detail_css(dark: bool) -> String {
          .note-color-swatch {{ border-radius: 50px; border: 1px solid alpha(@theme_fg_color, 0.18); }} \
          button.task-checkbox {{ min-width: 16px; min-height: 16px; padding: 0; border-radius: 50%; border: 1px solid #3584e4; background: transparent; box-shadow: none; transform: translate(0px, 5px); }} \
          button.task-checkbox:checked {{ background: #3584e4; color: white; }} \
-         button.task-checkbox label {{ font-size: 14px; font-weight: 700; }} "
+         button.task-checkbox label {{ font-size: 14px; font-weight: 700; }} \
+         picture.editor-image-selected {{ border: 2px solid @accent_color; }} \
+         box.editor-image-drop-indicator {{ background-color: @accent_bg_color; border-radius: 1px; }} \
+         box.editor-image-handle {{ background-color: @accent_bg_color; border: 2px solid white; border-radius: 50%; }} "
     );
     for &(color, _, _, _) in &NOTE_COLOR_PALETTE {
         let value = note_color_value(color, dark);
@@ -3934,8 +3989,15 @@ fn connect_events(state: &Rc<WindowState>, new_note: &gtk::Button) {
     track_signal(state, new_note, handler);
 
     let state_for_content = Rc::clone(state);
+    let content_for_change = state.content.downgrade();
     let buffer = state.content.buffer();
     let handler = buffer.connect_changed(move |buffer| {
+        if content_for_change
+            .upgrade()
+            .is_some_and(|editor| editor.has_css_class("editor-image-moving"))
+        {
+            return;
+        }
         style_note_heading(buffer);
         let markdown = markdown_from_editor_buffer(buffer);
         save_current(&state_for_content, &markdown);
@@ -4844,8 +4906,9 @@ fn open_note_window(application: &gtk::Application, state: &Rc<WindowState>, not
     prepare_empty_heading(&content);
     set_editor_view_content(&content, &note.editor_document());
     style_note_heading(&content.buffer());
-    let format_toolbar = editor_format_toolbar(&content);
-    install_editor_format_shortcuts(&content);
+    let image_history = new_editor_image_history();
+    let format_toolbar = editor_format_toolbar(&content, Rc::clone(&image_history));
+    install_editor_format_shortcuts(&content, image_history);
 
     let editor = gtk::Box::new(gtk::Orientation::Vertical, 12);
     editor.add_css_class("note-detail-surface");
@@ -4878,9 +4941,16 @@ fn open_note_window(application: &gtk::Application, state: &Rc<WindowState>, not
     });
 
     let buffer = content.buffer();
+    let content_for_change = content.downgrade();
     let note_id = note.id.clone();
     let state_for_content = Rc::downgrade(state);
     let content_handler = buffer.connect_changed(move |buffer| {
+        if content_for_change
+            .upgrade()
+            .is_some_and(|editor| editor.has_css_class("editor-image-moving"))
+        {
+            return;
+        }
         style_note_heading(buffer);
         let Some(state) = state_for_content.upgrade() else {
             return;
@@ -5036,7 +5106,10 @@ fn save_current(state: &Rc<WindowState>, content: &str) {
     }
 }
 
-fn editor_format_toolbar(editor: &gtk::TextView) -> gtk::Box {
+fn editor_format_toolbar(
+    editor: &gtk::TextView,
+    image_history: SharedEditorImageHistory,
+) -> gtk::Box {
     let buffer = editor.buffer();
     buffer.set_enable_undo(true);
     let toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -5047,28 +5120,73 @@ fn editor_format_toolbar(editor: &gtk::TextView) -> gtk::Box {
 
     let undo_button = icon_button("edit-undo-symbolic", tr("editor.undo"));
     undo_button.set_size_request(36, 36);
-    undo_button.set_sensitive(buffer.can_undo());
     let undo_button_weak = undo_button.downgrade();
-    buffer.connect_notify_local(Some("can-undo"), move |buffer, _| {
-        if let Some(button) = undo_button_weak.upgrade() {
-            button.set_sensitive(buffer.can_undo());
-        }
-    });
-    let buffer_for_undo = buffer.clone();
-    undo_button.connect_clicked(move |_| buffer_for_undo.undo());
-    toolbar.append(&undo_button);
-
     let redo_button = icon_button("edit-redo-symbolic", tr("editor.redo"));
     redo_button.set_size_request(36, 36);
-    redo_button.set_sensitive(buffer.can_redo());
     let redo_button_weak = redo_button.downgrade();
-    buffer.connect_notify_local(Some("can-redo"), move |buffer, _| {
-        if let Some(button) = redo_button_weak.upgrade() {
-            button.set_sensitive(buffer.can_redo());
+    let update_buttons: Rc<dyn Fn(&gtk::TextBuffer)> = {
+        let history = Rc::clone(&image_history);
+        Rc::new(move |buffer| {
+            let history = history.borrow();
+            if let Some(button) = undo_button_weak.upgrade() {
+                button.set_sensitive(buffer.can_undo() || !history.undo.is_empty());
+            }
+            if let Some(button) = redo_button_weak.upgrade() {
+                button.set_sensitive(buffer.can_redo() || !history.redo.is_empty());
+            }
+        })
+    };
+    let editor_for_history = editor.downgrade();
+    let history_for_change = Rc::clone(&image_history);
+    buffer.connect_changed(move |_| {
+        let Some(editor) = editor_for_history.upgrade() else {
+            return;
+        };
+        let wipe_native_undo = {
+            let mut history = history_for_change.borrow_mut();
+            if history.internal_change || editor.has_css_class("editor-image-moving") {
+                return;
+            }
+            history.redo.clear();
+            if editor.has_css_class("editor-content-replacing") {
+                history.undo.clear();
+                history.pending_delete = None;
+                false
+            } else if let Some(before) = history.pending_delete.take() {
+                // GTK would undo a deleted image into a bare placeholder character.
+                let after = editor_snapshot(&editor);
+                history.undo.push(EditorImageChange { before, after });
+                true
+            } else {
+                false
+            }
+        };
+        if wipe_native_undo {
+            let buffer = editor.buffer();
+            buffer.set_enable_undo(false);
+            buffer.set_enable_undo(true);
         }
+        deselect_editor_image(&editor);
     });
-    let buffer_for_redo = buffer.clone();
-    redo_button.connect_clicked(move |_| buffer_for_redo.redo());
+    let update_after_change = Rc::clone(&update_buttons);
+    buffer.connect_changed(move |buffer| update_after_change(buffer));
+    let update_after_undo = Rc::clone(&update_buttons);
+    buffer.connect_notify_local(Some("can-undo"), move |buffer, _| {
+        update_after_undo(buffer);
+    });
+    let update_after_redo = Rc::clone(&update_buttons);
+    buffer.connect_notify_local(Some("can-redo"), move |buffer, _| {
+        update_after_redo(buffer);
+    });
+    update_buttons(&buffer);
+    let editor_for_undo = editor.clone();
+    let history_for_undo = Rc::clone(&image_history);
+    undo_button.connect_clicked(move |_| undo_editor_change(&editor_for_undo, &history_for_undo));
+    toolbar.append(&undo_button);
+
+    let editor_for_redo = editor.clone();
+    let history_for_redo = Rc::clone(&image_history);
+    redo_button.connect_clicked(move |_| redo_editor_change(&editor_for_redo, &history_for_redo));
     toolbar.append(&redo_button);
 
     for (icon, tooltip, mark) in [
@@ -5101,6 +5219,14 @@ fn editor_format_toolbar(editor: &gtk::TextView) -> gtk::Box {
     link_button.connect_clicked(move |_| edit_editor_link(&editor_for_link));
     toolbar.append(&link_button);
 
+    let image_button = icon_button("insert-image-symbolic", tr("editor.image.insert"));
+    image_button.set_size_request(36, 36);
+    let editor_for_image = editor.clone();
+    let history_for_image = Rc::clone(&image_history);
+    image_button
+        .connect_clicked(move |_| choose_editor_image(&editor_for_image, &history_for_image));
+    toolbar.append(&image_button);
+
     toolbar.append(&editor_heading_menu(editor));
 
     for (icon, tooltip, kind) in [
@@ -5123,6 +5249,901 @@ fn editor_format_toolbar(editor: &gtk::TextView) -> gtk::Box {
     }
 
     toolbar
+}
+
+fn choose_editor_image(editor: &gtk::TextView, image_history: &SharedEditorImageHistory) {
+    let parent = editor.root().and_downcast::<gtk::Window>();
+    let dialog = gtk::FileChooserNative::new(
+        Some(tr("editor.image.insert")),
+        parent.as_ref(),
+        gtk::FileChooserAction::Open,
+        Some(tr("editor.image.insert")),
+        Some(tr("action.cancel")),
+    );
+    let filter = gtk::FileFilter::new();
+    filter.set_name(Some(tr("editor.image.insert")));
+    filter.add_mime_type("image/*");
+    dialog.add_filter(&filter);
+
+    let editor = editor.clone();
+    let image_history = Rc::clone(image_history);
+    dialog.connect_response(move |dialog, response| {
+        if response == gtk::ResponseType::Accept
+            && let Some(path) = dialog.file().and_then(|file| file.path())
+            && let Err(error) = insert_editor_image_file(&editor, &path, &image_history)
+        {
+            eprintln!("{}", error);
+        }
+        dialog.hide();
+    });
+    dialog.show();
+}
+
+fn insert_editor_image_file(
+    editor: &gtk::TextView,
+    source: &std::path::Path,
+    image_history: &SharedEditorImageHistory,
+) -> Result<()> {
+    let file_name = source
+        .file_name()
+        .context("the selected image has no file name")?;
+    let extension = source
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .filter(|extension| {
+            !extension.is_empty()
+                && extension
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric())
+        })
+        .unwrap_or("img")
+        .to_ascii_lowercase();
+    let directory = editor_image_directory()?;
+    std::fs::create_dir_all(&directory).context("could not create the image directory")?;
+    let destination = directory.join(format!("{}.{}", Uuid::new_v4(), extension));
+    std::fs::copy(source, &destination).context("could not copy the selected image")?;
+    let image_name = destination
+        .file_name()
+        .context("the copied image has no file name")?
+        .to_string_lossy();
+    let uri = format!("memonotes-image://{image_name}");
+    let alt = source
+        .file_stem()
+        .unwrap_or(file_name)
+        .to_string_lossy()
+        .into_owned();
+    let before = begin_editor_image_change(editor, image_history);
+    insert_editor_image(editor, &uri, &alt);
+    finish_editor_image_change(editor, image_history, before);
+    Ok(())
+}
+
+fn begin_editor_image_change(
+    editor: &gtk::TextView,
+    image_history: &SharedEditorImageHistory,
+) -> EditorSnapshot {
+    let before = editor_snapshot(editor);
+    editor.add_css_class("editor-image-moving");
+    image_history.borrow_mut().internal_change = true;
+    editor.buffer().set_enable_undo(false);
+    before
+}
+
+fn editor_snapshot(editor: &gtk::TextView) -> EditorSnapshot {
+    let buffer = editor.buffer();
+    EditorSnapshot {
+        markdown: markdown_from_editor_buffer(&buffer),
+        cursor: buffer.iter_at_mark(&buffer.get_insert()).offset(),
+    }
+}
+
+fn finish_editor_image_change(
+    editor: &gtk::TextView,
+    image_history: &SharedEditorImageHistory,
+    before: EditorSnapshot,
+) {
+    let buffer = editor.buffer();
+    buffer.set_enable_undo(true);
+    let after = editor_snapshot(editor);
+    {
+        let mut history = image_history.borrow_mut();
+        history.undo.push(EditorImageChange { before, after });
+        history.redo.clear();
+    }
+    editor.remove_css_class("editor-image-moving");
+    buffer.emit_by_name::<()>("changed", &[]);
+    image_history.borrow_mut().internal_change = false;
+}
+
+fn editor_image_directory() -> Result<PathBuf> {
+    memonotes::images::image_directory()
+}
+
+fn undo_editor_image_change(
+    editor: &gtk::TextView,
+    image_history: &SharedEditorImageHistory,
+) -> bool {
+    restore_editor_image_change(editor, image_history, true)
+}
+
+fn redo_editor_image_change(
+    editor: &gtk::TextView,
+    image_history: &SharedEditorImageHistory,
+) -> bool {
+    restore_editor_image_change(editor, image_history, false)
+}
+
+// Image steps wipe GTK's undo stack, so anything GTK can still undo is newer than the image history.
+fn undo_editor_change(editor: &gtk::TextView, image_history: &SharedEditorImageHistory) {
+    let buffer = editor.buffer();
+    if buffer.can_undo() {
+        buffer.undo();
+    } else {
+        undo_editor_image_change(editor, image_history);
+    }
+}
+
+fn redo_editor_change(editor: &gtk::TextView, image_history: &SharedEditorImageHistory) {
+    if !redo_editor_image_change(editor, image_history) {
+        editor.buffer().redo();
+    }
+}
+
+fn restore_editor_image_change(
+    editor: &gtk::TextView,
+    image_history: &SharedEditorImageHistory,
+    undo: bool,
+) -> bool {
+    let change = {
+        let mut history = image_history.borrow_mut();
+        let change = if undo {
+            history.undo.pop()
+        } else {
+            history.redo.pop()
+        };
+        let Some(change) = change else {
+            return false;
+        };
+        history.internal_change = true;
+        change
+    };
+    editor.add_css_class("editor-image-moving");
+    let target = if undo { &change.before } else { &change.after };
+    set_editor_view_content(editor, &target.markdown);
+    let buffer = editor.buffer();
+    buffer.place_cursor(&buffer.iter_at_offset(target.cursor.min(buffer.char_count())));
+    editor.remove_css_class("editor-image-moving");
+    {
+        let mut history = image_history.borrow_mut();
+        if undo {
+            history.redo.push(change);
+        } else {
+            history.undo.push(change);
+        }
+    }
+    editor.buffer().emit_by_name::<()>("changed", &[]);
+    image_history.borrow_mut().internal_change = false;
+    true
+}
+
+fn insert_editor_image(editor: &gtk::TextView, uri: &str, alt: &str) {
+    let buffer = editor.buffer();
+    let mut position = buffer.iter_at_mark(&buffer.get_insert());
+    let anchor = buffer.create_child_anchor(&mut position);
+    insert_editor_image_at_anchor(editor, &anchor, uri, alt);
+    editor.grab_focus();
+}
+
+fn insert_editor_image_at_anchor(
+    editor: &gtk::TextView,
+    anchor: &gtk::TextChildAnchor,
+    uri: &str,
+    alt: &str,
+) {
+    let widget = editor_image_widget(uri, alt);
+    attach_editor_image_widget(editor, &widget, anchor);
+}
+
+fn attach_editor_image_widget(
+    editor: &gtk::TextView,
+    widget: &gtk::Widget,
+    anchor: &gtk::TextChildAnchor,
+) {
+    widget.set_focusable(true);
+    widget.set_cursor_from_name(Some("grab"));
+    editor.add_child_at_anchor(widget, anchor);
+    install_editor_image_interactions(editor, widget, anchor);
+}
+
+fn clear_editor_image_interactions(widget: &gtk::Widget) {
+    let controllers = widget.observe_controllers();
+    let controllers: Vec<_> = (0..controllers.n_items())
+        .filter_map(|index| controllers.item(index))
+        .filter_map(|controller| controller.downcast::<gtk::EventController>().ok())
+        .filter(|controller| {
+            controller.is::<gtk::GestureClick>() || controller.is::<gtk::DragSource>()
+        })
+        .collect();
+    for controller in controllers {
+        widget.remove_controller(&controller);
+    }
+}
+
+fn install_editor_image_interactions(
+    editor: &gtk::TextView,
+    widget: &gtk::Widget,
+    anchor: &gtk::TextChildAnchor,
+) {
+    let click = gtk::GestureClick::new();
+    let editor_for_click = editor.downgrade();
+    let widget_for_click = widget.downgrade();
+    let anchor_for_click = anchor.clone();
+    click.connect_pressed(move |_, _, _, _| {
+        let (Some(editor), Some(widget)) = (editor_for_click.upgrade(), widget_for_click.upgrade())
+        else {
+            return;
+        };
+        if !anchor_for_click.is_deleted() {
+            select_editor_image(&editor, &widget, &anchor_for_click);
+        }
+    });
+    widget.add_controller(click);
+
+    let drag_source = gtk::DragSource::new();
+    drag_source.set_actions(gtk::gdk::DragAction::COPY);
+    let widget_for_drag = widget.downgrade();
+    drag_source.connect_prepare(move |_, _, _| {
+        let widget = widget_for_drag.upgrade()?;
+        let value = gtk::glib::BoxedAnyObject::new(widget.widget_name().to_string()).to_value();
+        Some(gtk::gdk::ContentProvider::for_value(&value))
+    });
+    widget.add_controller(drag_source);
+}
+
+fn range_has_image(start: &gtk::TextIter, end: &gtk::TextIter) -> bool {
+    let mut iter = *start;
+    while iter.offset() < end.offset() {
+        if let Some(anchor) = iter.child_anchor()
+            && anchor
+                .widgets()
+                .iter()
+                .any(|widget| widget.widget_name().starts_with("memonotes-image:"))
+        {
+            return true;
+        }
+        iter.forward_char();
+    }
+    false
+}
+
+fn delete_selected_editor_image(editor: &gtk::TextView) -> bool {
+    let Some(picture) = resize_target_picture(editor) else {
+        return false;
+    };
+    if !picture.has_css_class("editor-image-selected") {
+        return false;
+    }
+    let buffer = editor.buffer();
+    let mut iter = buffer.start_iter();
+    while iter.offset() < buffer.char_count() {
+        if let Some(anchor) = iter.child_anchor()
+            && anchor
+                .widgets()
+                .contains(picture.upcast_ref::<gtk::Widget>())
+        {
+            let mut start = iter;
+            let mut end = iter;
+            end.forward_char();
+            buffer.delete(&mut start, &mut end);
+            deselect_editor_image(editor);
+            return true;
+        }
+        iter.forward_char();
+    }
+    false
+}
+
+fn find_image_anchor(
+    buffer: &gtk::TextBuffer,
+    widget: &gtk::Widget,
+) -> Option<gtk::TextChildAnchor> {
+    let mut iter = buffer.start_iter();
+    while iter.offset() < buffer.char_count() {
+        if let Some(anchor) = iter.child_anchor()
+            && anchor.widgets().contains(widget)
+        {
+            return Some(anchor);
+        }
+        iter.forward_char();
+    }
+    None
+}
+
+fn select_editor_image(
+    editor: &gtk::TextView,
+    widget: &gtk::Widget,
+    anchor: &gtk::TextChildAnchor,
+) {
+    let buffer = editor.buffer();
+    deselect_editor_image(editor);
+    // A buffer selection lets GtkTextView start its own text drag, which moves the anchor without its widget.
+    buffer.place_cursor(&buffer.iter_at_child_anchor(anchor));
+    widget.add_css_class("editor-image-selected");
+    show_editor_image_handles(editor, widget);
+    editor.grab_focus();
+}
+
+fn show_editor_image_handles(editor: &gtk::TextView, widget: &gtk::Widget) {
+    let (Some(history), Ok(picture)) = (
+        editor_image_history(editor),
+        widget.clone().downcast::<gtk::Picture>(),
+    ) else {
+        return;
+    };
+    ensure_editor_image_handles(editor, &history);
+    history.borrow_mut().resize_target = Some(widget.downgrade());
+    // The caret next to an image is as tall as the image.
+    editor.set_cursor_visible(false);
+    position_editor_image_handles(editor, &picture);
+    // A freshly attached image has no allocation yet, so place the handles again once it has one.
+    for delay in [0_u64, 60] {
+        let editor = editor.downgrade();
+        let picture = picture.downgrade();
+        gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(delay), move || {
+            if let (Some(editor), Some(picture)) = (editor.upgrade(), picture.upgrade())
+                && resize_target_picture(&editor).as_ref() == Some(&picture)
+            {
+                position_editor_image_handles(&editor, &picture);
+            }
+        });
+    }
+}
+
+// Selection is its own state: the TextView moves the cursor around clicks, so it cannot track it.
+fn deselect_editor_image(editor: &gtk::TextView) {
+    let Some(history) = editor_image_history(editor) else {
+        return;
+    };
+    let target = {
+        let mut history = history.borrow_mut();
+        for handle in &history.handles {
+            handle.set_visible(false);
+        }
+        history.resize_target.take()
+    };
+    if let Some(widget) = target.and_then(|target| target.upgrade()) {
+        widget.remove_css_class("editor-image-selected");
+    }
+    editor.set_cursor_visible(true);
+}
+
+fn editor_image_at(editor: &gtk::TextView, x: f64, y: f64) -> Option<gtk::Widget> {
+    let mut widget = editor.pick(x, y, gtk::PickFlags::DEFAULT);
+    while let Some(current) = widget {
+        if current.widget_name().starts_with("memonotes-image:") {
+            return Some(current);
+        }
+        if current == *editor.upcast_ref::<gtk::Widget>() {
+            return None;
+        }
+        widget = current.parent();
+    }
+    None
+}
+
+// Selecting here, rather than only in the picture's own gesture, does not depend on how
+// GtkTextView hands the click down to its children.
+fn handle_editor_press(editor: &gtk::TextView, x: f64, y: f64) {
+    if image_handle_direction_at(editor, x, y).is_some() {
+        return;
+    }
+    let Some(picture) = editor_image_at(editor, x, y) else {
+        deselect_editor_image(editor);
+        return;
+    };
+    let Some(anchor) = find_image_anchor(&editor.buffer(), &picture) else {
+        return;
+    };
+    select_editor_image(editor, &picture, &anchor);
+    let editor = editor.downgrade();
+    let picture = picture.downgrade();
+    // GtkTextView handles the same press afterwards; make sure that did not undo the selection.
+    gtk::glib::idle_add_local_once(move || {
+        let (Some(editor), Some(picture)) = (editor.upgrade(), picture.upgrade()) else {
+            return;
+        };
+        let still_selected = resize_target_picture(&editor)
+            .is_some_and(|target| target.upcast_ref::<gtk::Widget>() == &picture);
+        if !still_selected && let Some(anchor) = find_image_anchor(&editor.buffer(), &picture) {
+            select_editor_image(&editor, &picture, &anchor);
+        }
+    });
+}
+
+fn is_modifier_key(key: gtk::gdk::Key) -> bool {
+    matches!(
+        key,
+        gtk::gdk::Key::Shift_L
+            | gtk::gdk::Key::Shift_R
+            | gtk::gdk::Key::Control_L
+            | gtk::gdk::Key::Control_R
+            | gtk::gdk::Key::Alt_L
+            | gtk::gdk::Key::Alt_R
+            | gtk::gdk::Key::Meta_L
+            | gtk::gdk::Key::Meta_R
+            | gtk::gdk::Key::Super_L
+            | gtk::gdk::Key::Super_R
+            | gtk::gdk::Key::Caps_Lock
+    )
+}
+
+fn image_origin(editor: &gtk::TextView, picture: &gtk::Picture) -> Option<(i32, i32)> {
+    let bounds = picture.compute_bounds(editor)?;
+    Some(editor.window_to_buffer_coords(
+        gtk::TextWindowType::Widget,
+        bounds.x() as i32,
+        bounds.y() as i32,
+    ))
+}
+
+fn place_editor_image_handles(editor: &gtk::TextView, origin: (i32, i32), width: i32, height: i32) {
+    let Some(history) = editor_image_history(editor) else {
+        return;
+    };
+    let (x, y) = origin;
+    let half = IMAGE_HANDLE_SIZE / 2;
+    let corners = [
+        (x, y),
+        (x + width, y),
+        (x, y + height),
+        (x + width, y + height),
+    ];
+    let mut history = history.borrow_mut();
+    history.handle_positions = corners
+        .iter()
+        .map(|(corner_x, corner_y)| (corner_x - half, corner_y - half))
+        .collect();
+    for (handle, (left, top)) in history.handles.iter().zip(&history.handle_positions) {
+        editor.move_overlay(handle, *left, *top);
+        handle.set_visible(true);
+    }
+}
+
+fn position_editor_image_handles(editor: &gtk::TextView, picture: &gtk::Picture) {
+    let Some(origin) = image_origin(editor, picture) else {
+        return;
+    };
+    let (width, height) = picture.size_request();
+    let width = if width > 0 { width } else { picture.width() };
+    let height = if height > 0 { height } else { picture.height() };
+    place_editor_image_handles(editor, origin, width, height);
+}
+
+const IMAGE_HANDLE_DIRECTIONS: [i32; 4] = [-1, 1, -1, 1];
+
+// Hit-tests against the positions we assigned, since allocations lag behind while resizing.
+fn image_handle_direction_at(editor: &gtk::TextView, x: f64, y: f64) -> Option<i32> {
+    let history = editor_image_history(editor)?;
+    let history = history.borrow();
+    let (x, y) = editor.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
+    let slop = 4;
+    history
+        .handle_positions
+        .iter()
+        .zip(IMAGE_HANDLE_DIRECTIONS)
+        .zip(&history.handles)
+        .find_map(|(((left, top), direction), handle)| {
+            let hit = handle.is_visible()
+                && (left - slop..=left + IMAGE_HANDLE_SIZE + slop).contains(&x)
+                && (top - slop..=top + IMAGE_HANDLE_SIZE + slop).contains(&y);
+            hit.then_some(direction)
+        })
+}
+
+fn ensure_editor_image_handles(editor: &gtk::TextView, history: &SharedEditorImageHistory) {
+    if !history.borrow().handles.is_empty() {
+        return;
+    }
+    let mut handles = Vec::new();
+    for cursor in ["nwse-resize", "nesw-resize", "nesw-resize", "nwse-resize"] {
+        let handle = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        handle.add_css_class("editor-image-handle");
+        handle.set_size_request(IMAGE_HANDLE_SIZE, IMAGE_HANDLE_SIZE);
+        handle.set_cursor_from_name(Some(cursor));
+        handle.set_visible(false);
+        editor.add_overlay(&handle, 0, 0);
+        handles.push(handle.upcast());
+    }
+    history.borrow_mut().handles = handles;
+    connect_editor_image_resize(editor, history);
+}
+
+fn resize_target_picture(editor: &gtk::TextView) -> Option<gtk::Picture> {
+    let history = editor_image_history(editor)?;
+    let widget = history.borrow().resize_target.as_ref()?.upgrade()?;
+    widget.downcast().ok()
+}
+
+fn dragged_image_width(start_width: i32, direction: i32, offset_x: f64) -> i32 {
+    (f64::from(start_width) + f64::from(direction) * offset_x)
+        .round()
+        .clamp(f64::from(IMAGE_MIN_WIDTH), f64::from(IMAGE_MAX_WIDTH)) as i32
+}
+
+#[derive(Clone, Copy)]
+struct ImageResize {
+    direction: i32,
+    start_width: i32,
+    origin: (i32, i32),
+}
+
+// The gesture lives on the editor: a gesture on a handle sees offsets in the handle's own,
+// moving coordinate space, which makes the image jitter while it is resized.
+fn connect_editor_image_resize(editor: &gtk::TextView, history: &SharedEditorImageHistory) {
+    let drag = gtk::GestureDrag::new();
+    drag.set_button(gtk::gdk::BUTTON_PRIMARY);
+    drag.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let active: Rc<Cell<Option<ImageResize>>> = Rc::new(Cell::new(None));
+
+    let editor_for_begin = editor.downgrade();
+    let active_for_begin = Rc::clone(&active);
+    drag.connect_drag_begin(move |gesture, x, y| {
+        let Some(editor) = editor_for_begin.upgrade() else {
+            return;
+        };
+        let Some((picture, direction)) =
+            resize_target_picture(&editor).zip(image_handle_direction_at(&editor, x, y))
+        else {
+            gesture.set_state(gtk::EventSequenceState::Denied);
+            return;
+        };
+        let Some(origin) = image_origin(&editor, &picture) else {
+            gesture.set_state(gtk::EventSequenceState::Denied);
+            return;
+        };
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+        active_for_begin.set(Some(ImageResize {
+            direction,
+            start_width: picture_width(&picture),
+            origin,
+        }));
+    });
+
+    let editor_for_update = editor.downgrade();
+    let active_for_update = Rc::clone(&active);
+    drag.connect_drag_update(move |_, offset_x, _| {
+        let (Some(editor), Some(resize)) = (editor_for_update.upgrade(), active_for_update.get())
+        else {
+            return;
+        };
+        let Some(picture) = resize_target_picture(&editor) else {
+            return;
+        };
+        let width = dragged_image_width(resize.start_width, resize.direction, offset_x);
+        let (width, height) = image_size_for_width(&picture, width);
+        picture.set_size_request(width, height);
+        place_editor_image_handles(&editor, resize.origin, width, height);
+    });
+
+    let editor_for_end = editor.downgrade();
+    drag.connect_drag_end(move |_, offset_x, _| {
+        let (Some(editor), Some(resize)) = (editor_for_end.upgrade(), active.take()) else {
+            return;
+        };
+        let Some(picture) = resize_target_picture(&editor) else {
+            return;
+        };
+        let width = dragged_image_width(resize.start_width, resize.direction, offset_x);
+        commit_editor_image_resize(&editor, &picture, width);
+    });
+    history.borrow_mut().resize_gesture = Some(drag.clone());
+    editor.add_controller(drag);
+}
+
+fn commit_editor_image_resize(editor: &gtk::TextView, picture: &gtk::Picture, width: i32) {
+    let Some((alt, uri)) = editor_image_values(&picture.widget_name()) else {
+        return;
+    };
+    let (width, height) = image_size_for_width(picture, width);
+    picture.set_size_request(width, height);
+    let new_uri = with_image_width(&uri, width);
+    if new_uri != uri {
+        let new_name = editor_image_name(&alt, &new_uri);
+        if let Some(history) = editor_image_history(editor) {
+            let before = begin_editor_image_change(editor, &history);
+            picture.set_widget_name(&new_name);
+            finish_editor_image_change(editor, &history, before);
+        } else {
+            picture.set_widget_name(&new_name);
+            editor.buffer().emit_by_name::<()>("changed", &[]);
+        }
+    }
+    position_editor_image_handles(editor, picture);
+    let editor = editor.downgrade();
+    let picture = picture.downgrade();
+    gtk::glib::idle_add_local_once(move || {
+        if let (Some(editor), Some(picture)) = (editor.upgrade(), picture.upgrade()) {
+            position_editor_image_handles(&editor, &picture);
+        }
+    });
+}
+
+fn install_editor_image_drop_target(
+    editor: &gtk::TextView,
+    image_history: &SharedEditorImageHistory,
+) {
+    let drop_target = gtk::DropTarget::new(
+        gtk::glib::BoxedAnyObject::static_type(),
+        gtk::gdk::DragAction::COPY,
+    );
+    let indicator: DropIndicator = Rc::new(RefCell::new(None));
+    let editor_for_motion = editor.downgrade();
+    let indicator_for_motion = Rc::clone(&indicator);
+    drop_target.connect_motion(move |_, x, y| {
+        if let Some(editor) = editor_for_motion.upgrade() {
+            show_editor_image_drop_indicator(&editor, &indicator_for_motion, x, y);
+        }
+        gtk::gdk::DragAction::COPY
+    });
+    let indicator_for_leave = Rc::clone(&indicator);
+    drop_target.connect_leave(move |_| hide_editor_image_drop_indicator(&indicator_for_leave));
+    let editor_for_drop = editor.downgrade();
+    let history_for_drop = Rc::clone(image_history);
+    drop_target.connect_drop(move |_, value, x, y| {
+        hide_editor_image_drop_indicator(&indicator);
+        editor_for_drop
+            .upgrade()
+            .is_some_and(|editor| handle_editor_image_drop(&editor, value, x, y, &history_for_drop))
+    });
+    editor.add_controller(drop_target);
+}
+
+type DropIndicator = Rc<RefCell<Option<gtk::Widget>>>;
+
+// Dropping beside or below a line lands after that line's text; the title line is never a target.
+fn editor_drop_iter(editor: &gtk::TextView, x: f64, y: f64) -> gtk::TextIter {
+    let buffer = editor.buffer();
+    let (bx, by) = editor.window_to_buffer_coords(gtk::TextWindowType::Widget, x as i32, y as i32);
+    let (line_start, _) = editor.line_at_y(by);
+    let mut line_end = line_start;
+    if !line_end.ends_line() {
+        line_end.forward_to_line_end();
+    }
+    let end_rect = editor.iter_location(&line_end);
+    let on_end_row = by >= end_rect.y() && by < end_rect.y() + end_rect.height();
+    let below_text =
+        line_start.line() == buffer.line_count() - 1 && by >= end_rect.y() + end_rect.height();
+    let mut target = if below_text || (on_end_row && bx >= end_rect.x()) {
+        line_end
+    } else {
+        editor.iter_at_location(bx, by).unwrap_or(line_end)
+    };
+    if target.line() == 0
+        && let Some(second_line) = buffer.iter_at_line(1)
+    {
+        target = second_line;
+    }
+    target
+}
+
+fn show_editor_image_drop_indicator(
+    editor: &gtk::TextView,
+    indicator: &DropIndicator,
+    x: f64,
+    y: f64,
+) {
+    let rect = editor.iter_location(&editor_drop_iter(editor, x, y));
+    let height = rect.height().max(1);
+    let mut slot = indicator.borrow_mut();
+    if let Some(widget) = slot.as_ref() {
+        widget.set_size_request(2, height);
+        editor.move_overlay(widget, rect.x(), rect.y());
+        widget.set_visible(true);
+        return;
+    }
+    let widget = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    widget.add_css_class("editor-image-drop-indicator");
+    widget.set_can_target(false);
+    widget.set_size_request(2, height);
+    editor.add_overlay(&widget, rect.x(), rect.y());
+    *slot = Some(widget.upcast());
+}
+
+fn hide_editor_image_drop_indicator(indicator: &DropIndicator) {
+    if let Some(widget) = indicator.borrow().as_ref() {
+        widget.set_visible(false);
+    }
+}
+
+fn handle_editor_image_drop(
+    editor: &gtk::TextView,
+    value: &gtk::glib::Value,
+    x: f64,
+    y: f64,
+    image_history: &SharedEditorImageHistory,
+) -> bool {
+    let Ok(payload) = value.get::<gtk::glib::BoxedAnyObject>() else {
+        return false;
+    };
+    let metadata = payload.borrow::<String>().to_owned();
+    if editor_image_values(&metadata).is_none() {
+        return false;
+    }
+    let offset = editor_drop_iter(editor, x, y).offset();
+    let editor = editor.downgrade();
+    let image_history = Rc::clone(image_history);
+    gtk::glib::idle_add_local_once(move || {
+        if let Some(editor) = editor.upgrade() {
+            move_editor_image_to_offset(&editor, &metadata, offset, &image_history);
+        }
+    });
+    true
+}
+
+fn move_editor_image_to_offset(
+    editor: &gtk::TextView,
+    metadata: &str,
+    target_offset: i32,
+    image_history: &SharedEditorImageHistory,
+) -> bool {
+    if editor_image_values(metadata).is_none() {
+        return false;
+    }
+    let buffer = editor.buffer();
+    let mut iter = buffer.start_iter();
+    let mut source = None;
+    while iter.offset() < buffer.char_count() {
+        if let Some(anchor) = iter.child_anchor()
+            && let Some(widget) = anchor
+                .widgets()
+                .into_iter()
+                .find(|widget| widget.widget_name() == metadata)
+        {
+            source = Some((anchor, widget, iter.offset()));
+            break;
+        }
+        iter.forward_char();
+    }
+    let Some((anchor, widget, source_offset)) = source else {
+        return false;
+    };
+    let target_offset = target_offset.clamp(0, buffer.char_count());
+    if (source_offset..=source_offset + 1).contains(&target_offset) {
+        return true;
+    }
+
+    let target = buffer.iter_at_offset(target_offset);
+    let target_mark = buffer.create_mark(None, &target, true);
+    let before = begin_editor_image_change(editor, image_history);
+    clear_editor_image_interactions(&widget);
+    editor.remove(&widget);
+    let mut source_start = buffer.iter_at_child_anchor(&anchor);
+    let mut source_end = source_start;
+    source_end.forward_char();
+    buffer.delete(&mut source_start, &mut source_end);
+
+    let mut insertion = buffer.iter_at_mark(&target_mark);
+    let new_anchor = buffer.create_child_anchor(&mut insertion);
+    attach_editor_image_widget(editor, &widget, &new_anchor);
+    finish_editor_image_change(editor, image_history, before);
+    buffer.delete_mark(&target_mark);
+    select_editor_image(editor, &widget, &new_anchor);
+    true
+}
+
+fn editor_image_values(metadata: &str) -> Option<(String, String)> {
+    let (alt, uri) = metadata.strip_prefix("memonotes-image:")?.split_once(':')?;
+    Some((
+        decode_editor_image_value(alt)?,
+        decode_editor_image_value(uri)?,
+    ))
+}
+
+fn editor_image_widget(uri: &str, alt: &str) -> gtk::Widget {
+    let (base_uri, requested_width) = split_image_width(uri);
+    let path = base_uri
+        .strip_prefix("memonotes-image://")
+        .filter(|name| {
+            !name.is_empty()
+                && name.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
+                })
+        })
+        .and_then(|name| {
+            editor_image_directory()
+                .ok()
+                .map(|directory| directory.join(name))
+        })
+        .or_else(|| gio::File::for_uri(base_uri).path());
+    let picture = path
+        .and_then(|path| gtk::gdk::Texture::from_file(&gio::File::for_path(path)).ok())
+        .map(|texture| {
+            let picture = gtk::Picture::for_paintable(&texture);
+            picture.set_can_shrink(true);
+            let width = requested_width
+                .unwrap_or_else(|| texture.width().clamp(1, DEFAULT_IMAGE_WIDTH))
+                .clamp(IMAGE_MIN_WIDTH, IMAGE_MAX_WIDTH);
+            let (width, height) = image_size_for_width(&picture, width);
+            picture.set_size_request(width, height);
+            picture.set_halign(gtk::Align::Start);
+            picture.upcast::<gtk::Widget>()
+        });
+    let widget = picture.unwrap_or_else(|| {
+        let image = gtk::Image::from_icon_name("image-x-generic-symbolic");
+        image.set_pixel_size(48);
+        image.upcast::<gtk::Widget>()
+    });
+    widget.add_css_class("editor-image");
+    widget.set_widget_name(&editor_image_name(alt, uri));
+    widget.set_tooltip_text((!alt.is_empty()).then_some(alt));
+    widget
+}
+
+const DEFAULT_IMAGE_WIDTH: i32 = 320;
+const IMAGE_MIN_WIDTH: i32 = 32;
+const IMAGE_MAX_WIDTH: i32 = 2000;
+const IMAGE_HANDLE_SIZE: i32 = 12;
+
+fn editor_image_name(alt: &str, uri: &str) -> String {
+    format!(
+        "memonotes-image:{}:{}",
+        encode_editor_image_value(alt),
+        encode_editor_image_value(uri)
+    )
+}
+
+// The chosen width travels in the URL fragment so other Markdown clients ignore it.
+fn split_image_width(uri: &str) -> (&str, Option<i32>) {
+    match uri.rsplit_once("#w=") {
+        Some((base, width)) => (base, width.parse().ok().filter(|width| *width > 0)),
+        None => (uri, None),
+    }
+}
+
+fn with_image_width(uri: &str, width: i32) -> String {
+    format!("{}#w={width}", split_image_width(uri).0)
+}
+
+fn image_size_for_width(picture: &gtk::Picture, width: i32) -> (i32, i32) {
+    let ratio = picture
+        .paintable()
+        .map_or(1.0, |paintable| paintable.intrinsic_aspect_ratio());
+    let ratio = if ratio > 0.0 { ratio } else { 1.0 };
+    (width, (f64::from(width) / ratio).round().max(1.0) as i32)
+}
+
+fn picture_width(picture: &gtk::Picture) -> i32 {
+    let requested = picture.size_request().0;
+    if requested > 0 {
+        requested
+    } else {
+        picture.width()
+    }
+}
+
+fn editor_image_markdown(widget: &gtk::Widget) -> Option<String> {
+    let (alt, uri) = editor_image_values(&widget.widget_name())?;
+    Some(format!("!{}", markdown_link(&alt, &uri)))
+}
+
+fn encode_editor_image_value(value: &str) -> String {
+    value
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn decode_editor_image_value(value: &str) -> Option<String> {
+    if value.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = (0..value.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&value[index..index + 2], 16))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .ok()?;
+    String::from_utf8(bytes).ok()
 }
 
 fn editor_heading_menu(editor: &gtk::TextView) -> gtk::MenuButton {
@@ -5231,11 +6252,7 @@ fn install_pending_heading_style(editor: &gtk::TextView) -> Rc<Cell<Option<(i32,
         {
             return;
         }
-        buffer.apply_tag(
-            &heading_style_tag(buffer, level),
-            &line_start,
-            &line_end,
-        );
+        buffer.apply_tag(&heading_style_tag(buffer, level), &line_start, &line_end);
         pending_for_change.set(None);
     });
     pending_heading
@@ -5297,8 +6314,28 @@ enum ListPrefixKind {
     Bullet,
 }
 
-fn install_editor_format_shortcuts(editor: &gtk::TextView) {
+fn install_editor_format_shortcuts(
+    editor: &gtk::TextView,
+    image_history: SharedEditorImageHistory,
+) {
     let buffer = editor.buffer();
+    register_editor_image_history(editor, &image_history);
+    install_editor_image_drop_target(editor, &image_history);
+    let editor_for_delete = editor.downgrade();
+    let history_for_delete = Rc::clone(&image_history);
+    buffer.connect_delete_range(move |_, start, end| {
+        let Some(editor) = editor_for_delete.upgrade() else {
+            return;
+        };
+        let own_change = editor.has_css_class("editor-image-moving")
+            || editor.has_css_class("editor-content-replacing");
+        if !own_change && range_has_image(start, end) {
+            let mut history = history_for_delete.borrow_mut();
+            if !history.internal_change {
+                history.pending_delete = Some(editor_snapshot(&editor));
+            }
+        }
+    });
     let auto_linking = Rc::new(Cell::new(false));
     let auto_linking_for_change = Rc::clone(&auto_linking);
     buffer.connect_changed(move |buffer| {
@@ -5309,13 +6346,23 @@ fn install_editor_format_shortcuts(editor: &gtk::TextView) {
         auto_linking_for_change.set(false);
     });
     let editor_for_enter = editor.clone();
+    let image_history_for_keys = Rc::clone(&image_history);
     let keys = gtk::EventControllerKey::new();
     keys.set_propagation_phase(gtk::PropagationPhase::Capture);
     keys.connect_key_pressed(move |_, key, _, modifiers| {
-        if matches!(key, gtk::gdk::Key::Tab | gtk::gdk::Key::ISO_Left_Tab)
-            && !modifiers.intersects(
-                gtk::gdk::ModifierType::CONTROL_MASK | gtk::gdk::ModifierType::ALT_MASK,
+        if resize_target_picture(&editor_for_enter).is_some()
+            && !is_modifier_key(key)
+            && !modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK)
+            && !matches!(
+                key,
+                gtk::gdk::Key::Delete | gtk::gdk::Key::KP_Delete | gtk::gdk::Key::BackSpace
             )
+        {
+            deselect_editor_image(&editor_for_enter);
+        }
+        if matches!(key, gtk::gdk::Key::Tab | gtk::gdk::Key::ISO_Left_Tab)
+            && !modifiers
+                .intersects(gtk::gdk::ModifierType::CONTROL_MASK | gtk::gdk::ModifierType::ALT_MASK)
             && indent_editor_list(
                 &editor_for_enter,
                 key == gtk::gdk::Key::ISO_Left_Tab
@@ -5334,14 +6381,28 @@ fn install_editor_format_shortcuts(editor: &gtk::TextView) {
         {
             return gtk::glib::Propagation::Stop;
         }
+        if matches!(
+            key,
+            gtk::gdk::Key::Delete | gtk::gdk::Key::KP_Delete | gtk::gdk::Key::BackSpace
+        ) && modifiers.is_empty()
+            && delete_selected_editor_image(&editor_for_enter)
+        {
+            return gtk::glib::Propagation::Stop;
+        }
         if !modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK) {
             return gtk::glib::Propagation::Proceed;
         }
         let shifted = modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK);
         match key {
-            gtk::gdk::Key::z | gtk::gdk::Key::Z if shifted => buffer.redo(),
-            gtk::gdk::Key::z if !shifted => buffer.undo(),
-            gtk::gdk::Key::y | gtk::gdk::Key::Y if !shifted => buffer.redo(),
+            gtk::gdk::Key::z | gtk::gdk::Key::Z if shifted => {
+                redo_editor_change(&editor_for_enter, &image_history_for_keys)
+            }
+            gtk::gdk::Key::z if !shifted => {
+                undo_editor_change(&editor_for_enter, &image_history_for_keys)
+            }
+            gtk::gdk::Key::y | gtk::gdk::Key::Y if !shifted => {
+                redo_editor_change(&editor_for_enter, &image_history_for_keys)
+            }
             gtk::gdk::Key::b if !shifted => apply_inline_style(&buffer, Mark::Bold),
             gtk::gdk::Key::i if !shifted => apply_inline_style(&buffer, Mark::Italic),
             gtk::gdk::Key::u if !shifted => apply_inline_style(&buffer, Mark::Underline),
@@ -5363,6 +6424,7 @@ fn install_editor_format_shortcuts(editor: &gtk::TextView) {
     click.set_propagation_phase(gtk::PropagationPhase::Capture);
     let editor_for_click = editor.clone();
     click.connect_pressed(move |gesture, _, x, y| {
+        handle_editor_press(&editor_for_click, x, y);
         if !gesture
             .current_event_state()
             .contains(gtk::gdk::ModifierType::CONTROL_MASK)
@@ -5381,10 +6443,8 @@ fn install_editor_format_shortcuts(editor: &gtk::TextView) {
             return;
         };
         if is_openable_link(&url)
-            && let Err(error) = adw::gio::AppInfo::launch_default_for_uri(
-                &url,
-                None::<&adw::gio::AppLaunchContext>,
-            )
+            && let Err(error) =
+                adw::gio::AppInfo::launch_default_for_uri(&url, None::<&adw::gio::AppLaunchContext>)
         {
             eprintln!(
                 "{}",
@@ -5475,12 +6535,15 @@ fn is_auto_link_candidate(candidate: &str) -> bool {
             !label.is_empty()
                 && !label.starts_with('-')
                 && !label.ends_with('-')
-                && label.chars().all(|character| {
-                    character.is_ascii_alphanumeric() || character == '-'
-                })
+                && label
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '-')
         })
         && labels.last().is_some_and(|label| {
-            label.len() >= 2 && label.chars().all(|character| character.is_ascii_alphabetic())
+            label.len() >= 2
+                && label
+                    .chars()
+                    .all(|character| character.is_ascii_alphabetic())
         })
 }
 
@@ -5698,7 +6761,12 @@ fn continue_editor_list_on_enter(editor: &gtk::TextView) -> bool {
     let trimmed = line.trim_start_matches([' ', '\t']);
     let indentation = &line[..line.len() - trimmed.len()];
     let prefix_chars = indentation.chars().count() as i32 + 2;
-    let empty = trimmed.chars().skip(2).collect::<String>().trim().is_empty();
+    let empty = trimmed
+        .chars()
+        .skip(2)
+        .collect::<String>()
+        .trim()
+        .is_empty();
     let marker = match kind {
         ListPrefixKind::Bullet => "• ",
         ListPrefixKind::Task => "☐ ",
@@ -5915,14 +6983,16 @@ mod editor_format_tests {
         let buffer = editor.buffer();
         let start = buffer.iter_at_line(1).unwrap();
         let marker = start.child_anchor().unwrap().widgets()[0]
-            .clone().downcast::<gtk::Label>().unwrap();
+            .clone()
+            .downcast::<gtk::Label>()
+            .unwrap();
         assert!(!marker.is_selectable());
         assert!(!marker.can_target());
         let marker_bounds = marker.compute_bounds(&editor).unwrap();
         let (_, layout_y) = marker.layout_offsets();
         let (ink, _) = marker.layout().pixel_extents();
-        let marker_center = marker_bounds.y() + layout_y as f32
-            + ink.y() as f32 + ink.height() as f32 / 2.0;
+        let marker_center =
+            marker_bounds.y() + layout_y as f32 + ink.y() as f32 + ink.height() as f32 / 2.0;
         let mut text_start = start;
         text_start.forward_chars(2);
         let text_bounds = editor.iter_location(&text_start);
@@ -5939,7 +7009,8 @@ mod editor_format_tests {
         let clipboard = editor.clipboard();
         buffer.copy_clipboard(&clipboard);
         let copied = gtk::glib::MainContext::default()
-            .block_on(clipboard.read_text_future())?.unwrap();
+            .block_on(clipboard.read_text_future())?
+            .unwrap();
         assert_eq!(copied.trim(), "First");
         buffer.cut_clipboard(&clipboard, true);
         buffer.place_cursor(&buffer.end_iter());
@@ -5950,7 +7021,10 @@ mod editor_format_tests {
         while !pasted.get() {
             gtk::glib::MainContext::default().iteration(true);
         }
-        assert_eq!(markdown_from_editor_buffer(&buffer), "# Title\n\n- Second First");
+        assert_eq!(
+            markdown_from_editor_buffer(&buffer),
+            "# Title\n\n- Second First"
+        );
         Ok(())
     }
 
@@ -5971,16 +7045,29 @@ mod editor_format_tests {
         gtk::init()?;
         let editor = gtk::TextView::new();
         let controllers = editor.observe_controllers();
-        let existing: Vec<_> = (0..controllers.n_items()).filter_map(|index| controllers.item(index)).collect();
-        install_editor_format_shortcuts(&editor);
-        let keys = (0..controllers.n_items()).filter_map(|index| controllers.item(index))
+        let existing: Vec<_> = (0..controllers.n_items())
+            .filter_map(|index| controllers.item(index))
+            .collect();
+        install_editor_format_shortcuts(&editor, new_editor_image_history());
+        let keys = (0..controllers.n_items())
+            .filter_map(|index| controllers.item(index))
             .filter(|controller| !existing.contains(controller))
-            .find_map(|controller| controller.downcast::<gtk::EventControllerKey>().ok()).unwrap();
-        let existing: Vec<_> = (0..controllers.n_items()).filter_map(|index| controllers.item(index)).collect();
-        connect_tab_navigation(&editor, gtk::Button::new().upcast(), gtk::Button::new().upcast());
-        let navigation = (0..controllers.n_items()).filter_map(|index| controllers.item(index))
-            .find(|controller| !existing.contains(controller)).unwrap()
-            .downcast::<gtk::EventControllerKey>().unwrap();
+            .find_map(|controller| controller.downcast::<gtk::EventControllerKey>().ok())
+            .unwrap();
+        let existing: Vec<_> = (0..controllers.n_items())
+            .filter_map(|index| controllers.item(index))
+            .collect();
+        connect_tab_navigation(
+            &editor,
+            gtk::Button::new().upcast(),
+            gtk::Button::new().upcast(),
+        );
+        let navigation = (0..controllers.n_items())
+            .filter_map(|index| controllers.item(index))
+            .find(|controller| !existing.contains(controller))
+            .unwrap()
+            .downcast::<gtk::EventControllerKey>()
+            .unwrap();
         let buffer = editor.buffer();
         set_editor_view_content(&editor, "Title\n- Parent\n- Child\n- [x] Task\nParagraph");
         buffer.place_cursor(&buffer.iter_at_line(2).unwrap());
@@ -5991,15 +7078,35 @@ mod editor_format_tests {
                 gtk::glib::Propagation::Proceed
             }
         };
-        assert!(!navigation.emit_by_name::<bool>("key-pressed",
-            &[&gtk::gdk::Key::Tab, &0u32, &gtk::gdk::ModifierType::empty()]));
-        assert_eq!(press(gtk::gdk::Key::Tab, gtk::gdk::ModifierType::empty()), gtk::glib::Propagation::Stop);
-        assert_eq!(markdown_from_editor_buffer(&buffer), "# Title\n- Parent\n    - Child\n- [x] Task\nParagraph");
+        assert!(!navigation.emit_by_name::<bool>(
+            "key-pressed",
+            &[&gtk::gdk::Key::Tab, &0u32, &gtk::gdk::ModifierType::empty()]
+        ));
+        assert_eq!(
+            press(gtk::gdk::Key::Tab, gtk::gdk::ModifierType::empty()),
+            gtk::glib::Propagation::Stop
+        );
+        assert_eq!(
+            markdown_from_editor_buffer(&buffer),
+            "# Title\n- Parent\n    - Child\n- [x] Task\nParagraph"
+        );
         buffer.undo();
-        assert_eq!(markdown_from_editor_buffer(&buffer), "# Title\n- Parent\n- Child\n- [x] Task\nParagraph");
+        assert_eq!(
+            markdown_from_editor_buffer(&buffer),
+            "# Title\n- Parent\n- Child\n- [x] Task\nParagraph"
+        );
         buffer.redo();
-        assert_eq!(press(gtk::gdk::Key::ISO_Left_Tab, gtk::gdk::ModifierType::SHIFT_MASK), gtk::glib::Propagation::Stop);
-        buffer.select_range(&buffer.iter_at_line(2).unwrap(), &buffer.iter_at_line(4).unwrap());
+        assert_eq!(
+            press(
+                gtk::gdk::Key::ISO_Left_Tab,
+                gtk::gdk::ModifierType::SHIFT_MASK
+            ),
+            gtk::glib::Propagation::Stop
+        );
+        buffer.select_range(
+            &buffer.iter_at_line(2).unwrap(),
+            &buffer.iter_at_line(4).unwrap(),
+        );
         assert!(indent_editor_list(&editor, false));
         let nested = "# Title\n- Parent\n    - Child\n    - [x] Task\nParagraph";
         assert_eq!(markdown_from_editor_buffer(&buffer), nested);
@@ -6009,14 +7116,29 @@ mod editor_format_tests {
         let mut end = buffer.iter_at_line(2).unwrap();
         end.forward_to_line_end();
         buffer.place_cursor(&end);
-        assert_eq!(press(gtk::gdk::Key::Return, gtk::gdk::ModifierType::empty()), gtk::glib::Propagation::Stop);
-        assert_eq!(markdown_from_editor_buffer(&buffer), "# Title\n- Parent\n    - Child\n    - \n    - [x] Task\nParagraph");
+        assert_eq!(
+            press(gtk::gdk::Key::Return, gtk::gdk::ModifierType::empty()),
+            gtk::glib::Propagation::Stop
+        );
+        assert_eq!(
+            markdown_from_editor_buffer(&buffer),
+            "# Title\n- Parent\n    - Child\n    - \n    - [x] Task\nParagraph"
+        );
         assert!(continue_editor_list_on_enter(&editor));
-        assert_eq!(markdown_from_editor_buffer(&buffer), "# Title\n- Parent\n    - Child\n- \n    - [x] Task\nParagraph");
+        assert_eq!(
+            markdown_from_editor_buffer(&buffer),
+            "# Title\n- Parent\n    - Child\n- \n    - [x] Task\nParagraph"
+        );
         assert!(continue_editor_list_on_enter(&editor));
-        assert_eq!(markdown_from_editor_buffer(&buffer), "# Title\n- Parent\n    - Child\n\n    - [x] Task\nParagraph");
+        assert_eq!(
+            markdown_from_editor_buffer(&buffer),
+            "# Title\n- Parent\n    - Child\n\n    - [x] Task\nParagraph"
+        );
         buffer.place_cursor(&buffer.end_iter());
-        assert_eq!(press(gtk::gdk::Key::Tab, gtk::gdk::ModifierType::empty()), gtk::glib::Propagation::Proceed);
+        assert_eq!(
+            press(gtk::gdk::Key::Tab, gtk::gdk::ModifierType::empty()),
+            gtk::glib::Propagation::Proceed
+        );
         Ok(())
     }
 
@@ -6099,10 +7221,16 @@ mod editor_format_tests {
         assert_eq!(text, "Title\nSee docs now");
         let mut inside = buffer.iter_at_line(1).unwrap();
         inside.forward_chars(5);
-        assert_eq!(link_url_at(&inside).as_deref(), Some("https://example.test/a"));
+        assert_eq!(
+            link_url_at(&inside).as_deref(),
+            Some("https://example.test/a")
+        );
         let (_, link_start, link_end) = link_at_cursor(&buffer, &inside).unwrap();
         assert_eq!(buffer.slice(&link_start, &link_end, true), "docs");
-        assert_eq!(markdown_from_editor_buffer(&buffer), format!("# Title\n{}", &source[6..]));
+        assert_eq!(
+            markdown_from_editor_buffer(&buffer),
+            format!("# Title\n{}", &source[6..])
+        );
 
         let mut start = buffer.iter_at_line(1).unwrap();
         let mut end = start;
@@ -6119,6 +7247,513 @@ mod editor_format_tests {
             markdown_from_editor_buffer(&buffer),
             "# Title\nSee **docs** now"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn images_render_inline_and_round_trip_through_markdown() -> Result<()> {
+        if std::env::var_os("MEMONOTES_EDITOR_FORMAT_TEST").is_none() {
+            let image_data = tempfile::tempdir()?;
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "editor_format_tests::images_render_inline_and_round_trip_through_markdown",
+                    "--test-threads=1",
+                ])
+                .env("MEMONOTES_EDITOR_FORMAT_TEST", "1")
+                .env("XDG_DATA_HOME", image_data.path())
+                .status()?;
+            assert!(status.success());
+            return Ok(());
+        }
+        gtk::init()?;
+        let directory = tempfile::tempdir()?;
+        let image_path = directory.path().join("diagram.svg");
+        std::fs::write(
+            &image_path,
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><rect width="16" height="16" fill="red"/></svg>"#,
+        )?;
+        let editor = gtk::TextView::new();
+        let image_history = new_editor_image_history();
+        let _toolbar = editor_format_toolbar(&editor, Rc::clone(&image_history));
+        install_editor_format_shortcuts(&editor, Rc::clone(&image_history));
+        let editor_controllers = editor.observe_controllers();
+        assert!(
+            (0..editor_controllers.n_items())
+                .filter_map(|index| editor_controllers.item(index))
+                .any(|controller| controller.is::<gtk::DropTarget>())
+        );
+        set_editor_view_content(&editor, "# Title\n");
+        let saved_markdown = Rc::new(RefCell::new(String::new()));
+        let saved_markdown_for_change = Rc::clone(&saved_markdown);
+        let save_count = Rc::new(Cell::new(0));
+        let save_count_for_change = Rc::clone(&save_count);
+        let editor_for_change = editor.downgrade();
+        editor.buffer().connect_changed(move |buffer| {
+            if editor_for_change
+                .upgrade()
+                .is_some_and(|editor| editor.has_css_class("editor-image-moving"))
+            {
+                return;
+            }
+            save_count_for_change.set(save_count_for_change.get() + 1);
+            *saved_markdown_for_change.borrow_mut() = markdown_from_editor_buffer(buffer);
+        });
+        insert_editor_image_file(&editor, &image_path, &image_history)?;
+        let buffer = editor.buffer();
+        let source = markdown_from_editor_buffer(&buffer);
+        assert!(source.contains("(memonotes-image://"));
+        assert_eq!(std::fs::read_dir(editor_image_directory()?)?.count(), 1);
+        assert_eq!(*saved_markdown.borrow(), source);
+        assert_eq!(markdown_from_editor_buffer(&buffer), source);
+
+        let key_controller = (0..editor_controllers.n_items())
+            .filter_map(|index| editor_controllers.item(index))
+            .find_map(|controller| controller.downcast::<gtk::EventControllerKey>().ok())
+            .unwrap();
+        assert!(key_controller.emit_by_name::<bool>(
+            "key-pressed",
+            &[
+                &gtk::gdk::Key::z,
+                &0u32,
+                &gtk::gdk::ModifierType::CONTROL_MASK,
+            ]
+        ));
+        assert_eq!(markdown_from_editor_buffer(&buffer), "# Title");
+        assert!(key_controller.emit_by_name::<bool>(
+            "key-pressed",
+            &[
+                &gtk::gdk::Key::z,
+                &0u32,
+                &(gtk::gdk::ModifierType::CONTROL_MASK | gtk::gdk::ModifierType::SHIFT_MASK),
+            ]
+        ));
+        assert_eq!(markdown_from_editor_buffer(&buffer), source);
+        save_count.set(0);
+
+        let image_anchor = buffer.iter_at_line(1).unwrap().child_anchor().unwrap();
+        let image_widget = image_anchor.widgets().into_iter().next().unwrap();
+        let controllers = image_widget.observe_controllers();
+        assert!(
+            (0..controllers.n_items())
+                .filter_map(|index| controllers.item(index))
+                .any(|controller| controller.is::<gtk::DragSource>())
+        );
+        assert!(
+            (0..controllers.n_items())
+                .filter_map(|index| controllers.item(index))
+                .any(|controller| controller.is::<gtk::GestureClick>())
+        );
+        let drag_source = (0..controllers.n_items())
+            .filter_map(|index| controllers.item(index))
+            .find_map(|controller| controller.downcast::<gtk::DragSource>().ok())
+            .unwrap();
+        assert_eq!(drag_source.actions(), gtk::gdk::DragAction::COPY);
+        select_editor_image(&editor, &image_widget, &image_anchor);
+        assert!(image_widget.has_css_class("editor-image-selected"));
+        assert!(buffer.selection_bounds().is_none());
+        assert_eq!(
+            buffer.iter_at_mark(&buffer.get_insert()).offset(),
+            buffer.iter_at_child_anchor(&image_anchor).offset()
+        );
+
+        let mut text_end = buffer.end_iter();
+        buffer.insert(&mut text_end, "left right");
+        let before_move = markdown_from_editor_buffer(&buffer);
+        let image_markdown = editor_image_markdown(&image_widget).unwrap();
+        let target_offset = buffer.iter_at_line(1).unwrap().offset() + 1 + "left".len() as i32;
+        save_count.set(0);
+        assert!(move_editor_image_to_offset(
+            &editor,
+            &image_widget.widget_name(),
+            target_offset,
+            &image_history,
+        ));
+        let moved = format!("# Title\nleft{image_markdown} right");
+        assert_eq!(markdown_from_editor_buffer(&buffer), moved);
+        assert_eq!(*saved_markdown.borrow(), moved);
+        assert_eq!(save_count.get(), 1);
+        let mut moved_image_position = buffer.iter_at_line(1).unwrap();
+        moved_image_position.forward_chars(4);
+        let moved_anchor = moved_image_position.child_anchor().unwrap();
+        let moved_widget = moved_anchor.widgets().into_iter().next().unwrap();
+        assert_eq!(moved_widget, image_widget);
+        assert!(moved_widget.has_css_class("editor-image-selected"));
+
+        assert_eq!(image_history.borrow().undo.len(), 2);
+        assert!(key_controller.emit_by_name::<bool>(
+            "key-pressed",
+            &[
+                &gtk::gdk::Key::z,
+                &0u32,
+                &gtk::gdk::ModifierType::CONTROL_MASK,
+            ]
+        ));
+        assert_eq!(markdown_from_editor_buffer(&buffer), before_move);
+        assert!(key_controller.emit_by_name::<bool>(
+            "key-pressed",
+            &[
+                &gtk::gdk::Key::z,
+                &0u32,
+                &(gtk::gdk::ModifierType::CONTROL_MASK | gtk::gdk::ModifierType::SHIFT_MASK),
+            ]
+        ));
+        assert_eq!(markdown_from_editor_buffer(&buffer), moved);
+
+        let mut moved_image_position = buffer.iter_at_line(1).unwrap();
+        moved_image_position.forward_chars(4);
+        let moved_anchor = moved_image_position.child_anchor().unwrap();
+        let moved_widget = moved_anchor.widgets().into_iter().next().unwrap();
+        assert!(moved_widget.is::<gtk::Picture>());
+        let drag_value =
+            gtk::glib::BoxedAnyObject::new(moved_widget.widget_name().to_string()).to_value();
+        let drop_x = 10_000.0_f64;
+        let drop_y = 10_000.0_f64;
+        save_count.set(0);
+        assert!(handle_editor_image_drop(
+            &editor,
+            &drag_value,
+            drop_x,
+            drop_y,
+            &image_history,
+        ));
+        while gtk::glib::MainContext::default().pending() {
+            gtk::glib::MainContext::default().iteration(false);
+        }
+        let dropped = format!("# Title\nleft right{image_markdown}");
+        assert_eq!(markdown_from_editor_buffer(&buffer), dropped);
+        assert_eq!(*saved_markdown.borrow(), dropped);
+        assert_eq!(save_count.get(), 1);
+
+        let press = |key: gtk::gdk::Key, modifiers: gtk::gdk::ModifierType| {
+            assert!(key_controller.emit_by_name::<bool>("key-pressed", &[&key, &0u32, &modifiers]));
+        };
+        let ctrl = gtk::gdk::ModifierType::CONTROL_MASK;
+        buffer.insert_at_cursor("!");
+        let typed = markdown_from_editor_buffer(&buffer);
+        assert_ne!(typed, dropped);
+        press(gtk::gdk::Key::z, ctrl);
+        assert_eq!(markdown_from_editor_buffer(&buffer), dropped);
+        press(gtk::gdk::Key::y, ctrl);
+        assert_eq!(markdown_from_editor_buffer(&buffer), typed);
+        press(gtk::gdk::Key::z, ctrl);
+        press(gtk::gdk::Key::z, ctrl);
+        assert_eq!(markdown_from_editor_buffer(&buffer), moved);
+        press(gtk::gdk::Key::y, ctrl);
+        assert_eq!(markdown_from_editor_buffer(&buffer), dropped);
+        press(gtk::gdk::Key::z, ctrl);
+        press(gtk::gdk::Key::z, ctrl);
+        press(gtk::gdk::Key::z, ctrl);
+        assert_eq!(markdown_from_editor_buffer(&buffer), "# Title");
+        press(gtk::gdk::Key::y, ctrl);
+        assert_eq!(markdown_from_editor_buffer(&buffer), source);
+        press(gtk::gdk::Key::z, ctrl);
+        set_editor_view_content(&editor, "Other\nNote");
+        assert!(image_history.borrow().undo.is_empty());
+        assert!(image_history.borrow().redo.is_empty());
+
+        let reloaded = gtk::TextView::new();
+        install_editor_format_shortcuts(&reloaded, new_editor_image_history());
+        set_editor_view_content(&reloaded, &dropped);
+        let reloaded_buffer = reloaded.buffer();
+        let mut image_position = reloaded_buffer.iter_at_line(1).unwrap();
+        image_position.forward_to_line_end();
+        image_position.backward_char();
+        let image_anchor = image_position.child_anchor();
+        let image_widget = image_anchor.unwrap().widgets().into_iter().next().unwrap();
+        assert!(image_widget.is::<gtk::Picture>());
+        assert_eq!(markdown_from_editor_buffer(&reloaded_buffer), dropped);
+        Ok(())
+    }
+
+    #[test]
+    fn image_drop_snaps_after_line_text_and_shows_a_cursor_indicator() -> Result<()> {
+        if std::env::var_os("MEMONOTES_EDITOR_FORMAT_TEST").is_none() {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "editor_format_tests::image_drop_snaps_after_line_text_and_shows_a_cursor_indicator",
+                    "--test-threads=1",
+                ])
+                .env("MEMONOTES_EDITOR_FORMAT_TEST", "1")
+                .status()?;
+            assert!(status.success());
+            return Ok(());
+        }
+        gtk::init()?;
+        let editor = gtk::TextView::new();
+        set_editor_view_content(&editor, "Title\nfirst line here\nsecond line");
+        let window = gtk::Window::builder()
+            .default_width(480)
+            .default_height(240)
+            .child(&editor)
+            .build();
+        window.present();
+        while gtk::glib::MainContext::default().pending() {
+            gtk::glib::MainContext::default().iteration(false);
+        }
+        let buffer = editor.buffer();
+        let widget_point = |offset: i32, dx: i32| {
+            let rect = editor.iter_location(&buffer.iter_at_offset(offset));
+            let (x, y) = editor.buffer_to_window_coords(
+                gtk::TextWindowType::Widget,
+                rect.x() + dx,
+                rect.y() + rect.height() / 2,
+            );
+            (f64::from(x), f64::from(y))
+        };
+        let first_line = buffer.iter_at_line(1).unwrap();
+        let mut first_end = first_line;
+        first_end.forward_to_line_end();
+
+        let (x, y) = widget_point(first_end.offset(), 150);
+        assert_eq!(editor_drop_iter(&editor, x, y).offset(), first_end.offset());
+        let (x, y) = widget_point(first_line.offset() + 5, 1);
+        assert_eq!(
+            editor_drop_iter(&editor, x, y).offset(),
+            first_line.offset() + 5
+        );
+        let (x, y) = widget_point(0, 1);
+        assert_eq!(
+            editor_drop_iter(&editor, x, y).offset(),
+            first_line.offset()
+        );
+        assert_eq!(
+            editor_drop_iter(&editor, 100.0, 5_000.0).offset(),
+            buffer.end_iter().offset()
+        );
+
+        let indicator: DropIndicator = Rc::new(RefCell::new(None));
+        let (x, y) = widget_point(first_end.offset(), 150);
+        show_editor_image_drop_indicator(&editor, &indicator, x, y);
+        let bar = indicator.borrow().clone().unwrap();
+        assert_eq!(
+            bar.ancestor(gtk::TextView::static_type()).as_ref(),
+            Some(editor.upcast_ref::<gtk::Widget>())
+        );
+        assert!(!bar.can_target());
+        hide_editor_image_drop_indicator(&indicator);
+        assert!(!bar.is_visible());
+        assert!(indicator.borrow().is_some());
+        window.set_child(gtk::Widget::NONE);
+        window.destroy();
+        Ok(())
+    }
+
+    #[test]
+    fn image_corner_handles_resize_with_aspect_ratio_and_undo() -> Result<()> {
+        if std::env::var_os("MEMONOTES_EDITOR_FORMAT_TEST").is_none() {
+            let image_data = tempfile::tempdir()?;
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "editor_format_tests::image_corner_handles_resize_with_aspect_ratio_and_undo",
+                    "--test-threads=1",
+                ])
+                .env("MEMONOTES_EDITOR_FORMAT_TEST", "1")
+                .env("XDG_DATA_HOME", image_data.path())
+                .status()?;
+            assert!(status.success());
+            return Ok(());
+        }
+        gtk::init()?;
+        let directory = tempfile::tempdir()?;
+        let image_path = directory.path().join("wide.svg");
+        std::fs::write(
+            &image_path,
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20"><rect width="40" height="20" fill="blue"/></svg>"#,
+        )?;
+        let editor = gtk::TextView::new();
+        editor.set_left_margin(44);
+        editor.set_top_margin(12);
+        let history = new_editor_image_history();
+        let _toolbar = editor_format_toolbar(&editor, Rc::clone(&history));
+        install_editor_format_shortcuts(&editor, Rc::clone(&history));
+        set_editor_view_content(&editor, "# Title\n");
+        let window = gtk::Window::builder()
+            .default_width(480)
+            .default_height(300)
+            .child(&editor)
+            .build();
+        window.present();
+        let pump = || {
+            while gtk::glib::MainContext::default().pending() {
+                gtk::glib::MainContext::default().iteration(false);
+            }
+        };
+        pump();
+        insert_editor_image_file(&editor, &image_path, &history)?;
+        pump();
+        let buffer = editor.buffer();
+        let widget_at_line = |editor: &gtk::TextView| {
+            let anchor = editor
+                .buffer()
+                .iter_at_line(1)
+                .unwrap()
+                .child_anchor()
+                .unwrap();
+            let widget = anchor.widgets().into_iter().next().unwrap();
+            (anchor, widget)
+        };
+        let (anchor, widget) = widget_at_line(&editor);
+        let picture = widget.clone().downcast::<gtk::Picture>().unwrap();
+        assert_eq!(picture.size_request(), (40, 20));
+
+        select_editor_image(&editor, &widget, &anchor);
+        pump();
+        let handles = history.borrow().handles.clone();
+        assert_eq!(handles.len(), 4);
+        assert!(handles.iter().all(|handle| handle.is_visible()));
+        // The handles must straddle the picture's corners, margins included.
+        let anchor_rect = editor.iter_location(&buffer.iter_at_child_anchor(&anchor));
+        let positions = history.borrow().handle_positions.clone();
+        let half = IMAGE_HANDLE_SIZE / 2;
+        assert_eq!(positions[0].0 + half, anchor_rect.x());
+        assert_eq!(positions[1].0 + half, anchor_rect.x() + 40);
+        assert_eq!(positions[3].1 - positions[0].1, 20);
+        assert!(!editor.is_cursor_visible());
+        let bounds = picture.compute_bounds(&editor).unwrap();
+        let center = (
+            f64::from(bounds.x() + bounds.width() / 2.0),
+            f64::from(bounds.y() + bounds.height() / 2.0),
+        );
+        assert!(editor_image_at(&editor, center.0, center.1).is_some());
+        assert!(editor_image_at(&editor, 400.0, 250.0).is_none());
+        // Pressing selects, repeated presses keep the selection, pressing elsewhere deselects.
+        handle_editor_press(&editor, 400.0, 250.0);
+        assert!(!picture.has_css_class("editor-image-selected"));
+        assert!(handles.iter().all(|handle| !handle.is_visible()));
+        for _ in 0..3 {
+            handle_editor_press(&editor, center.0, center.1);
+            pump();
+            assert!(picture.has_css_class("editor-image-selected"));
+            assert!(history.borrow().resize_target.is_some());
+            assert!(handles.iter().all(|handle| handle.is_visible()));
+        }
+        let drag = |index: usize, offset_x: f64| {
+            let gesture = history.borrow().resize_gesture.clone().unwrap();
+            let (left, top) = history.borrow().handle_positions[index];
+            let half = IMAGE_HANDLE_SIZE / 2;
+            let (x, y) = editor.buffer_to_window_coords(
+                gtk::TextWindowType::Widget,
+                left + half,
+                top + half,
+            );
+            gesture.emit_by_name::<()>("drag-begin", &[&f64::from(x), &f64::from(y)]);
+            // Repeated updates must be idempotent; moving handles may not feed back into the size.
+            gesture.emit_by_name::<()>("drag-update", &[&offset_x, &0.0_f64]);
+            gesture.emit_by_name::<()>("drag-update", &[&offset_x, &0.0_f64]);
+            gesture.emit_by_name::<()>("drag-end", &[&offset_x, &0.0_f64]);
+            pump();
+        };
+
+        let before = markdown_from_editor_buffer(&buffer);
+        drag(3, 60.0);
+        assert_eq!(picture.size_request(), (100, 50));
+        let resized = markdown_from_editor_buffer(&buffer);
+        assert!(resized.contains("#w=100)"), "{resized}");
+
+        let key_controller = (0..editor.observe_controllers().n_items())
+            .filter_map(|index| editor.observe_controllers().item(index))
+            .find_map(|controller| controller.downcast::<gtk::EventControllerKey>().ok())
+            .unwrap();
+        let press = |key: gtk::gdk::Key, modifiers: gtk::gdk::ModifierType| {
+            assert!(key_controller.emit_by_name::<bool>("key-pressed", &[&key, &0u32, &modifiers]));
+        };
+        let ctrl = gtk::gdk::ModifierType::CONTROL_MASK;
+        press(gtk::gdk::Key::z, ctrl);
+        assert_eq!(markdown_from_editor_buffer(&buffer), before);
+        press(gtk::gdk::Key::y, ctrl);
+        assert_eq!(markdown_from_editor_buffer(&buffer), resized);
+        pump();
+
+        let (anchor, widget) = widget_at_line(&editor);
+        let picture = widget.clone().downcast::<gtk::Picture>().unwrap();
+        assert_eq!(picture.size_request(), (100, 50));
+        select_editor_image(&editor, &widget, &anchor);
+        pump();
+        drag(0, -40.0);
+        assert_eq!(picture.size_request(), (140, 70));
+        drag(3, -10_000.0);
+        assert_eq!(
+            picture.size_request(),
+            (IMAGE_MIN_WIDTH, IMAGE_MIN_WIDTH / 2)
+        );
+        drag(3, 100_000.0);
+        assert_eq!(
+            picture.size_request(),
+            (IMAGE_MAX_WIDTH, IMAGE_MAX_WIDTH / 2)
+        );
+
+        let reloaded = gtk::TextView::new();
+        set_editor_view_content(&reloaded, &markdown_from_editor_buffer(&buffer));
+        let reloaded_picture = reloaded
+            .buffer()
+            .iter_at_line(1)
+            .unwrap()
+            .child_anchor()
+            .unwrap()
+            .widgets()
+            .into_iter()
+            .next()
+            .unwrap()
+            .downcast::<gtk::Picture>()
+            .unwrap();
+        assert_eq!(reloaded_picture.size_request(), picture.size_request());
+
+        // Deleting an image, by key or by plain buffer edit, must be undoable as a real image.
+        let (anchor, widget) = widget_at_line(&editor);
+        select_editor_image(&editor, &widget, &anchor);
+        let with_image = markdown_from_editor_buffer(&buffer);
+        press(gtk::gdk::Key::Delete, gtk::gdk::ModifierType::empty());
+        assert!(!markdown_from_editor_buffer(&buffer).contains("!["));
+        press(gtk::gdk::Key::z, ctrl);
+        assert_eq!(markdown_from_editor_buffer(&buffer), with_image);
+        assert!(widget_at_line(&editor).1.is::<gtk::Picture>());
+        let mut start = buffer.iter_at_line(1).unwrap();
+        let mut end = start;
+        end.forward_char();
+        buffer.delete(&mut start, &mut end);
+        assert!(!markdown_from_editor_buffer(&buffer).contains("!["));
+        press(gtk::gdk::Key::z, ctrl);
+        assert_eq!(markdown_from_editor_buffer(&buffer), with_image);
+        assert!(widget_at_line(&editor).1.is::<gtk::Picture>());
+        press(gtk::gdk::Key::y, ctrl);
+        assert!(!markdown_from_editor_buffer(&buffer).contains("!["));
+        press(gtk::gdk::Key::z, ctrl);
+
+        // One click selects and hides the caret; a key press or an edit deselects again.
+        let (_, widget) = widget_at_line(&editor);
+        let click = (0..widget.observe_controllers().n_items())
+            .filter_map(|index| widget.observe_controllers().item(index))
+            .find_map(|controller| controller.downcast::<gtk::GestureClick>().ok())
+            .unwrap();
+        click.emit_by_name::<()>("pressed", &[&1_i32, &5.0_f64, &5.0_f64]);
+        assert!(widget.has_css_class("editor-image-selected"));
+        assert!(history.borrow().resize_target.is_some());
+        assert!(!editor.is_cursor_visible());
+        let handled = key_controller.emit_by_name::<bool>(
+            "key-pressed",
+            &[
+                &gtk::gdk::Key::Left,
+                &0u32,
+                &gtk::gdk::ModifierType::empty(),
+            ],
+        );
+        assert!(!handled);
+        assert!(!widget.has_css_class("editor-image-selected"));
+        assert!(editor.is_cursor_visible());
+        click.emit_by_name::<()>("pressed", &[&1_i32, &5.0_f64, &5.0_f64]);
+        assert!(widget.has_css_class("editor-image-selected"));
+        buffer.insert_at_cursor("x");
+        assert!(!widget.has_css_class("editor-image-selected"));
+        assert!(editor.is_cursor_visible());
+        assert!(handles.iter().all(|handle| !handle.is_visible()));
+
+        set_editor_view_content(&editor, "Other\nNote");
+        assert!(handles.iter().all(|handle| !handle.is_visible()));
+        window.set_child(gtk::Widget::NONE);
+        window.destroy();
         Ok(())
     }
 
@@ -6140,7 +7775,7 @@ mod editor_format_tests {
         let editor = gtk::TextView::new();
         let buffer = editor.buffer();
         buffer.set_text("Title\n");
-        install_editor_format_shortcuts(&editor);
+        install_editor_format_shortcuts(&editor, new_editor_image_history());
         buffer.place_cursor(&buffer.end_iter());
         for character in "www.example.test, ".chars() {
             buffer.insert_at_cursor(&character.to_string());
@@ -6149,7 +7784,10 @@ mod editor_format_tests {
         let url_start = buffer.iter_at_line(1).unwrap();
         let mut url_end = url_start;
         url_end.forward_chars("www.example.test".chars().count() as i32);
-        assert_eq!(link_url_at(&url_start).as_deref(), Some("https://www.example.test"));
+        assert_eq!(
+            link_url_at(&url_start).as_deref(),
+            Some("https://www.example.test")
+        );
         assert_eq!(buffer.slice(&url_start, &url_end, true), "www.example.test");
         assert_eq!(
             markdown_from_editor_buffer(&buffer),
@@ -6162,7 +7800,10 @@ mod editor_format_tests {
             buffer.insert_at_cursor(&character.to_string());
         }
         let complete_url = buffer.iter_at_line(1).unwrap();
-        assert_eq!(link_url_at(&complete_url).as_deref(), Some("https://example.com"));
+        assert_eq!(
+            link_url_at(&complete_url).as_deref(),
+            Some("https://example.com")
+        );
         assert_eq!(
             markdown_from_editor_buffer(&buffer),
             "# Title\n[https://example.com](https://example.com)"
@@ -6183,7 +7824,10 @@ mod editor_format_tests {
             buffer.insert_at_cursor(&character.to_string());
         }
         let edited_url_start = buffer.iter_at_line(1).unwrap();
-        assert_eq!(link_url_at(&edited_url_start).as_deref(), Some("https://nos.com"));
+        assert_eq!(
+            link_url_at(&edited_url_start).as_deref(),
+            Some("https://nos.com")
+        );
         assert_eq!(
             markdown_from_editor_buffer(&buffer),
             "# Title\n[https://nos.com](https://nos.com) "
@@ -6198,8 +7842,12 @@ mod editor_format_tests {
         for character in " example.net ".chars() {
             buffer.insert_at_cursor(&character.to_string());
         }
-        let bare_domain = buffer.iter_at_offset("Title\nhttps://example.test ".chars().count() as i32);
-        assert_eq!(link_url_at(&bare_domain).as_deref(), Some("https://example.net"));
+        let bare_domain =
+            buffer.iter_at_offset("Title\nhttps://example.test ".chars().count() as i32);
+        assert_eq!(
+            link_url_at(&bare_domain).as_deref(),
+            Some("https://example.net")
+        );
         Ok(())
     }
 
@@ -6248,10 +7896,12 @@ mod editor_format_tests {
 
         activate_menu_choice(&menu, 2);
         assert_eq!(menu.label().as_deref(), Some("H2"));
-        assert!(buffer
-            .iter_at_line(2)
-            .unwrap()
-            .has_tag(&heading_style_tag(&buffer, 2)));
+        assert!(
+            buffer
+                .iter_at_line(2)
+                .unwrap()
+                .has_tag(&heading_style_tag(&buffer, 2))
+        );
         assert_eq!(
             markdown_from_editor_buffer(&buffer),
             "# Title\nFirst paragraph\n## Second paragraph"
@@ -6259,10 +7909,12 @@ mod editor_format_tests {
 
         activate_menu_choice(&menu, 0);
         assert_eq!(menu.label().as_deref(), Some("P"));
-        assert!(!buffer
-            .iter_at_line(2)
-            .unwrap()
-            .has_tag(&heading_style_tag(&buffer, 2)));
+        assert!(
+            !buffer
+                .iter_at_line(2)
+                .unwrap()
+                .has_tag(&heading_style_tag(&buffer, 2))
+        );
         assert_eq!(
             markdown_from_editor_buffer(&buffer),
             "# Title\nFirst paragraph\nSecond paragraph"
@@ -6276,10 +7928,12 @@ mod editor_format_tests {
         assert_eq!(menu.label().as_deref(), Some("H3"));
         buffer.insert_at_cursor("New heading");
         assert_eq!(menu.label().as_deref(), Some("H3"));
-        assert!(buffer
-            .iter_at_line(3)
-            .unwrap()
-            .has_tag(&heading_style_tag(&buffer, 3)));
+        assert!(
+            buffer
+                .iter_at_line(3)
+                .unwrap()
+                .has_tag(&heading_style_tag(&buffer, 3))
+        );
         assert_eq!(
             markdown_from_editor_buffer(&buffer),
             "# Title\nFirst paragraph\nSecond paragraph\n### New heading"
@@ -6304,7 +7958,7 @@ mod editor_format_tests {
         gtk::init()?;
         let editor = gtk::TextView::new();
         set_editor_view_content(&editor, "Title\nBody");
-        let toolbar = editor_format_toolbar(&editor);
+        let toolbar = editor_format_toolbar(&editor, new_editor_image_history());
         let undo_button = toolbar
             .first_child()
             .unwrap()
@@ -6440,7 +8094,10 @@ mod editor_format_tests {
             cursor.height()
         );
         assert_eq!(checkbox.valign(), gtk::Align::End);
-        assert_eq!(checkbox.cursor().unwrap().name().as_deref(), Some("pointer"));
+        assert_eq!(
+            checkbox.cursor().unwrap().name().as_deref(),
+            Some("pointer")
+        );
         let checkmark = checkbox.child().unwrap().downcast::<gtk::Label>().unwrap();
         assert_eq!(checkmark.halign(), gtk::Align::Center);
         assert_eq!(checkmark.valign(), gtk::Align::Center);
@@ -6459,7 +8116,11 @@ mod editor_format_tests {
             assert_eq!(checkmark.text(), if checked { "✓" } else { "" });
             assert_eq!(
                 markdown_from_editor_buffer(&buffer),
-                if checked { "# Title\n- [x] Task" } else { "# Title\n- [ ] Task" }
+                if checked {
+                    "# Title\n- [x] Task"
+                } else {
+                    "# Title\n- [ ] Task"
+                }
             );
             while gtk::glib::MainContext::default().pending() {
                 gtk::glib::MainContext::default().iteration(false);
@@ -6549,7 +8210,10 @@ mod editor_format_tests {
             let cursor_offset = buffer.iter_at_mark(&buffer.get_insert()).offset();
             let content = markdown_from_editor_buffer(&buffer);
             set_editor_view_content(&editor, &content);
-            assert_eq!(buffer.iter_at_mark(&buffer.get_insert()).offset(), cursor_offset);
+            assert_eq!(
+                buffer.iter_at_mark(&buffer.get_insert()).offset(),
+                cursor_offset
+            );
             assert_eq!(buffer.iter_at_mark(&buffer.get_insert()).line(), 5);
             assert!(!typing_anchor.is_deleted());
         }
@@ -6559,8 +8223,14 @@ mod editor_format_tests {
         buffer.select_range(&selection_start, &selection_end);
         let content = markdown_from_editor_buffer(&buffer);
         set_editor_view_content(&editor, &content);
-        assert_eq!(buffer.iter_at_mark(&buffer.get_insert()).offset(), selection_start.offset());
-        assert_eq!(buffer.iter_at_mark(&buffer.selection_bound()).offset(), selection_end.offset());
+        assert_eq!(
+            buffer.iter_at_mark(&buffer.get_insert()).offset(),
+            selection_start.offset()
+        );
+        assert_eq!(
+            buffer.iter_at_mark(&buffer.selection_bound()).offset(),
+            selection_end.offset()
+        );
         Ok(())
     }
 }
@@ -6660,11 +8330,13 @@ fn inline_style_tag(buffer: &gtk::TextBuffer, mark: Mark) -> gtk::TextTag {
 }
 
 fn apply_rendered_spans(
+    editor: &gtk::TextView,
     buffer: &gtk::TextBuffer,
     text: &str,
     spans: &[MarkupSpan],
     headings: &[memonotes::editor_document::HeadingSpan],
     links: &[LinkSpan],
+    images: &[ImageSpan],
 ) {
     let (start, end) = buffer.bounds();
     remove_link_tags(buffer, &start, &end);
@@ -6709,9 +8381,23 @@ fn apply_rendered_spans(
         let end = buffer.iter_at_offset(text[..link.range.end].chars().count() as i32);
         buffer.apply_tag(&link_tag(buffer, &link.url), &start, &end);
     }
+
+    for image in images.iter().rev() {
+        let offset = text[..image.range.start].chars().count() as i32;
+        let mut start = buffer.iter_at_offset(offset);
+        let mut end = start;
+        end.forward_char();
+        buffer.delete(&mut start, &mut end);
+        let anchor = buffer.create_child_anchor(&mut start);
+        insert_editor_image_at_anchor(editor, &anchor, &image.url, &image.alt);
+    }
 }
 
-fn remove_editor_anchor_widgets(editor: &gtk::TextView, mut iter: gtk::TextIter, end: gtk::TextIter) {
+fn remove_editor_anchor_widgets(
+    editor: &gtk::TextView,
+    mut iter: gtk::TextIter,
+    end: gtk::TextIter,
+) {
     while iter.offset() < end.offset() {
         if let Some(anchor) = iter.child_anchor() {
             for widget in anchor.widgets() {
@@ -6731,18 +8417,23 @@ fn set_editor_view_content(editor: &gtk::TextView, content: &str) {
     let mapped = editor_text_from_markdown(content);
     let rendered = render_markdown_source(&mapped);
     let (start, end) = buffer.bounds();
+    editor.add_css_class("editor-content-replacing");
+    deselect_editor_image(editor);
     buffer.set_enable_undo(false);
     remove_editor_anchor_widgets(editor, start, end);
     buffer.set_text(&rendered.text);
     apply_rendered_spans(
+        editor,
         &buffer,
         &rendered.text,
         &rendered.spans,
         &rendered.headings,
         &rendered.links,
+        &rendered.images,
     );
     install_task_checkbuttons(editor);
     buffer.set_enable_undo(true);
+    editor.remove_css_class("editor-content-replacing");
 }
 
 fn task_checkbox_checked_tag(buffer: &gtk::TextBuffer) -> gtk::TextTag {
@@ -6755,9 +8446,7 @@ fn task_checkbox_checked_tag(buffer: &gtk::TextBuffer) -> gtk::TextTag {
 
 fn bullet_marker_tag(buffer: &gtk::TextBuffer) -> gtk::TextTag {
     editor_text_tag(buffer, "bullet-marker", || {
-        gtk::TextTag::builder()
-            .name("bullet-marker")
-            .build()
+        gtk::TextTag::builder().name("bullet-marker").build()
     })
 }
 
@@ -6885,9 +8574,8 @@ fn markdown_from_editor_buffer(buffer: &gtk::TextBuffer) -> String {
         let marker_offset = char_offset + indentation;
         let line_chars: Vec<_> = line.chars().collect();
         let line_start = buffer.iter_at_offset(char_offset as i32);
-        let heading_level = (1..=6).find(|level| {
-            line_start.has_tag(&heading_style_tag(buffer, *level))
-        });
+        let heading_level =
+            (1..=6).find(|level| line_start.has_tag(&heading_style_tag(buffer, *level)));
         let (prefix, prefix_chars) = if trimmed.starts_with("\u{fffc} ") {
             let checkbox = buffer.iter_at_offset(marker_offset as i32);
             let checked = checkbox.has_tag(&task_checkbox_checked_tag(buffer));
@@ -6950,10 +8638,21 @@ fn serialize_inline_range(
         .into_iter()
         .map(|mark| (mark, inline_style_tag(buffer, mark)))
         .collect();
-    let mut runs: Vec<(Option<String>, Vec<Mark>, String)> = Vec::new();
+    let mut runs: Vec<(Option<String>, Vec<Mark>, String, Option<String>)> = Vec::new();
 
     for (character_offset, character) in characters.iter().enumerate() {
         let iter = buffer.iter_at_offset((start_offset + character_offset) as i32);
+        if *character == '\u{fffc}'
+            && let Some(image) = iter.child_anchor().and_then(|anchor| {
+                anchor
+                    .widgets()
+                    .into_iter()
+                    .find_map(|widget| editor_image_markdown(&widget))
+            })
+        {
+            runs.push((None, Vec::new(), String::new(), Some(image)));
+            continue;
+        }
         let marks: Vec<_> = tags
             .iter()
             .filter(|(_, tag)| iter.has_tag(tag))
@@ -6961,19 +8660,26 @@ fn serialize_inline_range(
             .collect();
         let url = link_url_at(&iter);
         match runs.last_mut() {
-            Some((last_url, last_marks, text)) if *last_url == url && *last_marks == marks => {
+            Some((last_url, last_marks, text, None))
+                if *last_url == url && *last_marks == marks =>
+            {
                 text.push(*character)
             }
-            _ => runs.push((url, marks, character.to_string())),
+            _ => runs.push((url, marks, character.to_string(), None)),
         }
     }
 
     let mut output = String::new();
     let mut index = 0;
     while index < runs.len() {
+        if let Some(image) = &runs[index].3 {
+            output.push_str(image);
+            index += 1;
+            continue;
+        }
         let url = runs[index].0.clone();
         let mut label = String::new();
-        while index < runs.len() && runs[index].0 == url {
+        while index < runs.len() && runs[index].3.is_none() && runs[index].0 == url {
             label.push_str(&serialize_marked_text(&runs[index].2, &runs[index].1));
             index += 1;
         }

@@ -11,6 +11,7 @@ pub mod adapters;
 pub mod credentials;
 pub mod editor_document;
 pub mod i18n;
+pub mod images;
 pub mod memo;
 pub mod memos;
 

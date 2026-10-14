@@ -9,6 +9,30 @@ use std::collections::HashSet;
 use std::env;
 use std::time::Duration;
 
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const ATTACHMENT_TIMEOUT: Duration = Duration::from_secs(300);
+const MAX_ATTACHMENT_BYTES: usize = 30 * 1024 * 1024;
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let value = chunk.iter().enumerate().fold(0u32, |value, (index, byte)| {
+            value | u32::from(*byte) << (16 - 8 * index)
+        });
+        for index in 0..4usize {
+            if index <= chunk.len() {
+                output.push(char::from(
+                    ALPHABET[(value >> (18 - 6 * index as u32) & 63) as usize],
+                ));
+            } else {
+                output.push('=');
+            }
+        }
+    }
+    output
+}
+
 pub fn is_connection_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause
@@ -50,6 +74,11 @@ pub struct MemoProperty {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct RemoteAttachment {
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteSpace {
     pub name: String,
@@ -85,7 +114,7 @@ impl MemosClient {
         api_base.set_path(&format!("{base_path}/api/v1"));
 
         let client = Client::builder()
-            .timeout(Duration::from_secs(15))
+            .timeout(REQUEST_TIMEOUT)
             .redirect(Policy::none())
             .build()
             .context(tr("api.memos.error.http_client_initialization_failed"))?;
@@ -171,6 +200,88 @@ impl MemosClient {
         )
     }
 
+    pub fn attachment_exists(&self, id: &str) -> Result<bool> {
+        let response = self
+            .client
+            .get(self.endpoint(&format!("attachments/{id}"))?)
+            .bearer_auth(&self.token)
+            .send()
+            .context(tr("api.memos.error.server_unreachable"))?;
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        ensure!(
+            status.is_success(),
+            crate::tr_format!("api.memos.error.request_http_status", status = status)
+        );
+        Ok(true)
+    }
+
+    pub fn upload_attachment(
+        &self,
+        id: &str,
+        filename: &str,
+        mime: &str,
+        bytes: &[u8],
+    ) -> Result<()> {
+        ensure!(
+            bytes.len() <= MAX_ATTACHMENT_BYTES,
+            tr("api.memos.error.image_too_large")
+        );
+        let body = serde_json::json!({
+            "filename": filename,
+            "type": mime,
+            "content": base64_encode(bytes),
+        });
+        self.send_mutation_with_timeout(
+            Method::POST,
+            "attachments",
+            &[("attachmentId", id.to_owned())],
+            Some(&body),
+            ATTACHMENT_TIMEOUT,
+        )
+        .map(|_| ())
+    }
+
+    pub fn download_attachment(&self, id: &str, filename: &str) -> Result<Vec<u8>> {
+        let mut endpoint = self.api_base.clone();
+        let base_path = self.api_base.path().trim_end_matches("/api/v1");
+        endpoint.set_path(&format!("{base_path}/file/attachments/{id}/{filename}"));
+        let response = self
+            .client
+            .get(endpoint)
+            .bearer_auth(&self.token)
+            .timeout(ATTACHMENT_TIMEOUT)
+            .send()
+            .context(tr("api.memos.error.server_unreachable"))?;
+        let status = response.status();
+        ensure!(
+            status.is_success(),
+            crate::tr_format!("api.memos.error.request_http_status", status = status)
+        );
+        ensure!(
+            response
+                .content_length()
+                .is_none_or(|length| length <= MAX_ATTACHMENT_BYTES as u64),
+            tr("api.memos.error.image_too_large")
+        );
+        let bytes = response
+            .bytes()
+            .context(tr("api.memos.error.server_unreachable"))?;
+        ensure!(
+            bytes.len() <= MAX_ATTACHMENT_BYTES,
+            tr("api.memos.error.image_too_large")
+        );
+        Ok(bytes.to_vec())
+    }
+
+    pub fn memo_attachment_names(&self, memo_id: &str) -> Result<Vec<String>> {
+        let attachments: Vec<RemoteAttachment> =
+            self.list_pages(&format!("memos/{memo_id}/attachments"), "attachments")?;
+        Ok(attachments.into_iter().map(|item| item.name).collect())
+    }
+
     pub fn uses_plain_http(&self) -> bool {
         self.api_base.scheme() == "http"
     }
@@ -182,10 +293,34 @@ impl MemosClient {
         query: &[(&str, String)],
         body: Option<&Value>,
     ) -> Result<()> {
+        self.send_mutation_json(method, resource, query, body)
+            .map(|_| ())
+    }
+
+    // Returns the response body, or Null when it is empty or not JSON.
+    pub(crate) fn send_mutation_json(
+        &self,
+        method: Method,
+        resource: &str,
+        query: &[(&str, String)],
+        body: Option<&Value>,
+    ) -> Result<Value> {
+        self.send_mutation_with_timeout(method, resource, query, body, REQUEST_TIMEOUT)
+    }
+
+    fn send_mutation_with_timeout(
+        &self,
+        method: Method,
+        resource: &str,
+        query: &[(&str, String)],
+        body: Option<&Value>,
+        timeout: Duration,
+    ) -> Result<Value> {
         let mut request = self
             .client
             .request(method, self.endpoint(resource)?)
             .bearer_auth(&self.token)
+            .timeout(timeout)
             .query(query);
         if let Some(body) = body {
             request = request.json(body);
@@ -194,11 +329,25 @@ impl MemosClient {
             .send()
             .context(tr("api.memos.error.server_unreachable"))?;
         let status = response.status();
-        ensure!(
-            status.is_success(),
-            crate::tr_format!("api.memos.error.mutation_http_status", status = status)
-        );
-        Ok(())
+        if !status.is_success() {
+            let message = response
+                .text()
+                .ok()
+                .and_then(|body| serde_json::from_str::<Value>(&body).ok())
+                .and_then(|body| body.get("message")?.as_str().map(str::to_owned))
+                .filter(|message| !message.is_empty());
+            let error = crate::tr_format!("api.memos.error.mutation_http_status", status = status);
+            bail!(match message {
+                Some(message) =>
+                    format!("{error}: {}", message.chars().take(300).collect::<String>()),
+                None => error,
+            });
+        }
+        Ok(response
+            .text()
+            .ok()
+            .and_then(|body| serde_json::from_str(&body).ok())
+            .unwrap_or(Value::Null))
     }
 
     fn endpoint(&self, resource: &str) -> Result<Url> {
@@ -624,6 +773,15 @@ mod tests {
                 .contains("authorization: bearer probe-token")
         }));
         Ok(())
+    }
+
+    #[test]
+    fn base64_encodes_with_padding() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
     }
 
     #[test]
