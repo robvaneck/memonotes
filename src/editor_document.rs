@@ -16,6 +16,7 @@ pub struct RenderedMarkdown {
     pub links: Vec<LinkSpan>,
     pub images: Vec<ImageSpan>,
     pub tables: Vec<TableSpan>,
+    pub rules: Vec<Range<usize>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -93,6 +94,8 @@ pub fn render_markdown_source(markdown: &str) -> RenderedMarkdown {
     source_images.retain(|image| !in_table(&image.range));
     hidden_ranges.extend(source_images.iter().map(|image| image.range.clone()));
     hidden_ranges.extend(source_tables.iter().map(|table| table.range.clone()));
+    let source_rules = markdown_rule_ranges(markdown);
+    hidden_ranges.extend(source_rules.iter().cloned());
     hidden_ranges.sort_unstable_by_key(|range| range.start);
     let mut merged_hidden_ranges: Vec<Range<usize>> = Vec::with_capacity(hidden_ranges.len());
     for range in hidden_ranges {
@@ -110,6 +113,7 @@ pub fn render_markdown_source(markdown: &str) -> RenderedMarkdown {
     let mut hidden_range_index = 0;
     let mut image_index = 0;
     let mut table_index = 0;
+    let mut rule_index = 0;
 
     for (byte_offset, character) in markdown.char_indices() {
         let end_offset = byte_offset + character.len_utf8();
@@ -136,6 +140,13 @@ pub fn render_markdown_source(markdown: &str) -> RenderedMarkdown {
         {
             output.push('\u{fffc}');
             table_index += 1;
+        }
+        if source_rules
+            .get(rule_index)
+            .is_some_and(|rule| rule.start == byte_offset)
+        {
+            output.push('\u{fffc}');
+            rule_index += 1;
         }
         if !hidden {
             output.push(character);
@@ -205,6 +216,14 @@ pub fn render_markdown_source(markdown: &str) -> RenderedMarkdown {
         })
         .collect();
 
+    let rules = source_rules
+        .into_iter()
+        .map(|rule| {
+            let start = output_offsets[rule.start];
+            start..start + '\u{fffc}'.len_utf8()
+        })
+        .collect();
+
     RenderedMarkdown {
         text: output,
         spans,
@@ -212,7 +231,44 @@ pub fn render_markdown_source(markdown: &str) -> RenderedMarkdown {
         links,
         images,
         tables,
+        rules,
     }
+}
+
+// Rules nested in lists or quotes stay plain text.
+fn markdown_rule_ranges(markdown: &str) -> Vec<Range<usize>> {
+    let mut rules = Vec::new();
+    let mut container_depth = 0_usize;
+    for (event, range) in Parser::new_ext(markdown, markdown_options()).into_offset_iter() {
+        match event {
+            Event::Start(Tag::List(_) | Tag::BlockQuote(_)) => container_depth += 1,
+            Event::End(TagEnd::List(_) | TagEnd::BlockQuote(_)) => {
+                container_depth = container_depth.saturating_sub(1)
+            }
+            Event::Rule if container_depth == 0 => {
+                let end = range.start + markdown[range.clone()].trim_end_matches(['\n', '\r']).len();
+                rules.push(range.start..end);
+            }
+            _ => {}
+        }
+    }
+    rules
+}
+
+/// A line of three or more `-`, `*` or `_` (spaces allowed) is a thematic break, not a list item.
+pub fn is_thematic_break(line: &str) -> bool {
+    let mut markers = line.chars().filter(|character| !matches!(character, ' ' | '\t'));
+    let Some(first) = markers.next().filter(|first| matches!(first, '-' | '*' | '_')) else {
+        return false;
+    };
+    let mut count = 1;
+    for marker in markers {
+        if marker != first {
+            return false;
+        }
+        count += 1;
+    }
+    count >= 3
 }
 
 struct SourceTable {
@@ -1645,6 +1701,29 @@ mod tests {
         let rendered = render_markdown_source(&markdown);
         assert_eq!(rendered.tables[0].alignments, alignments);
         assert_eq!(table_markdown(&alignments, &rendered.tables[0].rows), markdown);
+    }
+
+    #[test]
+    fn thematic_breaks_become_one_placeholder() {
+        let rendered = render_markdown_source("# Title\n\nBefore\n\n---\n\nAfter\n\n* * *\n");
+
+        assert_eq!(rendered.text, "Title\n\nBefore\n\n\u{fffc}\n\nAfter\n\n\u{fffc}\n");
+        assert_eq!(rendered.rules.len(), 2);
+        assert_eq!(&rendered.text[rendered.rules[0].clone()], "\u{fffc}");
+        assert!(rendered.spans.is_empty());
+
+        let nested = render_markdown_source("> quote\n>\n> ---\n");
+        assert!(nested.rules.is_empty());
+    }
+
+    #[test]
+    fn thematic_break_lines_are_recognized() {
+        for line in ["---", "***", "___", "- - -", "  * * * *"] {
+            assert!(is_thematic_break(line), "{line}");
+        }
+        for line in ["--", "- item", "-*-", "--- x", ""] {
+            assert!(!is_thematic_break(line), "{line}");
+        }
     }
 
     #[test]

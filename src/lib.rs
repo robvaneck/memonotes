@@ -159,6 +159,20 @@ pub struct SyncOutboxEntry {
     pub event: SyncEvent,
 }
 
+// Folders deleted before their create was uploaded have no resource link yet.
+fn outbox_folder_owners(events: &[SyncEvent]) -> HashMap<String, String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            SyncEvent::FolderCreated { folder } | SyncEvent::FolderUpdated { folder } => folder
+                .account_id
+                .clone()
+                .map(|account_id| (folder.id.clone(), account_id)),
+            _ => None,
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct SyncRejection {
     pub account_id: String,
@@ -706,6 +720,53 @@ impl Store {
         )
     }
 
+    /// Number of queued changes that have not reached the account's server yet.
+    pub fn pending_event_count(&self, account_id: &str) -> Result<usize> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT payload FROM sync_outbox ORDER BY sequence")?;
+        let events = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .map(|payload| Ok(serde_json::from_str::<SyncEvent>(&payload?)?))
+            .collect::<Result<Vec<_>>>()?;
+        drop(statement);
+        let folder_owners = outbox_folder_owners(&events);
+        let mut count = 0;
+        for event in &events {
+            if self.outbox_event_owner(event, &folder_owners)?.as_deref() == Some(account_id) {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    fn outbox_event_owner(
+        &self,
+        event: &SyncEvent,
+        folder_owners: &HashMap<String, String>,
+    ) -> Result<Option<String>> {
+        Ok(match event {
+            SyncEvent::FolderCreated { folder } | SyncEvent::FolderUpdated { folder } => {
+                folder.account_id.clone()
+            }
+            SyncEvent::FolderDeleted { folder_id } => self
+                .connection
+                .query_row(
+                    "SELECT account_id FROM backend_resource_links WHERE local_id = ?1 AND remote_name LIKE 'spaces/%'",
+                    [folder_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .or_else(|| folder_owners.get(folder_id).cloned()),
+            SyncEvent::NoteCreated { note }
+            | SyncEvent::NoteUpdated { note }
+            | SyncEvent::NoteArchived { note }
+            | SyncEvent::NoteUnarchived { note }
+            | SyncEvent::NoteDeleted { note }
+            | SyncEvent::NoteRestored { note } => note.account_id.clone(),
+        })
+    }
+
     pub fn sync_backend_events(
         &self,
         account: &BackendAccount,
@@ -733,16 +794,7 @@ impl Store {
         let mut batches: Vec<(Vec<i64>, SyncEvent)> = Vec::new();
         for (sequence, payload) in pending {
             let event: SyncEvent = serde_json::from_str(&payload)?;
-            let owner = match &event {
-                SyncEvent::FolderCreated { folder } | SyncEvent::FolderUpdated { folder } => folder.account_id.clone(),
-                SyncEvent::FolderDeleted { folder_id } => self.connection.query_row(
-                    "SELECT account_id FROM backend_resource_links WHERE local_id = ?1 AND remote_name LIKE 'spaces/%'",
-                    [folder_id], |row| row.get::<_, String>(0),
-                ).optional()?.or_else(|| folder_owners.get(folder_id).cloned()),
-                SyncEvent::NoteCreated { note } | SyncEvent::NoteUpdated { note }
-                | SyncEvent::NoteArchived { note } | SyncEvent::NoteUnarchived { note }
-                | SyncEvent::NoteDeleted { note } | SyncEvent::NoteRestored { note } => note.account_id.clone(),
-            };
+            let owner = self.outbox_event_owner(&event, &folder_owners)?;
             if owner.as_deref() != Some(account.id.as_str()) {
                 continue;
             }
@@ -2089,6 +2141,24 @@ mod tests {
         assert_eq!(note.content, "# Lokaal\nGewijzigd");
         assert!(store.sync_conflicts("one")?.is_empty());
         assert_eq!(store.pending_sync_events(10)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn pending_event_count_only_counts_the_given_account() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let store = Store::open(&directory.path().join("notes.sqlite3"))?;
+        store.add_backend_account("one", "Werk", "memos", "https://memos.example.com")?;
+        store.add_backend_account("two", "Prive", "memos", "https://memos.example.org")?;
+        assert_eq!(store.pending_event_count("one")?, 0);
+
+        let folder = store.create_folder(Some("one"), "Trip")?;
+        store.create_note(Some("one"), Some(&folder))?;
+        store.create_note(Some("two"), None)?;
+        store.create_note(None, None)?;
+
+        assert_eq!(store.pending_event_count("one")?, 2);
+        assert_eq!(store.pending_event_count("two")?, 1);
         Ok(())
     }
 

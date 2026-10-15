@@ -1,11 +1,12 @@
 # Memonotes - product and implementation plan
 
-Original plan: 2026-10-05. Status updated: 2026-10-14.
+Original plan: 2026-10-05. Status updated: 2026-10-15.
 Status: GTK desktop app with SQLite, multiple Memos accounts, background fetching
 and automatic outbox uploads. Sync keeps base versions, detects conflicts,
 reconciles confirmed remote deletions and recovers uncertain creates. The editor
 supports WYSIWYG formatting and inline images that sync as Memos attachments;
-automatic merging and live multi-client race validation remain open.
+concurrent edits from other clients surface as a version conflict that the user resolves.
+Automatic merging is not built.
 Project directory: /home/fedora/repos/memonotes.
 The product agreements below describe the goal; the checklist shows what is
 actually implemented in the current code. See also [README.md](README.md) and
@@ -49,16 +50,16 @@ actually implemented in the current code. See also [README.md](README.md) and
 - [x] Archive/restore works remotely; tested end to end on the real server.
 - [x] Filter shared Memos spaces and non-private notes out of the UI; keep shared data only in the sync cache.
 - [x] GTK editor undo/redo with focus-aware Ctrl+Z routing and updated button state.
-- [ ] Finish the WYSIWYG editor: remaining block formatting and further end-to-end roundtrip tests. Inline formatting, headings/paragraphs, checklist, bullet, link, local image and undo/redo actions are wired up.
+- [x] Finish the WYSIWYG editor: inline formatting, headings/paragraphs, checklist, bullet and numbered lists (toolbar button and Ctrl+Shift+O), link, local image, table, horizontal rule (typing `---` and Enter) and undo/redo actions are wired up with roundtrip tests.
 - [x] Memos attachments for inline images: upload linked to the memo in the same mutation (Memos 0.31 otherwise rejects with 400), download and cache locally, map images from the Memos web client (also without a file name) to local images, and unbind/delete attachments when the user removes the image from the note. Attachment ID = local UUID; content references `/file/attachments/<id>/<file>`; the width is stored in the alt text because Memos rejects URL fragments. Verified manually against the target server; bare anchor characters without an image are no longer saved to Markdown.
 - [x] Insert an image offline and upload it after reconnect: confirmed manually, one attachment on the server.
-- [ ] Validate image sync further: upload retries after an interrupted connection without duplicate/orphaned attachments, server file size limits and non-image attachment types.
+- [x] Validate image sync further: upload retries after an interrupted connection without duplicate/orphaned attachments, server file size limits and non-image attachment types.
 - [x] Import one or many Markdown files (including large batches) into a selected account and folder/space. Every import creates new notes; existing notes are never overwritten.
 - [x] Export a selected account to a ZIP with one directory per folder/space and its Markdown files; include metadata and images.
-- [ ] Explicit onboarding/local import and safe unlinking with pending changes/export.
-- [ ] Narrow-window navigation, remembered pane widths/selection, accessibility and visible sync/conflict status.
-- [ ] Fedora/Flatpak packaging and network/keyring tests in the sandbox.
-- [ ] Apply Markdown formatting when opening MD files.
+- [x] Safe unlinking of an account: removing an account with unsent outbox changes shows a warning with the number of changes. Export is not offered in that dialog; use the account export first. A separate onboarding flow is not needed; the app starts locally and accounts are added in Settings.
+- [ ] Narrow-window navigation, accessibility and visible sync/conflict status. Remembered pane widths are not needed.
+- [x] Fedora/Flatpak packaging (`packaging/`, app ID `io.github.robvaneck.Memonotes`); network and GNOME Keyring tested in the sandbox. Screenshots and Flathub submission are still to do.
+- [x] Apply Markdown formatting when opening MD files. Blockquotes and code blocks stay visible as raw Markdown characters (`>`, backticks); that is accepted for now.
 - [x] Automatically continue lists (bullets, `-`/`*`/`+` and numbered) when pressing Enter.
 - [x] Table support: Markdown pipe tables render as editable grid widgets (top-level tables only; tables inside lists or quotes stay text) at full editor width, with an insert-table toolbar button, row/column add and delete, drag selection of cells with copy, cut, clear and paste, pasting spreadsheet ranges (Excel, Calc, web tables) as a new table, and undo/redo for structure changes.
 - [x] Bulk delete in the note list: Ctrl+A selects all notes, Delete archives the selection (or permanently deletes it, after confirmation, in the archive).
@@ -131,12 +132,11 @@ same note; switching tabs preserves content and never shows a stale version.
 Do not silently lose unknown Markdown/HTML from Memos in a WYSIWYG roundtrip.
 Keep unsupported content intact and warn specifically if visual editing is not safe.
 
-## 3. Storage choice and onboarding
+## 3. Storage choice
 
-The first start contains an explicit choice:
-
-1. On this device: start immediately, without an account, key or network requests.
-2. Connect Memos: enter the server address and personal app key, test the connection.
+There is no onboarding flow: the app starts immediately in local mode, without an
+account, key or network requests. Memos accounts are added in Settings, by entering the
+server address and personal app key and testing the connection.
 
 In Settings > Storage it stays possible to connect or disconnect Memos later.
 Current implementation: multiple Memos accounts with separate collections; local notes
@@ -213,8 +213,7 @@ and no nested folders: the consulted Space definition offers no parent field.
   The confirmation dialog therefore offers three choices: cancel, delete the folder
   and keep the notes, or delete the folder with all its notes. When keeping, notes are
   first moved to No folder; when deleting, notes are deleted first. Only then is
-  `FolderDeleted` processed. The core space flow has been tested live; concurrent
-  server changes remain part of the sync validation.
+  `FolderDeleted` processed. The core space flow has been tested live.
 - Discriminating integration test: use a PAT to create an own space, attach a PRIVATE
   note, rename it and read/move it from a second client.
 - If the space semantics turn out to be unsuitable, propose an alternative and agree again;
@@ -244,18 +243,18 @@ On sync, first create the required memo/attachment resources according to the te
 then publish the final image reference; never send local file paths to the server.
 Upload retries and interrupted uploads must not produce duplicate or orphaned attachments.
 Cache linked images locally for offline reading; report missing files visibly.
-The attachment API and URL/authentication are tested for images; server limits remain to be investigated.
+The attachment API and URL/authentication are tested for images.
 Retries must not create duplicate notes: use stable API-compatible IDs and
 query the server state first after an uncertain create outcome. This is implemented
-for note creates; attachment retries must follow this later.
+for note creates and attachment uploads.
 A change during an upload is not marked as synchronized by the upload acknowledgement.
 
 Do not resolve conflicts with blind last-write-wins: compare base, local and remote.
 The app keeps those three versions and lets the user keep local or server.
 Automatic merging does not exist.
-The API definitions consulted prove no atomic compare-and-swap; a read-before-write
-is therefore not complete race protection. Investigate this in the integration test and
-test it explicitly with multiple desktop clients and the Memos web client.
+The API definitions consulted prove no atomic compare-and-swap, so a read-before-write
+is not complete race protection. A change made by another client in that window is
+detected on the next fetch and reported as a version conflict.
 Missing items in a partial list never automatically mean deletion.
 Remote deletions are processed only after direct GET confirmation. Deletions with
 pending local edits or a concurrent server edit lead to recovery/conflict,
@@ -289,7 +288,7 @@ Memos collections can sync with other clients through the server; local-only col
    GNOME integration before the editor engine is finally chosen.
 3. Local MVP: SQLite, autosave, flat folders, moving, pinning, archive, batch Markdown import and ZIP export.
    Starting without a backend makes no network requests; restart and crash lose no confirmed saves.
-4. Memos integration: server/PAT onboarding, keyring, fetching and durable outbox.
+4. Memos integration: server/PAT setup, keyring, fetching and durable outbox.
    Without network, read/edit text and images; after reconnect, sync without duplicates or silent loss.
 5. Robustness and Fedora release: sync conflicts, token errors, migrations, packaging.
    Distribution proposal: Flatpak; RPM only when needed. Test network and keyring access in the sandbox.
@@ -321,5 +320,4 @@ personal space semantics and safe offline image sync. Mobile is out of scope.
 The app and local storage/API mock tests now exist in this workspace.
 The current code is authoritative for the implemented checklist; the other sections
 remain product goals and acceptance criteria. Core live server compatibility is
-confirmed; concurrent updates, attachment behavior and release/sandbox tests are
-not yet validated.
+confirmed; release/sandbox tests are not yet validated.

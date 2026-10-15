@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.robvaneck.Memonotes</id>
+  <name>Memonotes</name>
+  <summary>Notes that sync with your Memos server</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <developer id="io.github.robvaneck">
+    <name>Rob van Eck</name>
+  </developer>
+  <description>
+    <p>Memonotes is a calm notes app for GNOME. Write in a visual editor with formatting, checklists, tables and images, and keep everything in sync with your own Memos server.</p>
+    <p>Notes are stored locally first, so reading and editing keeps working offline. Changes are uploaded when you are back online, and conflicts are shown so you decide which version to keep.</p>
+    <ul>
+      <li>Folders, search, pinning and archive</li>
+      <li>Multiple Memos accounts, with access tokens stored in the system keyring</li>
+      <li>Import and export of Markdown files</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">io.github.robvaneck.Memonotes.desktop</launchable>
+  <url type="homepage">https://github.com/robvaneck/memonotes</url>
+  <url type="bugtracker">https://github.com/robvaneck/memonotes/issues</url>
+  <provides>
+    <binary>memonotes</binary>
+  </provides>
+  <categories>
+    <category>Utility</category>
+    <category>TextEditor</category>
+  </categories>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-10-15"/>
+  </releases>
+</component>

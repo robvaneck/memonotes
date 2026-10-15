@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Memonotes
+Comment=Notes with Memos sync
+Exec=memonotes
+Icon=io.github.robvaneck.Memonotes
+Terminal=false
+Categories=Utility;TextEditor;GTK;
+Keywords=notes;memos;markdown;memo;
+StartupNotify=true

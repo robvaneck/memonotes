@@ -269,7 +269,7 @@ fn main() -> Result<()> {
         adw::gio::ApplicationFlags::FLAGS_NONE
     };
     let application = Application::builder()
-        .application_id("app.memonotes.Desktop")
+        .application_id(APP_ID)
         .flags(flags)
         .build();
 
@@ -2602,7 +2602,7 @@ fn show_about_window(parent: &ApplicationWindow) {
     header.pack_end(&close_controls);
 
     let about_content = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    let app_icon = gtk::Image::from_file(concat!(env!("CARGO_MANIFEST_DIR"), "/icon11.svg"));
+    let app_icon = about_app_icon();
     app_icon.set_pixel_size(128);
     app_icon.add_css_class("icon-dropshadow");
     app_icon.set_halign(gtk::Align::Center);
@@ -2638,10 +2638,6 @@ fn show_about_window(parent: &ApplicationWindow) {
     links_group.add(&about_link_row(
         "GitHub",
         "https://github.com/robvaneck/memonotes",
-    ));
-    links_group.add(&about_link_row(
-        tr("about.donate"),
-        "https://github.com/sponsors/robvaneck",
     ));
     about_content.append(&links_group);
 
@@ -2683,6 +2679,19 @@ fn show_about_window(parent: &ApplicationWindow) {
     about_window.set_titlebar(Some(&header));
     about_window.set_child(Some(&about_scroll));
     about_window.present();
+}
+
+const APP_ID: &str = "io.github.robvaneck.Memonotes";
+
+// An installed build has the icon in the theme; a source checkout falls back to the file.
+fn about_app_icon() -> gtk::Image {
+    let installed = gtk::gdk::Display::default()
+        .is_some_and(|display| gtk::IconTheme::for_display(&display).has_icon(APP_ID));
+    if installed {
+        gtk::Image::from_icon_name(APP_ID)
+    } else {
+        gtk::Image::from_file(concat!(env!("CARGO_MANIFEST_DIR"), "/icon.svg"))
+    }
 }
 
 fn about_link_row(title: &str, uri: &str) -> adw::ActionRow {
@@ -2895,16 +2904,39 @@ fn append_backend_account(
         else {
             return;
         };
-        let alert = adw::AlertDialog::builder()
-            .heading(tr("account.remove.confirm_title"))
-            .body(memonotes::tr_format!(
-                "account.remove.confirm_message",
-                account = account.label
-            ))
-            .build();
+        let pending = state_for_remove
+            .store
+            .borrow()
+            .pending_event_count(&account.id)
+            .unwrap_or(0);
+        let alert = if pending > 0 {
+            adw::AlertDialog::builder()
+                .heading(tr("account.remove.pending_title"))
+                .body(memonotes::tr_format!(
+                    "account.remove.pending_message",
+                    account = account.label,
+                    count = pending.to_string()
+                ))
+                .build()
+        } else {
+            adw::AlertDialog::builder()
+                .heading(tr("account.remove.confirm_title"))
+                .body(memonotes::tr_format!(
+                    "account.remove.confirm_message",
+                    account = account.label
+                ))
+                .build()
+        };
         alert.add_responses(&[
             ("cancel", tr("action.cancel")),
-            ("delete", tr("action.delete")),
+            (
+                "delete",
+                if pending > 0 {
+                    tr("account.remove.anyway")
+                } else {
+                    tr("action.delete")
+                },
+            ),
         ]);
         alert.set_default_response(Some("cancel"));
         alert.set_close_response("cancel");
@@ -6229,6 +6261,15 @@ fn editor_format_toolbar(
         toolbar.append(&button);
     }
 
+    let numbered_button = icon_button(
+        "view-list-ordered-symbolic",
+        tr("editor.format.numbered_list"),
+    );
+    numbered_button.set_size_request(36, 36);
+    let editor_for_numbered = editor.clone();
+    numbered_button.connect_clicked(move |_| toggle_numbered_list(&editor_for_numbered));
+    toolbar.append(&numbered_button);
+
     toolbar
 }
 
@@ -6537,6 +6578,7 @@ fn range_has_image(start: &gtk::TextIter, end: &gtk::TextIter) -> bool {
             && anchor.widgets().iter().any(|widget| {
                 widget.widget_name().starts_with("memonotes-image:")
                     || editor_table::is_table_widget(widget)
+                    || editor_table::is_rule_widget(widget)
             })
         {
             return true;
@@ -6666,6 +6708,7 @@ fn update_editor_cursor_visibility(editor: &gtk::TextView) {
                 anchor.widgets().iter().any(|widget| {
                     widget.widget_name().starts_with("memonotes-image:")
                         || editor_table::is_table_widget(widget)
+                        || editor_table::is_rule_widget(widget)
                 })
             })
         {
@@ -7582,6 +7625,9 @@ fn install_editor_format_shortcuts(
             gtk::gdk::Key::l | gtk::gdk::Key::L if shifted => {
                 toggle_list_prefix(&editor_for_enter, ListPrefixKind::Bullet)
             }
+            gtk::gdk::Key::o | gtk::gdk::Key::O if shifted => {
+                toggle_numbered_list(&editor_for_enter)
+            }
             _ => return gtk::glib::Propagation::Proceed,
         }
         gtk::glib::Propagation::Stop
@@ -7959,6 +8005,30 @@ fn continue_editor_list_on_enter(editor: &gtk::TextView) -> bool {
     true
 }
 
+/// Replaces the typed `---` line with a rule and moves the caret to a new line below it.
+fn insert_editor_rule_from_line(editor: &gtk::TextView, mut line_start: gtk::TextIter) {
+    let history = editor_image_history(editor);
+    let before = history
+        .as_ref()
+        .map(|history| begin_editor_image_change(editor, history));
+
+    let buffer = editor.buffer();
+    let mut line_end = line_start;
+    line_end.forward_to_line_end();
+    buffer.delete(&mut line_start, &mut line_end);
+    let anchor = buffer.create_child_anchor(&mut line_start);
+    editor.add_child_at_anchor(&editor_table::build_rule_widget(editor), &anchor);
+    buffer.insert(&mut line_start, "\n");
+    buffer.place_cursor(&line_start);
+
+    match (history, before) {
+        (Some(history), Some(before)) => {
+            finish_editor_image_change(editor, &history, before)
+        }
+        _ => buffer.emit_by_name::<()>("changed", &[]),
+    }
+}
+
 /// Handles lists typed as plain text: `- `/`* `/`+ ` become bullets, `1. ` is numbered on.
 fn continue_plain_list_on_enter(
     editor: &gtk::TextView,
@@ -7973,6 +8043,13 @@ fn continue_plain_list_on_enter(
     let trimmed = line.trim_start_matches([' ', '\t']);
     let indentation = &line[..line.len() - trimmed.len()];
     let cursor_offset = buffer.iter_at_mark(&buffer.get_insert()).line_offset() as usize;
+
+    if memonotes::editor_document::is_thematic_break(line)
+        && cursor_offset == line.chars().count()
+    {
+        insert_editor_rule_from_line(editor, line_start);
+        return true;
+    }
 
     let digits = trimmed.chars().take_while(char::is_ascii_digit).count();
     if (1..=9).contains(&digits)
@@ -8096,6 +8173,83 @@ fn toggle_list_prefix(editor: &gtk::TextView, kind: ListPrefixKind) {
     editor.grab_focus();
 }
 
+/// Length in characters of a leading `N. ` marker.
+fn numbered_prefix_chars(line: &str) -> Option<i32> {
+    let digits = line.chars().take_while(char::is_ascii_digit).count();
+    ((1..=9).contains(&digits) && line[digits..].starts_with(". ")).then_some(digits as i32 + 2)
+}
+
+/// Characters of an existing list marker (bullet, checkbox or number) at the start of `line`.
+fn list_marker_chars(line: &str) -> i32 {
+    if let Some(chars) = numbered_prefix_chars(line) {
+        chars
+    } else if ["• ", "☐ ", "☑ ", "\u{fffc} "]
+        .iter()
+        .any(|marker| line.starts_with(marker))
+    {
+        2
+    } else {
+        0
+    }
+}
+
+fn toggle_numbered_list(editor: &gtk::TextView) {
+    let buffer = editor.buffer();
+    let selection = buffer.selection_bounds();
+    let (start_line, mut end_line) = selection
+        .as_ref()
+        .map(|(start, end)| (start.line(), end.line()))
+        .unwrap_or_else(|| {
+            let cursor = buffer.iter_at_mark(&buffer.get_insert());
+            (cursor.line(), cursor.line())
+        });
+    if let Some((_, end)) = selection.as_ref()
+        && end.line_offset() == 0
+        && end_line > start_line
+    {
+        end_line -= 1;
+    }
+
+    // The first line is the note title.
+    let lines = (start_line.max(1)..=end_line).collect::<Vec<_>>();
+    if lines.is_empty() {
+        return;
+    }
+    let line_text = |line_number: i32| {
+        let start = buffer.iter_at_line(line_number)?;
+        let mut end = start;
+        end.forward_to_line_end();
+        Some(buffer.slice(&start, &end, true).to_string())
+    };
+    let all_numbered = lines.iter().all(|line_number| {
+        line_text(*line_number).is_some_and(|line| {
+            numbered_prefix_chars(line.trim_start_matches([' ', '\t'])).is_some()
+        })
+    });
+
+    buffer.begin_user_action();
+    for (index, line_number) in lines.iter().enumerate().rev() {
+        let Some(line) = line_text(*line_number) else {
+            continue;
+        };
+        let Some(mut line_start) = buffer.iter_at_line(*line_number) else {
+            continue;
+        };
+        let trimmed = line.trim_start_matches([' ', '\t']);
+        line_start.forward_chars((line.chars().count() - trimmed.chars().count()) as i32);
+        let mut prefix_end = line_start;
+        prefix_end.forward_chars(list_marker_chars(trimmed));
+        remove_editor_anchor_widgets(editor, line_start, prefix_end);
+        buffer.delete(&mut line_start, &mut prefix_end);
+        if !all_numbered {
+            buffer.insert(&mut line_start, &format!("{}. ", index + 1));
+        }
+    }
+    buffer.end_user_action();
+    install_task_checkbuttons(editor);
+    editor.grab_focus();
+}
+
 fn list_prefix_change(line: &str, kind: ListPrefixKind) -> (i32, &'static str) {
     match kind {
         ListPrefixKind::Task if line.starts_with("☐ ") => (2, "☑ "),
@@ -8128,6 +8282,10 @@ fn map_list_markers(text: &str, to_editor: bool) -> String {
             continue;
         }
 
+        if to_editor && memonotes::editor_document::is_thematic_break(line) {
+            mapped.push_str(line_with_ending);
+            continue;
+        }
         let indentation = line.len() - trimmed.len();
         let (rest, replacement) = if to_editor {
             if let Some(rest) = trimmed.strip_prefix("- [ ] ") {
@@ -8341,6 +8499,60 @@ mod editor_format_tests {
             memonotes::tr_format!("editor.table.column_title", n = 1),
             memonotes::tr_format!("editor.table.column_title", n = 2)
         )));
+        Ok(())
+    }
+
+    #[test]
+    fn horizontal_rules_round_trip_through_separator_widgets() -> Result<()> {
+        if std::env::var_os("MEMONOTES_EDITOR_FORMAT_TEST").is_none() {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "editor_format_tests::horizontal_rules_round_trip_through_separator_widgets",
+                    "--test-threads=1",
+                ])
+                .env("MEMONOTES_EDITOR_FORMAT_TEST", "1")
+                .status()?;
+            assert!(status.success());
+            return Ok(());
+        }
+        gtk::init()?;
+        let editor = gtk::TextView::new();
+        install_editor_format_shortcuts(&editor, new_editor_image_history());
+        let source = "# Title\n\nBefore\n\n---\n\nAfter\n\n---";
+        set_editor_view_content(&editor, source);
+        let buffer = editor.buffer();
+        let rules = |buffer: &gtk::TextBuffer| {
+            let mut count = 0;
+            let mut iter = buffer.start_iter();
+            while !iter.is_end() {
+                if let Some(anchor) = iter.child_anchor() {
+                    count += anchor
+                        .widgets()
+                        .iter()
+                        .filter(|widget| editor_table::is_rule_widget(widget))
+                        .count();
+                }
+                iter.forward_char();
+            }
+            count
+        };
+        assert_eq!(rules(&buffer), 2);
+        assert_eq!(markdown_from_editor_buffer(&buffer), source);
+
+        set_editor_view_content(&editor, "Title\n\n* * *\n\n- item");
+        assert_eq!(rules(&buffer), 1);
+        assert_eq!(
+            markdown_from_editor_buffer(&buffer),
+            "# Title\n\n---\n\n- item"
+        );
+
+        set_editor_view_content(&editor, "Title\nBefore\n---");
+        buffer.place_cursor(&buffer.end_iter());
+        assert!(continue_editor_list_on_enter(&editor));
+        assert_eq!(rules(&buffer), 1);
+        assert_eq!(buffer.iter_at_mark(&buffer.get_insert()).line(), 3);
+        assert!(markdown_from_editor_buffer(&buffer).starts_with("# Title\nBefore\n\n---"));
         Ok(())
     }
 
@@ -9725,6 +9937,19 @@ mod editor_format_tests {
         toggle_list_prefix(&editor, ListPrefixKind::Bullet);
         assert_eq!(markdown_from_editor_buffer(&buffer), "# Title\n- Task");
 
+        set_editor_view_content(&editor, "Title\nOne\n- Two\nThree");
+        buffer.select_range(&buffer.iter_at_line(1).unwrap(), &buffer.end_iter());
+        toggle_numbered_list(&editor);
+        assert_eq!(
+            markdown_from_editor_buffer(&buffer),
+            "# Title\n1. One\n2. Two\n3. Three"
+        );
+        toggle_numbered_list(&editor);
+        assert_eq!(
+            markdown_from_editor_buffer(&buffer),
+            "# Title\nOne\nTwo\nThree"
+        );
+
         set_editor_view_content(
             &editor,
             "Title\n- [ ] One\n- [ ] Two\n- [ ] Three\n- [ ] Four\n- [ ] Five\n- [ ] Last",
@@ -9866,6 +10091,7 @@ fn apply_rendered_spans(
     links: &[LinkSpan],
     images: &[ImageSpan],
     tables: &[memonotes::editor_document::TableSpan],
+    rules: &[std::ops::Range<usize>],
 ) {
     let (start, end) = buffer.bounds();
     let char_offsets = memonotes::editor_document::byte_to_char_offsets(text);
@@ -9932,6 +10158,15 @@ fn apply_rendered_spans(
         let widget = editor_table::build_table_widget(editor, &table.alignments, &table.rows);
         editor.add_child_at_anchor(&widget, &anchor);
     }
+
+    for rule in rules.iter().rev() {
+        let mut start = buffer.iter_at_offset(char_offsets[rule.start] as i32);
+        let mut end = start;
+        end.forward_char();
+        buffer.delete(&mut start, &mut end);
+        let anchor = buffer.create_child_anchor(&mut start);
+        editor.add_child_at_anchor(&editor_table::build_rule_widget(editor), &anchor);
+    }
 }
 
 fn remove_editor_anchor_widgets(
@@ -9974,6 +10209,7 @@ fn set_editor_view_content(editor: &gtk::TextView, content: &str) {
         &rendered.links,
         &rendered.images,
         &rendered.tables,
+        &rendered.rules,
     );
     install_task_checkbuttons(editor);
     auto_link_plain_urls(&buffer);
@@ -10292,7 +10528,13 @@ fn table_markdown_at(buffer: &gtk::TextBuffer, offset: usize) -> Option<String> 
         .child_anchor()?
         .widgets()
         .into_iter()
-        .find_map(|widget| editor_table::table_markdown_from_widget(&widget))
+        .find_map(|widget| {
+            if editor_table::is_rule_widget(&widget) {
+                Some("---".to_owned())
+            } else {
+                editor_table::table_markdown_from_widget(&widget)
+            }
+        })
 }
 
 // Leaves one blank line between the previous Markdown block and the next one.

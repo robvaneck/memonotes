@@ -7,9 +7,24 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 pub const TABLE_WIDGET_NAME: &str = "memonotes-table";
+pub const RULE_WIDGET_NAME: &str = "memonotes-rule";
 
 pub fn is_table_widget(widget: &gtk::Widget) -> bool {
     widget.widget_name() == TABLE_WIDGET_NAME
+}
+
+pub fn is_rule_widget(widget: &gtk::Widget) -> bool {
+    widget.widget_name() == RULE_WIDGET_NAME
+}
+
+pub fn build_rule_widget(editor: &gtk::TextView) -> gtk::Widget {
+    let rule = gtk::Separator::new(gtk::Orientation::Horizontal);
+    rule.set_widget_name(RULE_WIDGET_NAME);
+    rule.set_valign(gtk::Align::Center);
+    rule.set_margin_top(8);
+    rule.set_margin_bottom(8);
+    fit_table_to_editor(editor, &rule);
+    rule.upcast()
 }
 
 /// Cell widgets hold the content; the Markdown is read from them when the note is saved.
@@ -774,7 +789,7 @@ pub fn build_table_widget(
 }
 
 // Anchored children keep their natural width, so the text width is applied explicitly.
-fn fit_table_to_editor(editor: &gtk::TextView, root: &gtk::Box) {
+fn fit_table_to_editor<W: IsA<gtk::Widget>>(editor: &gtk::TextView, root: &W) {
     let editor_weak = editor.downgrade();
     let root_weak = root.downgrade();
     let applied = Cell::new(0);
