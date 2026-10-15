@@ -58,6 +58,11 @@ actually implemented in the current code. See also [README.md](README.md) and
 - [ ] Explicit onboarding/local import and safe unlinking with pending changes/export.
 - [ ] Narrow-window navigation, remembered pane widths/selection, accessibility and visible sync/conflict status.
 - [ ] Fedora/Flatpak packaging and network/keyring tests in the sandbox.
+- [ ] Apply Markdown formatting when opening MD files.
+- [x] Automatically continue lists (bullets, `-`/`*`/`+` and numbered) when pressing Enter.
+- [x] Table support: Markdown pipe tables render as editable grid widgets (top-level tables only; tables inside lists or quotes stay text) at full editor width, with an insert-table toolbar button, row/column add and delete, drag selection of cells with copy, cut, clear and paste, pasting spreadsheet ranges (Excel, Calc, web tables) as a new table, and undo/redo for structure changes.
+- [x] Bulk delete in the note list: Ctrl+A selects all notes, Delete archives the selection (or permanently deletes it, after confirmation, in the archive).
+- [x] Export: write the note title into the Markdown content (as the first H1), not only into the file name.
 
 Not built and outside the current version 1 scope: space members/invitations,
 publishing, PAT management through the API, mobile and React Native. File

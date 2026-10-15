@@ -87,6 +87,10 @@ impl NoteList {
         self.selection.unselect_all();
     }
 
+    pub fn select_all(&self) {
+        self.selection.select_all();
+    }
+
     pub fn scroll_to(&self, id: &str) {
         if let Some(position) = self.position(id) {
             let _ = self

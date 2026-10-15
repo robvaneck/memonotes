@@ -292,6 +292,7 @@ mod tests {
     fn application_translation_keys_exist() {
         for source in [
             include_str!("main.rs"),
+            include_str!("editor_table.rs"),
             include_str!("lib.rs"),
             include_str!("adapters.rs"),
             include_str!("credentials.rs"),

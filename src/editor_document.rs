@@ -15,6 +15,28 @@ pub struct RenderedMarkdown {
     pub headings: Vec<HeadingSpan>,
     pub links: Vec<LinkSpan>,
     pub images: Vec<ImageSpan>,
+    pub tables: Vec<TableSpan>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TableAlignment {
+    #[default]
+    None,
+    Left,
+    Center,
+    Right,
+}
+
+/// A top-level Markdown table; the first row is the header and cells keep their inline Markdown.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TableSpan {
+    pub range: Range<usize>,
+    pub alignments: Vec<TableAlignment>,
+    pub rows: Vec<Vec<String>>,
+}
+
+fn markdown_options() -> Options {
+    Options::ENABLE_TASKLISTS | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES
 }
 
 pub fn byte_to_char_offsets(text: &str) -> Vec<usize> {
@@ -49,7 +71,14 @@ pub struct ImageSpan {
 }
 
 pub fn render_markdown_source(markdown: &str) -> RenderedMarkdown {
-    let source_spans = markdown_style_spans(markdown);
+    let source_tables = markdown_table_ranges(markdown);
+    let in_table = |range: &Range<usize>| {
+        source_tables
+            .iter()
+            .any(|table| table.range.start < range.end && range.start < table.range.end)
+    };
+    let mut source_spans = markdown_style_spans(markdown);
+    source_spans.retain(|span| !in_table(&span.range));
     let (source_headings, heading_markers) = markdown_heading_ranges(markdown);
     let mut hidden_ranges: Vec<_> = source_spans
         .iter()
@@ -57,10 +86,13 @@ pub fn render_markdown_source(markdown: &str) -> RenderedMarkdown {
         .map(|span| span.range.clone())
         .collect();
     hidden_ranges.extend(heading_markers);
-    let source_links = markdown_link_ranges(markdown);
+    let mut source_links = markdown_link_ranges(markdown);
+    source_links.retain(|link| !in_table(&link.content));
     hidden_ranges.extend(source_links.iter().flat_map(|link| link.hidden.clone()));
-    let source_images = markdown_image_ranges(markdown);
+    let mut source_images = markdown_image_ranges(markdown);
+    source_images.retain(|image| !in_table(&image.range));
     hidden_ranges.extend(source_images.iter().map(|image| image.range.clone()));
+    hidden_ranges.extend(source_tables.iter().map(|table| table.range.clone()));
     hidden_ranges.sort_unstable_by_key(|range| range.start);
     let mut merged_hidden_ranges: Vec<Range<usize>> = Vec::with_capacity(hidden_ranges.len());
     for range in hidden_ranges {
@@ -77,6 +109,7 @@ pub fn render_markdown_source(markdown: &str) -> RenderedMarkdown {
     let mut output_offsets = vec![0; markdown.len() + 1];
     let mut hidden_range_index = 0;
     let mut image_index = 0;
+    let mut table_index = 0;
 
     for (byte_offset, character) in markdown.char_indices() {
         let end_offset = byte_offset + character.len_utf8();
@@ -96,6 +129,13 @@ pub fn render_markdown_source(markdown: &str) -> RenderedMarkdown {
         {
             output.push('\u{fffc}');
             image_index += 1;
+        }
+        if source_tables
+            .get(table_index)
+            .is_some_and(|table| table.range.start == byte_offset)
+        {
+            output.push('\u{fffc}');
+            table_index += 1;
         }
         if !hidden {
             output.push(character);
@@ -153,13 +193,194 @@ pub fn render_markdown_source(markdown: &str) -> RenderedMarkdown {
         })
         .collect();
 
+    let tables = source_tables
+        .into_iter()
+        .map(|table| {
+            let start = output_offsets[table.range.start];
+            TableSpan {
+                range: start..start + '\u{fffc}'.len_utf8(),
+                alignments: table.alignments,
+                rows: table.rows,
+            }
+        })
+        .collect();
+
     RenderedMarkdown {
         text: output,
         spans,
         headings,
         links,
         images,
+        tables,
     }
+}
+
+struct SourceTable {
+    range: Range<usize>,
+    alignments: Vec<TableAlignment>,
+    rows: Vec<Vec<String>>,
+}
+
+// Tables nested in lists or quotes stay plain text.
+fn markdown_table_ranges(markdown: &str) -> Vec<SourceTable> {
+    let mut tables = Vec::new();
+    let mut container_depth = 0_usize;
+    let mut open: Option<SourceTable> = None;
+    let mut row: Vec<String> = Vec::new();
+
+    for (event, range) in Parser::new_ext(markdown, markdown_options()).into_offset_iter() {
+        match event {
+            Event::Start(Tag::List(_) | Tag::BlockQuote(_)) => container_depth += 1,
+            Event::End(TagEnd::List(_) | TagEnd::BlockQuote(_)) => {
+                container_depth = container_depth.saturating_sub(1)
+            }
+            Event::Start(Tag::Table(alignments)) if container_depth == 0 => {
+                let source = &markdown[range.clone()];
+                let end = range.start + source.trim_end_matches(['\n', '\r']).len();
+                open = Some(SourceTable {
+                    range: range.start..end,
+                    alignments: alignments
+                        .iter()
+                        .map(|alignment| match alignment {
+                            pulldown_cmark::Alignment::None => TableAlignment::None,
+                            pulldown_cmark::Alignment::Left => TableAlignment::Left,
+                            pulldown_cmark::Alignment::Center => TableAlignment::Center,
+                            pulldown_cmark::Alignment::Right => TableAlignment::Right,
+                        })
+                        .collect(),
+                    rows: Vec::new(),
+                });
+            }
+            Event::Start(Tag::TableHead | Tag::TableRow) => row.clear(),
+            Event::End(TagEnd::TableCell) if open.is_some() => {
+                row.push(markdown[range].trim().to_owned());
+            }
+            Event::End(TagEnd::TableHead | TagEnd::TableRow) => {
+                if let Some(table) = open.as_mut() {
+                    table.rows.push(std::mem::take(&mut row));
+                }
+            }
+            Event::End(TagEnd::Table) => {
+                if let Some(mut table) = open.take() {
+                    let columns = table.alignments.len().max(1);
+                    table.alignments.resize(columns, TableAlignment::None);
+                    for row in &mut table.rows {
+                        row.resize(columns, String::new());
+                    }
+                    tables.push(table);
+                }
+            }
+            _ => {}
+        }
+    }
+    tables
+}
+
+/// Escapes a cell for a pipe table: unescaped pipes and line breaks would break the row.
+fn escape_table_cell(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut previous_backslash = false;
+    for character in text.chars() {
+        match character {
+            '\n' | '\r' | '\u{fffc}' => output.push(' '),
+            '|' if !previous_backslash => output.push_str("\\|"),
+            other => output.push(other),
+        }
+        previous_backslash = character == '\\' && !previous_backslash;
+    }
+    output.trim().to_owned()
+}
+
+/// Parses spreadsheet clipboard text: tab-separated cells, with quoted cells for embedded breaks.
+pub fn parse_tsv(text: &str) -> Vec<Vec<String>> {
+    let text = text
+        .strip_suffix("\r\n")
+        .or_else(|| text.strip_suffix('\n'))
+        .unwrap_or(text);
+    let mut rows = Vec::new();
+    let mut row = Vec::new();
+    let mut field = String::new();
+    let mut at_field_start = true;
+    let mut in_quotes = false;
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        if in_quotes {
+            if character != '"' {
+                field.push(character);
+            } else if characters.peek() == Some(&'"') {
+                field.push('"');
+                characters.next();
+            } else {
+                in_quotes = false;
+            }
+            continue;
+        }
+        match character {
+            '"' if at_field_start => {
+                in_quotes = true;
+                at_field_start = false;
+            }
+            '\t' => {
+                row.push(std::mem::take(&mut field));
+                at_field_start = true;
+            }
+            '\r' if characters.peek() == Some(&'\n') => {}
+            '\n' => {
+                row.push(std::mem::take(&mut field));
+                rows.push(std::mem::take(&mut row));
+                at_field_start = true;
+            }
+            other => {
+                field.push(other);
+                at_field_start = false;
+            }
+        }
+    }
+    row.push(field);
+    rows.push(row);
+    rows
+}
+
+/// Returns the cells when clipboard text looks like a copied spreadsheet range, not ordinary text.
+pub fn pasted_table_rows(text: &str) -> Option<Vec<Vec<String>>> {
+    let mut rows = parse_tsv(text);
+    let columns = rows.first()?.len();
+    if columns < 2 || rows.iter().any(|row| row.len() != columns) {
+        return None;
+    }
+    // A lone indented line also contains a tab.
+    if rows.len() == 1 && rows[0].iter().any(|cell| cell.trim().is_empty()) {
+        return None;
+    }
+    for cell in rows.iter_mut().flatten() {
+        *cell = cell.replace(['\r', '\n', '\t'], " ").trim().to_owned();
+    }
+    Some(rows)
+}
+
+pub fn table_markdown(alignments: &[TableAlignment], rows: &[Vec<String>]) -> String {
+    let columns = alignments
+        .len()
+        .max(rows.iter().map(Vec::len).max().unwrap_or(0))
+        .max(1);
+    let format_row = |row: &[String]| {
+        let cells: Vec<_> = (0..columns)
+            .map(|column| escape_table_cell(row.get(column).map_or("", String::as_str)))
+            .collect();
+        format!("| {} |", cells.join(" | "))
+    };
+    let delimiter: Vec<_> = (0..columns)
+        .map(|column| match alignments.get(column).copied().unwrap_or_default() {
+            TableAlignment::None => "---",
+            TableAlignment::Left => ":---",
+            TableAlignment::Center => ":---:",
+            TableAlignment::Right => "---:",
+        })
+        .collect();
+    let mut lines = vec![format_row(rows.first().map_or(&[][..], Vec::as_slice))];
+    lines.push(format!("| {} |", delimiter.join(" | ")));
+    lines.extend(rows.iter().skip(1).map(|row| format_row(row)));
+    lines.join("\n")
 }
 
 struct SourceImage {
@@ -169,7 +390,7 @@ struct SourceImage {
 }
 
 fn markdown_image_ranges(markdown: &str) -> Vec<SourceImage> {
-    let options = Options::ENABLE_TASKLISTS | Options::ENABLE_STRIKETHROUGH;
+    let options = markdown_options();
     let mut images = Vec::new();
     let mut open: Option<SourceImage> = None;
 
@@ -206,7 +427,7 @@ struct SourceLink {
 }
 
 fn markdown_link_ranges(markdown: &str) -> Vec<SourceLink> {
-    let options = Options::ENABLE_TASKLISTS | Options::ENABLE_STRIKETHROUGH;
+    let options = markdown_options();
     let mut links = Vec::new();
     // (url, first inner start, last inner end)
     let mut open: Option<(String, usize, usize)> = None;
@@ -377,7 +598,7 @@ pub struct MarkupSpan {
 }
 
 pub fn markdown_preview_text(markdown: &str) -> String {
-    let options = Options::ENABLE_TASKLISTS | Options::ENABLE_STRIKETHROUGH;
+    let options = markdown_options();
     let mut output = String::new();
     for event in Parser::new_ext(markdown, options) {
         match event {
@@ -394,7 +615,8 @@ pub fn markdown_preview_text(markdown: &str) -> String {
                 | TagEnd::Heading(_)
                 | TagEnd::Item
                 | TagEnd::BlockQuote(_)
-                | TagEnd::CodeBlock,
+                | TagEnd::CodeBlock
+                | TagEnd::TableCell,
             ) => output.push(' '),
             Event::Html(_) | Event::InlineHtml(_) => {}
             _ => {}
@@ -404,7 +626,7 @@ pub fn markdown_preview_text(markdown: &str) -> String {
 }
 
 pub fn markdown_style_spans(markdown: &str) -> Vec<MarkupSpan> {
-    let options = Options::ENABLE_TASKLISTS | Options::ENABLE_STRIKETHROUGH;
+    let options = markdown_options();
     let mut active_marks = Vec::new();
     let mut spans = Vec::new();
 
@@ -1380,5 +1602,84 @@ mod tests {
         let exported = document.to_markdown(|url| Ok(url.to_owned())).unwrap();
 
         assert_eq!(exported, source);
+    }
+    #[test]
+    fn pipe_tables_become_one_placeholder_with_their_cells() {
+        let source = "# Title\n\nBefore\n\n| Name | Qty |\n| :--- | ---: |\n| **Milk** | 2 \\| 3 |\n| Eggs |\n\nAfter";
+        let rendered = render_markdown_source(source);
+
+        assert_eq!(rendered.text, "Title\n\nBefore\n\n\u{fffc}\n\nAfter");
+        assert_eq!(rendered.tables.len(), 1);
+        let table = &rendered.tables[0];
+        assert_eq!(
+            &rendered.text[table.range.clone()],
+            "\u{fffc}"
+        );
+        assert_eq!(
+            table.alignments,
+            vec![TableAlignment::Left, TableAlignment::Right]
+        );
+        assert_eq!(
+            table.rows,
+            vec![
+                vec!["Name".to_owned(), "Qty".to_owned()],
+                vec!["**Milk**".to_owned(), "2 \\| 3".to_owned()],
+                vec!["Eggs".to_owned(), String::new()],
+            ]
+        );
+        assert!(rendered.spans.is_empty());
+    }
+
+    #[test]
+    fn table_markdown_round_trips_and_escapes_pipes() {
+        let rows = vec![
+            vec!["A".to_owned(), "B | C".to_owned()],
+            vec!["1".to_owned(), "two\nlines".to_owned()],
+        ];
+        let alignments = [TableAlignment::Center, TableAlignment::None];
+        let markdown = table_markdown(&alignments, &rows);
+        assert_eq!(
+            markdown,
+            "| A | B \\| C |\n| :---: | --- |\n| 1 | two lines |"
+        );
+        let rendered = render_markdown_source(&markdown);
+        assert_eq!(rendered.tables[0].alignments, alignments);
+        assert_eq!(table_markdown(&alignments, &rendered.tables[0].rows), markdown);
+    }
+
+    #[test]
+    fn tables_inside_lists_stay_plain_text() {
+        let rendered = render_markdown_source("- item\n\n  | a | b |\n  | - | - |\n  | 1 | 2 |");
+        assert!(rendered.tables.is_empty());
+    }
+
+    #[test]
+    fn table_preview_lists_cell_text() {
+        assert_eq!(
+            markdown_preview_text("| a | b |\n| - | - |\n| 1 | 2 |"),
+            "a b 1 2"
+        );
+    }
+    #[test]
+    fn spreadsheet_text_becomes_table_rows() {
+        let copied = "Name\tQty\r\nMilk\t2\r\n\"Eggs\nfree range\"\t\"12 \"\"large\"\"\"\r\n";
+        assert_eq!(
+            pasted_table_rows(copied).unwrap(),
+            vec![
+                vec!["Name".to_owned(), "Qty".to_owned()],
+                vec!["Milk".to_owned(), "2".to_owned()],
+                vec!["Eggs free range".to_owned(), "12 \"large\"".to_owned()],
+            ]
+        );
+    }
+
+    #[test]
+    fn ordinary_text_is_not_mistaken_for_a_table() {
+        assert!(pasted_table_rows("just a sentence").is_none());
+        assert!(pasted_table_rows("one\ntwo\nthree").is_none());
+        assert!(pasted_table_rows("\tindented code").is_none());
+        assert!(pasted_table_rows("a\tb\nc").is_none());
+        assert!(pasted_table_rows("fn main() {\n\tprintln!();\n}").is_none());
+        assert!(pasted_table_rows("a\tb").is_some());
     }
 }

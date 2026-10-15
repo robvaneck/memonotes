@@ -23,6 +23,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+mod editor_table;
 mod note_list;
 
 use note_list::{NoteList, NoteListEntry};
@@ -89,6 +90,8 @@ struct EditorSnapshot {
 struct EditorImageChange {
     before: EditorSnapshot,
     after: EditorSnapshot,
+    // Table edits are undone in place; the snapshots are the fallback once the table was rebuilt.
+    table_patch: Option<editor_table::TablePatch>,
 }
 
 #[derive(Default)]
@@ -2179,10 +2182,17 @@ fn choose_markdown_export(state: &Rc<WindowState>, window: &ApplicationWindow) {
         .build();
     dialog.add_button(tr("action.cancel"), gtk::ResponseType::Cancel);
     dialog.add_button(tr("action.continue"), gtk::ResponseType::Accept);
+    dialog.set_default_response(gtk::ResponseType::Accept);
     let labels: Vec<_> = accounts.iter().map(|(_, label)| label.as_str()).collect();
     let model = gtk::StringList::new(&labels);
     let dropdown = gtk::DropDown::new(Some(model), None::<&gtk::Expression>);
-    dialog.content_area().append(&markdown_dialog_row(
+    let content = dialog.content_area();
+    content.set_spacing(12);
+    content.set_margin_top(18);
+    content.set_margin_bottom(18);
+    content.set_margin_start(18);
+    content.set_margin_end(18);
+    content.append(&markdown_dialog_row(
         tr("markdown.destination.account"),
         &dropdown,
     ));
@@ -4330,7 +4340,11 @@ fn note_detail_css(dark: bool) -> String {
          button.task-checkbox label {{ font-size: 14px; font-weight: 700; }} \
          picture.editor-image-selected {{ border: 2px solid @accent_color; }} \
          box.editor-image-drop-indicator {{ background-color: @accent_bg_color; border-radius: 1px; }} \
-         box.editor-image-handle {{ background-color: @accent_bg_color; border: 2px solid white; border-radius: 50%; }} "
+         box.editor-image-handle {{ background-color: @accent_bg_color; border: 2px solid white; border-radius: 50%; }} \
+         entry.table-cell {{ border-radius: 0; box-shadow: none; background: transparent; border: 1px solid alpha(@theme_fg_color, 0.22); }} \
+         entry.table-header {{ font-weight: 700; background-color: alpha(@theme_fg_color, 0.06); }} \
+         entry.table-cell.table-cell-selected {{ background-color: alpha(@accent_bg_color, 0.3); }} \
+         grid.table-selecting entry text selection {{ background: transparent; color: inherit; }} "
     );
     for &(color, _, _, _) in &NOTE_COLOR_PALETTE {
         let value = note_color_value(color, dark);
@@ -4662,10 +4676,8 @@ fn install_shortcuts(
     let undo_action = adw::gio::SimpleAction::new("undo", None);
     let state_for_undo = Rc::clone(state);
     undo_action.connect_activate(move |_, _| {
-        if let Some(buffer) = focused_editor_buffer(&state_for_undo) {
-            if buffer.can_undo() {
-                buffer.undo();
-            }
+        if let Some(editor) = focused_editor(&state_for_undo) {
+            undo_focused_editor(&editor, false);
         } else {
             undo_last_operation(&state_for_undo);
         }
@@ -4678,15 +4690,15 @@ fn install_shortcuts(
     undo_keys.connect_key_pressed(move |_, key, _, modifiers| {
         if !modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK)
             || !matches!(key, gtk::gdk::Key::z | gtk::gdk::Key::Z)
+            || editor_cell_has_focus(&state_for_undo_keys.content)
         {
             return gtk::glib::Propagation::Proceed;
         }
-        if let Some(buffer) = focused_editor_buffer(&state_for_undo_keys) {
-            if modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
-                buffer.redo();
-            } else {
-                buffer.undo();
-            }
+        if let Some(editor) = focused_editor(&state_for_undo_keys) {
+            undo_focused_editor(
+                &editor,
+                modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK),
+            );
         } else if !modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
             undo_last_operation(&state_for_undo_keys);
         } else {
@@ -4753,9 +4765,9 @@ fn connect_note_list_factory(state: &Rc<WindowState>) {
     });
 }
 
-fn focused_editor_buffer(state: &WindowState) -> Option<gtk::TextBuffer> {
+fn focused_editor(state: &WindowState) -> Option<gtk::TextView> {
     if state.content.has_focus() {
-        return Some(state.content.buffer());
+        return Some(state.content.clone());
     }
     state
         .note_window_editors
@@ -4763,7 +4775,16 @@ fn focused_editor_buffer(state: &WindowState) -> Option<gtk::TextBuffer> {
         .values()
         .filter_map(|editor| editor.upgrade())
         .find(|editor| editor.has_focus())
-        .map(|editor| editor.buffer())
+}
+
+// Image and table changes live in the editor's own history, so plain buffer undo misses them.
+fn undo_focused_editor(editor: &gtk::TextView, redo: bool) {
+    match editor_image_history(editor) {
+        Some(history) if redo => redo_editor_change(editor, &history),
+        Some(history) => undo_editor_change(editor, &history),
+        None if redo => editor.buffer().redo(),
+        None => editor.buffer().undo(),
+    }
 }
 
 fn connect_events(state: &Rc<WindowState>, new_note: &gtk::Button) {
@@ -4813,11 +4834,23 @@ fn connect_events(state: &Rc<WindowState>, new_note: &gtk::Button) {
     let state_for_delete = Rc::clone(state);
     let handler = delete_keys.connect_key_pressed(move |_, key, _, modifiers| match key {
         gtk::gdk::Key::Delete => {
-            if state_for_delete.active_filter.borrow().is_archived() {
+            if state_for_delete.note_list.selected_ids().len() > 1 {
+                if state_for_delete.active_filter.borrow().is_archived() {
+                    delete_selected_notes(&state_for_delete);
+                } else {
+                    archive_selected_notes(&state_for_delete);
+                }
+            } else if state_for_delete.active_filter.borrow().is_archived() {
                 delete_current_note(&state_for_delete);
             } else {
                 archive_current_note(&state_for_delete);
             }
+            gtk::glib::Propagation::Stop
+        }
+        gtk::gdk::Key::a | gtk::gdk::Key::A
+            if modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK) =>
+        {
+            state_for_delete.note_list.select_all();
             gtk::glib::Propagation::Stop
         }
         gtk::gdk::Key::Up => move_note_selection(&state_for_delete, -1),
@@ -5001,6 +5034,10 @@ fn connect_tab_navigation(
             .upgrade()
             .and_then(|widget| widget.downcast::<gtk::TextView>().ok())
         {
+            // Table cells handle Tab themselves.
+            if editor_cell_has_focus(&editor) {
+                return gtk::glib::Propagation::Proceed;
+            }
             let buffer = editor.buffer();
             let cursor = buffer.iter_at_mark(&buffer.get_insert());
             if let Some(start) = buffer.iter_at_line(cursor.line()) {
@@ -6083,7 +6120,11 @@ fn editor_format_toolbar(
             } else if let Some(before) = history.pending_delete.take() {
                 // GTK would undo a deleted image into a bare placeholder character.
                 let after = editor_snapshot(&editor);
-                history.undo.push(EditorImageChange { before, after });
+                history.undo.push(EditorImageChange {
+                    before,
+                    after,
+                    table_patch: None,
+                });
                 true
             } else {
                 false
@@ -6160,6 +6201,12 @@ fn editor_format_toolbar(
     image_button
         .connect_clicked(move |_| choose_editor_image(&editor_for_image, &history_for_image));
     toolbar.append(&image_button);
+
+    let table_button = icon_button("view-grid-symbolic", tr("editor.format.table"));
+    table_button.set_size_request(36, 36);
+    let editor_for_table = editor.clone();
+    table_button.connect_clicked(move |_| editor_table::insert_table(&editor_for_table));
+    toolbar.append(&table_button);
 
     toolbar.append(&editor_heading_menu(editor));
 
@@ -6281,7 +6328,11 @@ fn finish_editor_image_change(
     let after = editor_snapshot(editor);
     {
         let mut history = image_history.borrow_mut();
-        history.undo.push(EditorImageChange { before, after });
+        history.undo.push(EditorImageChange {
+                    before,
+                    after,
+                    table_patch: None,
+                });
         history.redo.clear();
     }
     editor.remove_css_class("editor-image-moving");
@@ -6354,10 +6405,20 @@ fn restore_editor_image_change(
         change
     };
     editor.add_css_class("editor-image-moving");
-    let target = if undo { &change.before } else { &change.after };
-    set_editor_view_content(editor, &target.markdown);
-    let buffer = editor.buffer();
-    buffer.place_cursor(&buffer.iter_at_offset(target.cursor.min(buffer.char_count())));
+    let patched = change
+        .table_patch
+        .as_ref()
+        .is_some_and(|patch| patch.apply(undo));
+    if !patched {
+        let target = if undo { &change.before } else { &change.after };
+        let scroll = editor.vadjustment().map(|adjustment| adjustment.value());
+        set_editor_view_content(editor, &target.markdown);
+        if let Some(scroll) = scroll {
+            keep_editor_scroll(editor, scroll);
+        }
+        let buffer = editor.buffer();
+        buffer.place_cursor(&buffer.iter_at_offset(target.cursor.min(buffer.char_count())));
+    }
     editor.remove_css_class("editor-image-moving");
     {
         let mut history = image_history.borrow_mut();
@@ -6370,6 +6431,29 @@ fn restore_editor_image_change(
     editor.buffer().emit_by_name::<()>("changed", &[]);
     image_history.borrow_mut().internal_change = false;
     true
+}
+
+// Rebuilt content is laid out over many frames, so the old position is re-applied until it holds.
+fn keep_editor_scroll(editor: &gtk::TextView, value: f64) {
+    let Some(adjustment) = editor.vadjustment() else {
+        return;
+    };
+    let frames = Cell::new(0);
+    let stable_frames = Cell::new(0);
+    editor.add_tick_callback(move |_, _| {
+        adjustment.set_value(value);
+        frames.set(frames.get() + 1);
+        if (adjustment.value() - value).abs() < 1.0 {
+            stable_frames.set(stable_frames.get() + 1);
+        } else {
+            stable_frames.set(0);
+        }
+        if stable_frames.get() >= 15 || frames.get() >= 240 {
+            gtk::glib::ControlFlow::Break
+        } else {
+            gtk::glib::ControlFlow::Continue
+        }
+    });
 }
 
 fn insert_editor_image(editor: &gtk::TextView, uri: &str, alt: &str) {
@@ -6450,16 +6534,24 @@ fn range_has_image(start: &gtk::TextIter, end: &gtk::TextIter) -> bool {
     let mut iter = *start;
     while iter.offset() < end.offset() {
         if let Some(anchor) = iter.child_anchor()
-            && anchor
-                .widgets()
-                .iter()
-                .any(|widget| widget.widget_name().starts_with("memonotes-image:"))
+            && anchor.widgets().iter().any(|widget| {
+                widget.widget_name().starts_with("memonotes-image:")
+                    || editor_table::is_table_widget(widget)
+            })
         {
             return true;
         }
         iter.forward_char();
     }
     false
+}
+
+fn editor_cell_has_focus(editor: &gtk::TextView) -> bool {
+    editor
+        .root()
+        .and_downcast::<gtk::Window>()
+        .and_then(|window| GtkWindowExt::focus(&window))
+        .is_some_and(|focus| focus.is_ancestor(editor) && focus.is::<gtk::Text>())
 }
 
 fn delete_selected_editor_image(editor: &gtk::TextView) -> bool {
@@ -6528,8 +6620,7 @@ fn show_editor_image_handles(editor: &gtk::TextView, widget: &gtk::Widget) {
     };
     ensure_editor_image_handles(editor, &history);
     history.borrow_mut().resize_target = Some(widget.downgrade());
-    // The caret next to an image is as tall as the image.
-    editor.set_cursor_visible(false);
+    update_editor_cursor_visibility(editor);
     position_editor_image_handles(editor, &picture);
     // A freshly attached image has no allocation yet, so place the handles again once it has one.
     for delay in [0_u64, 60] {
@@ -6560,7 +6651,32 @@ fn deselect_editor_image(editor: &gtk::TextView) {
     if let Some(widget) = target.and_then(|target| target.upgrade()) {
         widget.remove_css_class("editor-image-selected");
     }
-    editor.set_cursor_visible(true);
+    update_editor_cursor_visibility(editor);
+}
+
+// A caret on a line with an image or table is as tall as that widget, so it is hidden there.
+fn update_editor_cursor_visibility(editor: &gtk::TextView) {
+    let buffer = editor.buffer();
+    let cursor = buffer.iter_at_mark(&buffer.get_insert());
+    let mut iter = buffer.iter_at_line(cursor.line()).unwrap_or(cursor);
+    let mut tall_line = false;
+    while !iter.ends_line() {
+        if iter.char() == '\u{fffc}'
+            && iter.child_anchor().is_some_and(|anchor| {
+                anchor.widgets().iter().any(|widget| {
+                    widget.widget_name().starts_with("memonotes-image:")
+                        || editor_table::is_table_widget(widget)
+                })
+            })
+        {
+            tall_line = true;
+            break;
+        }
+        if !iter.forward_char() {
+            break;
+        }
+    }
+    editor.set_cursor_visible(!tall_line && resize_target_picture(editor).is_none());
 }
 
 fn editor_image_at(editor: &gtk::TextView, x: f64, y: f64) -> Option<gtk::Widget> {
@@ -7317,6 +7433,48 @@ fn install_editor_format_shortcuts(
             }
         }
     });
+    let editor_for_cursor = editor.downgrade();
+    buffer.connect_mark_set(move |_, _, mark| {
+        if mark.name().as_deref() != Some("insert") {
+            return;
+        }
+        if let Some(editor) = editor_for_cursor.upgrade()
+            && !editor.has_css_class("editor-content-replacing")
+        {
+            update_editor_cursor_visibility(&editor);
+        }
+    });
+    let editor_for_cursor = editor.downgrade();
+    buffer.connect_changed(move |_| {
+        if let Some(editor) = editor_for_cursor.upgrade()
+            && !editor.has_css_class("editor-content-replacing")
+        {
+            update_editor_cursor_visibility(&editor);
+        }
+    });
+    // The clipboard is read asynchronously, so a copied spreadsheet range can become a table.
+    editor.connect_paste_clipboard(move |view| {
+        if !view.is_editable() {
+            return;
+        }
+        view.stop_signal_emission_by_name("paste-clipboard");
+        let view = view.clone();
+        let clipboard = view.clipboard();
+        gtk::glib::MainContext::default().spawn_local(async move {
+            let text = clipboard.read_text_future().await.ok().flatten();
+            match text
+                .as_deref()
+                .and_then(memonotes::editor_document::pasted_table_rows)
+            {
+                Some(rows) => editor_table::insert_pasted_table(&view, &rows),
+                None => {
+                    let buffer = view.buffer();
+                    buffer.paste_clipboard(&clipboard, None, true);
+                    view.scroll_mark_onscreen(&buffer.get_insert());
+                }
+            }
+        });
+    });
     // Dragged or pasted text carries anchor characters without their widget; drop them.
     let editor_for_insert = editor.downgrade();
     buffer.connect_insert_text(move |buffer, iter, text| {
@@ -7357,6 +7515,10 @@ fn install_editor_format_shortcuts(
     let keys = gtk::EventControllerKey::new();
     keys.set_propagation_phase(gtk::PropagationPhase::Capture);
     keys.connect_key_pressed(move |_, key, _, modifiers| {
+        // Keys typed into a table cell belong to that cell, not to the note text.
+        if editor_cell_has_focus(&editor_for_enter) {
+            return gtk::glib::Propagation::Proceed;
+        }
         if resize_target_picture(&editor_for_enter).is_some()
             && !is_modifier_key(key)
             && !modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK)
@@ -7763,7 +7925,7 @@ fn continue_editor_list_on_enter(editor: &gtk::TextView) -> bool {
     line_end.forward_to_line_end();
     let line = buffer.slice(&line_start, &line_end, true).to_string();
     let Some(kind) = editor_list_kind(&buffer, line_start, &line) else {
-        return false;
+        return continue_plain_list_on_enter(editor, line_start, &line);
     };
     let trimmed = line.trim_start_matches([' ', '\t']);
     let indentation = &line[..line.len() - trimmed.len()];
@@ -7795,6 +7957,61 @@ fn continue_editor_list_on_enter(editor: &gtk::TextView) -> bool {
     install_task_checkbuttons(editor);
     buffer.end_user_action();
     true
+}
+
+/// Handles lists typed as plain text: `- `/`* `/`+ ` become bullets, `1. ` is numbered on.
+fn continue_plain_list_on_enter(
+    editor: &gtk::TextView,
+    mut line_start: gtk::TextIter,
+    line: &str,
+) -> bool {
+    let buffer = editor.buffer();
+    // The first line is the note title.
+    if line_start.line() == 0 {
+        return false;
+    }
+    let trimmed = line.trim_start_matches([' ', '\t']);
+    let indentation = &line[..line.len() - trimmed.len()];
+    let cursor_offset = buffer.iter_at_mark(&buffer.get_insert()).line_offset() as usize;
+
+    let digits = trimmed.chars().take_while(char::is_ascii_digit).count();
+    if (1..=9).contains(&digits)
+        && let Some(rest) = trimmed[digits..].strip_prefix(". ")
+    {
+        let marker_len = indentation.len() + digits + 2;
+        if cursor_offset < marker_len {
+            return false;
+        }
+        if rest.trim().is_empty() {
+            let mut line_end = line_start;
+            line_end.forward_to_line_end();
+            buffer.delete(&mut line_start, &mut line_end);
+        } else if let Ok(number) = trimmed[..digits].parse::<u64>() {
+            buffer.insert_at_cursor(&format!("\n{indentation}{}. ", number + 1));
+        } else {
+            return false;
+        }
+        return true;
+    }
+
+    let is_bullet = ["- ", "* ", "+ "]
+        .iter()
+        .any(|marker| trimmed.starts_with(marker));
+    let is_task = trimmed.get(2..).is_some_and(|rest| {
+        rest.starts_with("[ ] ") || rest.starts_with("[x] ") || rest.starts_with("[X] ")
+    });
+    if !is_bullet || is_task || cursor_offset < indentation.len() + 2 {
+        return false;
+    }
+    buffer.begin_user_action();
+    line_start.forward_chars(indentation.len() as i32);
+    let mut prefix_end = line_start;
+    prefix_end.forward_chars(2);
+    buffer.delete(&mut line_start, &mut prefix_end);
+    buffer.insert(&mut line_start, "• ");
+    buffer.end_user_action();
+    install_task_checkbuttons(editor);
+    continue_editor_list_on_enter(editor)
 }
 
 fn apply_inline_style(buffer: &gtk::TextBuffer, mark: Mark) {
@@ -7920,7 +8137,11 @@ fn map_list_markers(text: &str, to_editor: bool) -> String {
                 .or_else(|| trimmed.strip_prefix("- [X] "))
             {
                 (Some(rest), "☑ ")
-            } else if let Some(rest) = trimmed.strip_prefix("- ") {
+            } else if let Some(rest) = trimmed
+                .strip_prefix("- ")
+                .or_else(|| trimmed.strip_prefix("* "))
+                .or_else(|| trimmed.strip_prefix("+ "))
+            {
                 (Some(rest), "• ")
             } else {
                 (None, "")
@@ -8032,6 +8253,94 @@ mod editor_format_tests {
             markdown_from_editor_buffer(&buffer),
             "# Title\n\n- Second First"
         );
+        Ok(())
+    }
+
+    fn table_widgets(buffer: &gtk::TextBuffer) -> Vec<gtk::Widget> {
+        let mut widgets = Vec::new();
+        let mut iter = buffer.start_iter();
+        while !iter.is_end() {
+            if let Some(anchor) = iter.child_anchor() {
+                widgets.extend(
+                    anchor
+                        .widgets()
+                        .into_iter()
+                        .filter(editor_table::is_table_widget),
+                );
+            }
+            iter.forward_char();
+        }
+        widgets
+    }
+
+    fn descendants_of_type<T: IsA<gtk::Widget>>(widget: &gtk::Widget) -> Vec<T> {
+        let mut found = Vec::new();
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            if let Some(typed) = current.downcast_ref::<T>() {
+                found.push(typed.clone());
+            }
+            found.extend(descendants_of_type::<T>(&current));
+            child = current.next_sibling();
+        }
+        found
+    }
+
+    #[test]
+    fn pipe_tables_round_trip_through_cell_widgets() -> Result<()> {
+        if std::env::var_os("MEMONOTES_EDITOR_FORMAT_TEST").is_none() {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "editor_format_tests::pipe_tables_round_trip_through_cell_widgets",
+                    "--test-threads=1",
+                ])
+                .env("MEMONOTES_EDITOR_FORMAT_TEST", "1")
+                .status()?;
+            assert!(status.success());
+            return Ok(());
+        }
+        gtk::init()?;
+        let editor = gtk::TextView::new();
+        install_editor_format_shortcuts(&editor, new_editor_image_history());
+        let source = "# Title\n\nBefore\n\n| A | B |\n| :--- | ---: |\n| 1 | 2 \\| 3 |\n\nAfter";
+        set_editor_view_content(&editor, source);
+        let buffer = editor.buffer();
+        assert_eq!(table_widgets(&buffer).len(), 1);
+        assert_eq!(markdown_from_editor_buffer(&buffer), source);
+
+        let table = table_widgets(&buffer).remove(0);
+        let entries = descendants_of_type::<gtk::Entry>(&table);
+        assert_eq!(entries.len(), 4);
+        entries[3].set_text("x | y");
+        assert_eq!(
+            markdown_from_editor_buffer(&buffer),
+            source.replace("2 \\| 3", "x \\| y")
+        );
+
+        let history = editor_image_history(&editor).unwrap();
+        let add_row = descendants_of_type::<gtk::Button>(&table)
+            .into_iter()
+            .find(|button| button.label().as_deref() == Some(tr("editor.table.add_row")))
+            .unwrap();
+        add_row.emit_clicked();
+        assert!(markdown_from_editor_buffer(&buffer).contains("| 1 | x \\| y |\n|  |  |\n"));
+        assert!(undo_editor_image_change(&editor, &history));
+        assert_eq!(
+            markdown_from_editor_buffer(&buffer),
+            source.replace("2 \\| 3", "x \\| y")
+        );
+        assert_eq!(table_widgets(&buffer).len(), 1);
+
+        buffer.place_cursor(&buffer.end_iter());
+        editor_table::insert_table(&editor);
+        assert_eq!(table_widgets(&buffer).len(), 2);
+        let markdown = markdown_from_editor_buffer(&buffer);
+        assert!(markdown.ends_with(&format!(
+            "After\n\n| {} | {} |\n| --- | --- |\n|  |  |\n|  |  |\n",
+            memonotes::tr_format!("editor.table.column_title", n = 1),
+            memonotes::tr_format!("editor.table.column_title", n = 2)
+        )));
         Ok(())
     }
 
@@ -8870,12 +9179,15 @@ mod editor_format_tests {
         );
         assert!(!handled);
         assert!(!widget.has_css_class("editor-image-selected"));
+        // A caret on the image's own line would be as tall as the image.
+        assert!(!editor.is_cursor_visible());
+        buffer.place_cursor(&buffer.iter_at_line(0).unwrap());
         assert!(editor.is_cursor_visible());
         click.emit_by_name::<()>("pressed", &[&1_i32, &5.0_f64, &5.0_f64]);
         assert!(widget.has_css_class("editor-image-selected"));
         buffer.insert_at_cursor("x");
         assert!(!widget.has_css_class("editor-image-selected"));
-        assert!(editor.is_cursor_visible());
+        assert!(!editor.is_cursor_visible());
         assert!(handles.iter().all(|handle| !handle.is_visible()));
 
         set_editor_view_content(&editor, "Other\nNote");
@@ -9236,8 +9548,8 @@ mod editor_format_tests {
             (2, "")
         );
         assert_eq!(
-            editor_text_from_markdown("- [ ] Task\n- [x] Done\n- Bullet"),
-            "☐ Task\n☑ Done\n• Bullet"
+            editor_text_from_markdown("- [ ] Task\n- [x] Done\n- Bullet\n* Star\n+ Plus"),
+            "☐ Task\n☑ Done\n• Bullet\n• Star\n• Plus"
         );
         assert_eq!(
             markdown_from_editor_text("☐ Task\n☑ Done\n• Bullet"),
@@ -9553,6 +9865,7 @@ fn apply_rendered_spans(
     headings: &[memonotes::editor_document::HeadingSpan],
     links: &[LinkSpan],
     images: &[ImageSpan],
+    tables: &[memonotes::editor_document::TableSpan],
 ) {
     let (start, end) = buffer.bounds();
     let char_offsets = memonotes::editor_document::byte_to_char_offsets(text);
@@ -9608,6 +9921,17 @@ fn apply_rendered_spans(
         let anchor = buffer.create_child_anchor(&mut start);
         insert_editor_image_at_anchor(editor, &anchor, &image.url, &image.alt);
     }
+
+    for table in tables.iter().rev() {
+        let offset = char_offsets[table.range.start] as i32;
+        let mut start = buffer.iter_at_offset(offset);
+        let mut end = start;
+        end.forward_char();
+        buffer.delete(&mut start, &mut end);
+        let anchor = buffer.create_child_anchor(&mut start);
+        let widget = editor_table::build_table_widget(editor, &table.alignments, &table.rows);
+        editor.add_child_at_anchor(&widget, &anchor);
+    }
 }
 
 fn remove_editor_anchor_widgets(
@@ -9649,11 +9973,13 @@ fn set_editor_view_content(editor: &gtk::TextView, content: &str) {
         &rendered.headings,
         &rendered.links,
         &rendered.images,
+        &rendered.tables,
     );
     install_task_checkbuttons(editor);
     auto_link_plain_urls(&buffer);
     buffer.set_enable_undo(true);
     editor.remove_css_class("editor-content-replacing");
+    update_editor_cursor_visibility(editor);
 }
 
 fn task_checkbox_checked_tag(buffer: &gtk::TextBuffer) -> gtk::TextTag {
@@ -9866,6 +10192,7 @@ fn markdown_from_editor_buffer(buffer: &gtk::TextBuffer) -> String {
     let title = title_line.strip_suffix('\n').unwrap_or(title_line);
     let mut body = String::new();
     let mut char_offset = title_line.chars().count();
+    let mut after_table = false;
 
     for line_with_ending in lines {
         let line = line_with_ending
@@ -9875,6 +10202,41 @@ fn markdown_from_editor_buffer(buffer: &gtk::TextBuffer) -> String {
         let indentation = line.chars().count() - trimmed.chars().count();
         let marker_offset = char_offset + indentation;
         let line_chars: Vec<_> = line.chars().collect();
+        if std::mem::take(&mut after_table) && !line.trim().is_empty() {
+            body.push('\n');
+        }
+        // A table is its own Markdown block; text beside its anchor becomes separate blocks.
+        let table_at = line_chars.iter().enumerate().find_map(|(index, character)| {
+            (*character == '\u{fffc}')
+                .then(|| table_markdown_at(buffer, char_offset + index))
+                .flatten()
+                .map(|table| (index, table))
+        });
+        if let Some((index, table)) = table_at {
+            let before = serialize_inline_range(buffer, &line_chars[..index], char_offset);
+            let after = serialize_inline_range(
+                buffer,
+                &line_chars[index + 1..],
+                char_offset + index + 1,
+            );
+            if !before.trim().is_empty() {
+                start_markdown_block(&mut body);
+                body.push_str(&before);
+            }
+            start_markdown_block(&mut body);
+            body.push_str(&table);
+            if !after.trim().is_empty() {
+                start_markdown_block(&mut body);
+                body.push_str(&after);
+            } else {
+                after_table = true;
+            }
+            if line_with_ending.ends_with('\n') {
+                body.push('\n');
+            }
+            char_offset += line_with_ending.chars().count();
+            continue;
+        }
         let line_start = buffer.iter_at_offset(char_offset as i32);
         let heading_level =
             (1..=6).find(|level| line_start.has_tag(&heading_style_tag(buffer, *level)));
@@ -9922,6 +10284,29 @@ fn markdown_from_editor_buffer(buffer: &gtk::TextBuffer) -> String {
 
     let body = markdown_from_editor_text(&body);
     memonotes::memo::editor_content(title, &body)
+}
+
+fn table_markdown_at(buffer: &gtk::TextBuffer, offset: usize) -> Option<String> {
+    buffer
+        .iter_at_offset(offset as i32)
+        .child_anchor()?
+        .widgets()
+        .into_iter()
+        .find_map(|widget| editor_table::table_markdown_from_widget(&widget))
+}
+
+// Leaves one blank line between the previous Markdown block and the next one.
+fn start_markdown_block(body: &mut String) {
+    if body.is_empty() {
+        return;
+    }
+    if !body.ends_with('\n') {
+        body.push('\n');
+    }
+    // The title line precedes the body, so a lone newline already is a blank line.
+    if !body.ends_with("\n\n") && body != "\n" {
+        body.push('\n');
+    }
 }
 
 fn serialize_inline_range(
@@ -10117,6 +10502,96 @@ fn delete_current_note(state: &Rc<WindowState>) {
             if state.note_id.borrow().as_deref() == Some(note_id.as_str()) {
                 clear_note_selection(&state);
             }
+            let _ = refresh_notes(&state);
+        },
+    );
+}
+
+fn archive_selected_notes(state: &Rc<WindowState>) {
+    let ids = state.note_list.selected_ids();
+    for id in ids {
+        let note = state.store.borrow().note(&id).ok().flatten();
+        let Some(note) = note else {
+            continue;
+        };
+        if state.store.borrow().set_archived(&id, true).is_ok() {
+            state
+                .undo_stack
+                .borrow_mut()
+                .push(UndoOperation::Archive(note));
+        }
+    }
+    clear_note_selection(state);
+    let _ = refresh_notes(state);
+}
+
+fn delete_selected_notes(state: &Rc<WindowState>) {
+    let notes: Vec<Note> = state
+        .note_list
+        .selected_ids()
+        .iter()
+        .filter_map(|id| state.store.borrow().note(id).ok().flatten())
+        .filter(|note| note.archived)
+        .collect();
+    if notes.is_empty() {
+        return;
+    }
+    let Some(parent) = state.note_list.view.root().and_downcast::<gtk::Window>() else {
+        return;
+    };
+    let alert = adw::AlertDialog::builder()
+        .heading(tr("note.delete_many.confirm_title"))
+        .body(memonotes::tr_format!(
+            "note.delete_many.confirm_message",
+            count = notes.len()
+        ))
+        .build();
+    alert.add_responses(&[
+        ("cancel", tr("action.cancel")),
+        ("delete", tr("action.delete")),
+    ]);
+    alert.set_default_response(Some("cancel"));
+    alert.set_close_response("cancel");
+    alert.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+
+    let state = Rc::clone(state);
+    alert.choose(
+        Some(&parent),
+        None::<&adw::gio::Cancellable>,
+        move |response| {
+            if response != "delete" {
+                return;
+            }
+            let mut accounts: Vec<Option<String>> = Vec::new();
+            for note in &notes {
+                let result = state.store.borrow().delete_note(&note.id);
+                if let Err(error) = result {
+                    state
+                        .toast_overlay
+                        .add_toast(adw::Toast::new(&memonotes::tr_format!(
+                            "note.error.delete_failed",
+                            error = format!("{error:#}")
+                        )));
+                    break;
+                }
+                state
+                    .undo_stack
+                    .borrow_mut()
+                    .retain(|operation| match operation {
+                        UndoOperation::Archive(archived) => archived.id != note.id,
+                    });
+                let note_window = state.note_windows.borrow().get(&note.id).cloned();
+                if let Some(window) = note_window {
+                    window.close();
+                }
+                if !accounts.contains(&note.account_id) {
+                    accounts.push(note.account_id.clone());
+                }
+            }
+            for account_id in accounts {
+                debounce_backend_save(&state, account_id.as_deref());
+            }
+            clear_note_selection(&state);
             let _ = refresh_notes(&state);
         },
     );

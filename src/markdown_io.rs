@@ -183,7 +183,8 @@ fn portable_markdown(
     written_directories: &mut HashSet<String>,
     written_assets: &mut HashSet<String>,
 ) -> Result<String> {
-    let images = images::local_images(&note.content);
+    let content = content_with_title_heading(note);
+    let images = images::local_images(&content);
     let mut edits = Vec::with_capacity(images.len());
     for image in images {
         let asset_path = image_directory.join(&image.local);
@@ -205,14 +206,14 @@ fn portable_markdown(
         edits.push((image.range, format!("{relative_asset}{width}")));
     }
     edits.sort_by_key(|(range, _)| range.start);
-    let mut markdown = String::with_capacity(note.content.len());
+    let mut markdown = String::with_capacity(content.len());
     let mut copied = 0;
     for (range, replacement) in edits {
-        markdown.push_str(&note.content[copied..range.start]);
+        markdown.push_str(&content[copied..range.start]);
         markdown.push_str(&replacement);
         copied = range.end;
     }
-    markdown.push_str(&note.content[copied..]);
+    markdown.push_str(&content[copied..]);
     if markdown.contains("memonotes-image://") {
         bail!(
             "note '{}' contains an image reference that cannot be exported",
@@ -220,6 +221,23 @@ fn portable_markdown(
         );
     }
     Ok(markdown)
+}
+
+/// Ensures the exported document starts with the note title as a heading.
+fn content_with_title_heading(note: &Note) -> String {
+    let (title, body) = note.editor_parts();
+    if title.is_empty() {
+        return note.content.clone();
+    }
+    if body == note.content {
+        return crate::memo::editor_content(title, body);
+    }
+    let first = note.content.lines().next().unwrap_or("").trim();
+    if first.starts_with('#') && title != first {
+        note.content.clone()
+    } else {
+        crate::memo::editor_content(title, body)
+    }
 }
 
 fn safe_component(value: &str) -> String {
@@ -327,6 +345,41 @@ mod tests {
             .read_to_string(&mut manifest)?;
         assert!(manifest.contains(&note_ids[0]));
         assert!(manifest.contains("Travel / Trips"));
+        Ok(())
+    }
+
+    #[test]
+    fn export_writes_the_title_into_the_markdown() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let store = Store::open(directory.path().join("notes.sqlite"))?;
+        let ids = store.import_markdown_notes(
+            None,
+            None,
+            &[
+                ("plain".into(), "Plain first line\nBody".into()),
+                ("heading".into(), "# Heading\n\nBody".into()),
+                ("legacy".into(), "placeholder".into()),
+            ],
+        )?;
+        store.save_note(&ids[2], "Only body", "Separate title")?;
+        let destination = directory.path().join("export.zip");
+
+        export_account_zip(&store, None, "On this device", directory.path(), &destination)?;
+        let mut archive = zip::ZipArchive::new(File::open(destination)?)?;
+        let mut read = |name: &str| -> Result<String> {
+            let mut text = String::new();
+            archive.by_name(name)?.read_to_string(&mut text)?;
+            Ok(text)
+        };
+        assert_eq!(
+            read("Unfiled/Plain first line.md")?,
+            "# Plain first line\nBody"
+        );
+        assert_eq!(read("Unfiled/Heading.md")?, "# Heading\n\nBody");
+        assert_eq!(
+            read("Unfiled/Separate title.md")?,
+            "# Separate title\nOnly body"
+        );
         Ok(())
     }
 

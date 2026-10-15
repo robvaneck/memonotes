@@ -28,6 +28,7 @@ see [PLAN.md](PLAN.md) for the roadmap and [README.md](README.md) for technical 
 
 - WYSIWYG editing: no visible Markdown syntax and no separate title field.
 - Bold, italic and underline; headings H1-H6; bulleted lists with nesting; clickable checklists.
+- Tables: Markdown pipe tables open as editable grids (Tab, Enter and arrow keys move between cells; add or delete rows and columns; column alignment is kept) and are saved back as Markdown tables. Cells hold inline Markdown as text.
 - Links (`Ctrl+K`, `Ctrl+click` to open).
 - Inline images that can be selected, dragged and resized from their corners while keeping their aspect ratio.
 - Undo and redo, including for image changes.
