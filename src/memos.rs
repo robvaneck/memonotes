@@ -635,7 +635,7 @@ mod tests {
 
     #[test]
     fn opening_folder_gets_space_and_its_paginated_memos() -> Result<()> {
-        use crate::adapters::MemosAdapter;
+        use crate::adapters::{BackendAdapter, MemosAdapter};
 
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let address = listener.local_addr()?;

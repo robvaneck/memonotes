@@ -12,10 +12,146 @@ pub trait BackendAdapter: Send {
     fn check_connection(&self) -> Result<()>;
     fn list_memos(&self) -> Result<Vec<Memo>>;
     fn list_folders(&self) -> Result<Vec<MemoFolder>>;
+    fn get_memo(&self, name: &str) -> Result<Memo>;
+    fn get_memo_if_exists(&self, name: &str) -> Result<Option<Memo>>;
+    fn get_folder(&self, name: &str) -> Result<MemoFolder>;
+    fn list_folder_memos(&self, name: &str) -> Result<Vec<Memo>>;
     fn apply_event(&self, event: &SyncEvent) -> Result<()>;
     // `base_content` is the last synced content of the note, when known.
     fn apply_event_with_base(&self, event: &SyncEvent, _base_content: Option<&str>) -> Result<()> {
         self.apply_event(event)
+    }
+    fn uses_plain_http(&self) -> bool {
+        false
+    }
+    // The name the backend gave a folder that an event created or renamed, when it differs from
+    // the name the event carried.
+    fn applied_remote_name(&self, _event: &SyncEvent) -> Option<String> {
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResourceKind {
+    Note,
+    Folder,
+}
+
+impl ResourceKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Note => "note",
+            Self::Folder => "folder",
+        }
+    }
+}
+
+pub struct ProviderInfo {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub available: bool,
+}
+
+const MEMOS: &str = "memos";
+const IMAP: &str = "imap";
+const MEMOS_CONTENT_LIMIT_BYTES: usize = 8 * 1024;
+
+pub const PROVIDERS: [ProviderInfo; 3] = [
+    ProviderInfo {
+        id: MEMOS,
+        name: "Memos",
+        available: true,
+    },
+    ProviderInfo {
+        id: "imap",
+        name: "IMAP",
+        available: true,
+    },
+    ProviderInfo {
+        id: "joplin",
+        name: "Joplin",
+        available: false,
+    },
+];
+
+pub fn provider_name(provider: &str) -> &'static str {
+    PROVIDERS
+        .iter()
+        .find(|info| info.id == provider)
+        .map_or("Backend", |info| info.name)
+}
+
+pub fn is_supported(provider: &str) -> bool {
+    PROVIDERS
+        .iter()
+        .any(|info| info.id == provider && info.available)
+}
+
+pub fn connect(provider: &str, server_url: &str, token: &str) -> Result<Box<dyn BackendAdapter>> {
+    match provider {
+        MEMOS => Ok(Box::new(MemosAdapter::new(server_url, token)?)),
+        IMAP => Ok(Box::new(crate::imap_notes::ImapAdapter::new(
+            server_url, token,
+        )?)),
+        _ => bail!(tr("account.error.backend_unavailable")),
+    }
+}
+
+// Remote name for a local item that the backend has not seen yet.
+pub fn default_remote_name(provider: &str, kind: ResourceKind, local_id: &str) -> String {
+    match provider {
+        MEMOS => {
+            let collection = memos_collection(kind);
+            if local_id.starts_with(&format!("{collection}/")) {
+                local_id.to_owned()
+            } else {
+                format!("{collection}/{local_id}")
+            }
+        }
+        _ => local_id.to_owned(),
+    }
+}
+
+// The local ID a remote item reuses when a local item with that ID already exists.
+pub fn local_id_from_remote_name(
+    provider: &str,
+    kind: ResourceKind,
+    remote_name: &str,
+) -> Result<String> {
+    match provider {
+        MEMOS => remote_name
+            .strip_prefix(&format!("{}/", memos_collection(kind)))
+            .filter(|id| !id.is_empty() && !id.contains('/'))
+            .map(str::to_owned)
+            .context(tr("api.memos.error.invalid_resource_name")),
+        _ => Ok(remote_name.to_owned()),
+    }
+}
+
+// The size the backend would store and its limit, when the content does not fit.
+pub fn content_limit_violation(provider: &str, content: &str) -> Option<(usize, usize)> {
+    match provider {
+        MEMOS => {
+            let size = crate::images::to_remote_content(content).len();
+            (size > MEMOS_CONTENT_LIMIT_BYTES).then_some((size, MEMOS_CONTENT_LIMIT_BYTES))
+        }
+        _ => None,
+    }
+}
+
+pub fn is_connection_error(error: &anyhow::Error) -> bool {
+    crate::memos::is_connection_error(error) || crate::imap_notes::is_connection_error(error)
+}
+
+// The server rejected this particular request, so retrying it unchanged cannot succeed.
+pub fn is_rejected_request(error: &anyhow::Error) -> bool {
+    crate::memos::is_bad_request(error) || crate::imap_notes::is_rejected_request(error)
+}
+
+fn memos_collection(kind: ResourceKind) -> &'static str {
+    match kind {
+        ResourceKind::Note => "memos",
+        ResourceKind::Folder => "spaces",
     }
 }
 
@@ -189,47 +325,6 @@ impl MemosAdapter {
         Ok(Self {
             client: MemosClient::from_env()?,
         })
-    }
-
-    pub fn uses_plain_http(&self) -> bool {
-        self.client.uses_plain_http()
-    }
-
-    pub fn get_memo(&self, name: &str) -> Result<Memo> {
-        let id = resource_id(name, "memos")?;
-        let remote = self.localize_images(self.client.get_memo(id)?);
-        let shared_space = self.remote_space_is_shared(remote.space.as_deref())?;
-        memo_from_remote(remote, shared_space)
-    }
-
-    pub fn get_memo_if_exists(&self, name: &str) -> Result<Option<Memo>> {
-        let id = resource_id(name, "memos")?;
-        let Some(remote) = self.client.get_memo_if_exists(id)? else {
-            return Ok(None);
-        };
-        let remote = self.localize_images(remote);
-        let shared_space = self.remote_space_is_shared(remote.space.as_deref())?;
-        Ok(Some(memo_from_remote(remote, shared_space)?))
-    }
-
-    pub fn get_folder(&self, name: &str) -> Result<MemoFolder> {
-        let id = resource_id(name, "spaces")?;
-        let space = self.client.get_space(id)?;
-        Ok(MemoFolder {
-            id: space.name,
-            name: space.title,
-            is_shared: space.member_count != 1,
-        })
-    }
-
-    pub fn list_folder_memos(&self, name: &str) -> Result<Vec<Memo>> {
-        let id = resource_id(name, "spaces")?;
-        let is_shared = self.client.get_space(id)?.member_count != 1;
-        self.client
-            .list_space_memos(id)?
-            .into_iter()
-            .map(|remote| memo_from_remote(self.localize_images(remote), is_shared))
-            .collect()
     }
 
     // Serves remote attachments as local image files so stored content keeps local references.
@@ -478,6 +573,47 @@ impl MemosAdapter {
 }
 
 impl BackendAdapter for MemosAdapter {
+    fn uses_plain_http(&self) -> bool {
+        self.client.uses_plain_http()
+    }
+
+    fn get_memo(&self, name: &str) -> Result<Memo> {
+        let id = resource_id(name, "memos")?;
+        let remote = self.localize_images(self.client.get_memo(id)?);
+        let shared_space = self.remote_space_is_shared(remote.space.as_deref())?;
+        memo_from_remote(remote, shared_space)
+    }
+
+    fn get_memo_if_exists(&self, name: &str) -> Result<Option<Memo>> {
+        let id = resource_id(name, "memos")?;
+        let Some(remote) = self.client.get_memo_if_exists(id)? else {
+            return Ok(None);
+        };
+        let remote = self.localize_images(remote);
+        let shared_space = self.remote_space_is_shared(remote.space.as_deref())?;
+        Ok(Some(memo_from_remote(remote, shared_space)?))
+    }
+
+    fn get_folder(&self, name: &str) -> Result<MemoFolder> {
+        let id = resource_id(name, "spaces")?;
+        let space = self.client.get_space(id)?;
+        Ok(MemoFolder {
+            id: space.name,
+            name: space.title,
+            is_shared: space.member_count != 1,
+        })
+    }
+
+    fn list_folder_memos(&self, name: &str) -> Result<Vec<Memo>> {
+        let id = resource_id(name, "spaces")?;
+        let is_shared = self.client.get_space(id)?.member_count != 1;
+        self.client
+            .list_space_memos(id)?
+            .into_iter()
+            .map(|remote| memo_from_remote(self.localize_images(remote), is_shared))
+            .collect()
+    }
+
     fn apply_event(&self, event: &SyncEvent) -> Result<()> {
         self.apply_with_base(event, None)
     }

@@ -50,30 +50,29 @@ impl NoteList {
     }
 
     pub fn entry(&self, position: u32) -> Option<NoteListEntry> {
+        self.with_entry(position, Clone::clone)
+    }
+
+    // Entries carry whole note contents, so lookups borrow instead of cloning.
+    fn with_entry<R>(&self, position: u32, read: impl FnOnce(&NoteListEntry) -> R) -> Option<R> {
         let object = self
             .model
             .item(position)?
             .downcast::<gtk::glib::BoxedAnyObject>()
             .ok()?;
-        Some(object.borrow::<NoteListEntry>().clone())
+        let entry = object.borrow::<NoteListEntry>();
+        Some(read(&entry))
     }
 
     pub fn position(&self, id: &str) -> Option<u32> {
-        (0..self.model.n_items()).find(|position| {
-            let object = self
-                .model
-                .item(*position)
-                .unwrap()
-                .downcast::<gtk::glib::BoxedAnyObject>()
-                .unwrap();
-            object.borrow::<NoteListEntry>().note.id == id
-        })
+        (0..self.model.n_items())
+            .find(|position| self.with_entry(*position, |entry| entry.note.id == id) == Some(true))
     }
 
     pub fn selected_ids(&self) -> Vec<String> {
         (0..self.model.n_items())
             .filter(|position| self.selection.is_selected(*position))
-            .filter_map(|position| self.entry(position).map(|entry| entry.note.id))
+            .filter_map(|position| self.with_entry(position, |entry| entry.note.id.clone()))
             .collect()
     }
 
@@ -126,16 +125,19 @@ impl NoteList {
         let old_count = self.model.n_items() as usize;
         let mut prefix = 0;
         while prefix < old_count.min(entries.len())
-            && self.entry(prefix as u32).unwrap().matches(&entries[prefix])
+            && self
+                .with_entry(prefix as u32, |old| old.matches(&entries[prefix]))
+                .unwrap()
         {
             prefix += 1;
         }
         let mut suffix = 0;
         while suffix < (old_count - prefix).min(entries.len() - prefix)
             && self
-                .entry((old_count - suffix - 1) as u32)
+                .with_entry((old_count - suffix - 1) as u32, |old| {
+                    old.matches(&entries[entries.len() - suffix - 1])
+                })
                 .unwrap()
-                .matches(&entries[entries.len() - suffix - 1])
         {
             suffix += 1;
         }

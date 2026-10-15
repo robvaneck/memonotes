@@ -418,7 +418,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let store = Store::open(directory.path().join("notes.sqlite"))?;
         store.add_backend_account("account", "Memos", "memos", "https://example.test")?;
-        let oversized = "x".repeat(crate::MEMOS_CONTENT_LIMIT_BYTES + 1);
+        let oversized = "x".repeat(16 * 1024);
 
         let result = store.import_markdown_notes(
             Some("account"),

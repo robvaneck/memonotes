@@ -2,6 +2,7 @@ use crate::i18n::tr;
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -12,6 +13,7 @@ pub mod credentials;
 pub mod editor_document;
 pub mod i18n;
 pub mod images;
+pub mod imap_notes;
 pub mod markdown_io;
 pub mod memo;
 pub mod memos;
@@ -22,8 +24,6 @@ const NOTE_COLOR_IDS: [&str; 36] = [
     "jade", "green", "grass", "bronze", "gold", "brown", "orange", "amber", "yellow", "lime",
     "mint", "sky", "rose", "peach", "lemon", "lilac",
 ];
-
-const MEMOS_CONTENT_LIMIT_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Serialize)]
 pub struct Folder {
@@ -194,6 +194,8 @@ pub struct BackendAccount {
 
 pub struct Store {
     connection: Connection,
+    // Per account: (data version, total changes, result) of the last pending-events scan.
+    events_check: RefCell<HashMap<String, (i64, i64, bool)>>,
 }
 
 impl Store {
@@ -203,7 +205,7 @@ impl Store {
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version > 12 {
+        if version > 13 {
             bail!(tr("storage.error.newer_schema_version"));
         }
         if version == 0 {
@@ -315,6 +317,16 @@ impl Store {
                  PRAGMA user_version = 12;",
             )?;
         }
+        if version < 13 {
+            // Links made before this version only exist for Memos, where spaces are folders.
+            if !has_column(&connection, "backend_resource_links", "kind")? {
+                connection.execute_batch(
+                    "ALTER TABLE backend_resource_links ADD COLUMN kind TEXT NOT NULL DEFAULT 'note';
+                     UPDATE backend_resource_links SET kind = 'folder' WHERE remote_name LIKE 'spaces/%';",
+                )?;
+            }
+            connection.execute_batch("PRAGMA user_version = 13;")?;
+        }
         if !has_column(&connection, "backend_accounts", "enabled")? {
             connection.execute_batch(
                 "ALTER TABLE backend_accounts ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1;",
@@ -333,7 +345,10 @@ impl Store {
             "CREATE INDEX IF NOT EXISTS folders_account ON folders(account_id);
              CREATE INDEX IF NOT EXISTS notes_account ON notes(account_id);",
         )?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            events_check: RefCell::new(HashMap::new()),
+        })
     }
 
     pub fn folders(&self) -> Result<Vec<Folder>> {
@@ -484,7 +499,7 @@ impl Store {
         notes: &[(String, String)],
     ) -> Result<Vec<String>> {
         let transaction = self.connection.unchecked_transaction()?;
-        let is_memos_remote = if let Some(account_id) = account_id {
+        let provider = if let Some(account_id) = account_id {
             transaction
                 .query_row(
                     "SELECT provider FROM backend_accounts WHERE id = ?1",
@@ -492,29 +507,27 @@ impl Store {
                     |row| row.get::<_, String>(0),
                 )
                 .optional()?
-                .as_deref()
-                == Some("memos")
         } else {
-            false
+            None
         };
         if let Some(folder_id) = folder_id {
             ensure_folder_in_account(&transaction, folder_id, account_id)?;
         }
         let mut ids = Vec::with_capacity(notes.len());
         for (file_name, content) in notes {
-            if is_memos_remote {
-                let remote_size = images::to_remote_content(content).len();
-                if remote_size > MEMOS_CONTENT_LIMIT_BYTES {
-                    bail!(
-                        "{}",
-                        crate::tr_format!(
-                            "markdown.import.memos_content_too_large",
-                            file = file_name,
-                            size = remote_size.to_string(),
-                            limit = MEMOS_CONTENT_LIMIT_BYTES.to_string()
-                        )
-                    );
-                }
+            if let Some(provider) = &provider
+                && let Some((size, limit)) = adapters::content_limit_violation(provider, content)
+            {
+                bail!(
+                    "{}",
+                    crate::tr_format!(
+                        "markdown.import.content_too_large",
+                        file = file_name,
+                        backend = adapters::provider_name(provider),
+                        size = size.to_string(),
+                        limit = limit.to_string()
+                    )
+                );
             }
             let id = Uuid::new_v4().to_string();
             let (markdown_title, _) = memo::editor_parts(content);
@@ -752,7 +765,7 @@ impl Store {
             SyncEvent::FolderDeleted { folder_id } => self
                 .connection
                 .query_row(
-                    "SELECT account_id FROM backend_resource_links WHERE local_id = ?1 AND remote_name LIKE 'spaces/%'",
+                    "SELECT account_id FROM backend_resource_links WHERE local_id = ?1 AND kind = 'folder'",
                     [folder_id],
                     |row| row.get::<_, String>(0),
                 )
@@ -880,7 +893,7 @@ impl Store {
                 continue;
             }
             if !account.enabled
-                || account.provider != "memos"
+                || !adapters::is_supported(&account.provider)
                 || !self
                     .backend_accounts()?
                     .iter()
@@ -905,18 +918,33 @@ impl Store {
                 | SyncEvent::FolderUpdated { .. }
                 | SyncEvent::FolderDeleted { .. } => None,
             };
+            let mut renamed_folder = None;
             let created_link = match &mut event {
                 SyncEvent::FolderCreated { folder } => {
                     let local_id = folder.id.clone();
-                    folder.id = self.backend_resource_name(&account.id, &local_id, "spaces")?;
-                    Some((local_id, folder.id.clone()))
+                    folder.id = self.backend_resource_name(
+                        &account.id,
+                        &local_id,
+                        adapters::ResourceKind::Folder,
+                    )?;
+                    Some((local_id, folder.id.clone(), adapters::ResourceKind::Folder))
                 }
                 SyncEvent::FolderUpdated { folder } => {
-                    folder.id = self.backend_resource_name(&account.id, &folder.id, "spaces")?;
+                    let local_id = folder.id.clone();
+                    folder.id = self.backend_resource_name(
+                        &account.id,
+                        &local_id,
+                        adapters::ResourceKind::Folder,
+                    )?;
+                    renamed_folder = Some((local_id, folder.id.clone()));
                     None
                 }
                 SyncEvent::FolderDeleted { folder_id } => {
-                    *folder_id = self.backend_resource_name(&account.id, folder_id, "spaces")?;
+                    *folder_id = self.backend_resource_name(
+                        &account.id,
+                        folder_id,
+                        adapters::ResourceKind::Folder,
+                    )?;
                     None
                 }
                 SyncEvent::NoteCreated { note }
@@ -926,13 +954,20 @@ impl Store {
                 | SyncEvent::NoteUnarchived { note }
                 | SyncEvent::NoteDeleted { note } => {
                     let local_id = note.id.clone();
-                    note.id = self.backend_resource_name(&account.id, &local_id, "memos")?;
+                    note.id = self.backend_resource_name(
+                        &account.id,
+                        &local_id,
+                        adapters::ResourceKind::Note,
+                    )?;
                     if let Some(folder_id) = &mut note.folder_id {
-                        *folder_id =
-                            self.backend_resource_name(&account.id, folder_id, "spaces")?;
+                        *folder_id = self.backend_resource_name(
+                            &account.id,
+                            folder_id,
+                            adapters::ResourceKind::Folder,
+                        )?;
                     }
                     if creates_note {
-                        Some((local_id, note.id.clone()))
+                        Some((local_id, note.id.clone(), adapters::ResourceKind::Note))
                     } else {
                         None
                     }
@@ -947,7 +982,7 @@ impl Store {
                 _ => None,
             };
             if let Err(error) = adapter.apply_event_with_base(&event, base_content.as_deref()) {
-                if !memos::is_bad_request(&error) {
+                if !adapters::is_rejected_request(&error) {
                     return Err(error);
                 }
                 self.connection.execute(
@@ -972,6 +1007,7 @@ impl Store {
                 )));
                 continue;
             }
+            let applied_name = adapter.applied_remote_name(&event);
             let transaction = self.connection.unchecked_transaction()?;
             if let Some((note_id, state)) = note_sync_state {
                 if let Some(state) = state {
@@ -983,12 +1019,29 @@ impl Store {
                     )?;
                 }
             }
-            if let Some((local_id, remote_name)) = created_link {
+            if let Some((local_id, sent_name, kind)) = created_link {
+                let remote_name = applied_name.clone().unwrap_or(sent_name);
                 transaction.execute(
-                    "INSERT INTO backend_resource_links (account_id, remote_name, local_id) VALUES (?1, ?2, ?3)
+                    "INSERT INTO backend_resource_links (account_id, remote_name, local_id, kind)
+                     VALUES (?1, ?2, ?3, ?4)
                      ON CONFLICT(account_id, remote_name) DO UPDATE SET local_id = excluded.local_id",
-                    params![account.id, remote_name, local_id],
+                    params![account.id, remote_name, local_id, kind.as_str()],
                 )?;
+            }
+            if let (Some((local_id, sent_name)), Some(new_name)) = (renamed_folder, applied_name) {
+                if new_name != sent_name {
+                    transaction.execute(
+                        "INSERT INTO backend_resource_links (account_id, remote_name, local_id, kind)
+                         VALUES (?1, ?2, ?3, 'folder')
+                         ON CONFLICT(account_id, remote_name) DO UPDATE SET local_id = excluded.local_id",
+                        params![account.id, new_name, local_id],
+                    )?;
+                    transaction.execute(
+                        "DELETE FROM backend_resource_links
+                         WHERE account_id = ?1 AND remote_name = ?2 AND local_id = ?3 AND kind = 'folder'",
+                        params![account.id, sent_name, local_id],
+                    )?;
+                }
             }
             transaction.execute(
                 "DELETE FROM sync_rejections WHERE account_id = ?1 AND item_id = ?2",
@@ -1010,6 +1063,25 @@ impl Store {
     }
 
     pub fn has_backend_events(&self, account_id: &str) -> Result<bool> {
+        // The scan parses every queued event and is polled every second, so reuse it until
+        // this or another connection changes the database.
+        let data_version: i64 = self
+            .connection
+            .pragma_query_value(None, "data_version", |row| row.get(0))?;
+        let changes = self.connection.total_changes() as i64;
+        if let Some((version, seen_changes, result)) = self.events_check.borrow().get(account_id) {
+            if *version == data_version && *seen_changes == changes {
+                return Ok(*result);
+            }
+        }
+        let result = self.scan_backend_events(account_id)?;
+        self.events_check
+            .borrow_mut()
+            .insert(account_id.to_owned(), (data_version, changes, result));
+        Ok(result)
+    }
+
+    fn scan_backend_events(&self, account_id: &str) -> Result<bool> {
         Ok(self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM sync_outbox
              WHERE (json_extract(payload, '$.snapshot.note.account_id') = ?1
@@ -1020,7 +1092,7 @@ impl Store {
                 OR (json_extract(payload, '$.type') = 'folder_deleted' AND EXISTS(
                     SELECT 1 FROM backend_resource_links WHERE account_id = ?1
                     AND local_id = json_extract(payload, '$.snapshot.folder_id')
-                    AND remote_name LIKE 'spaces/%')))",
+                    AND kind = 'folder')))",
             [account_id],
             |row| row.get(0),
         )?)
@@ -1086,32 +1158,34 @@ impl Store {
         &self,
         account_id: &str,
         local_id: &str,
-        collection: &str,
+        kind: adapters::ResourceKind,
     ) -> Result<String> {
-        Ok(self
+        let linked = self
             .connection
             .query_row(
                 "SELECT remote_name FROM backend_resource_links
-             WHERE account_id = ?1 AND local_id = ?2 AND remote_name LIKE ?3",
-                params![account_id, local_id, format!("{collection}/%")],
+             WHERE account_id = ?1 AND local_id = ?2 AND kind = ?3",
+                params![account_id, local_id, kind.as_str()],
                 |row| row.get::<_, String>(0),
             )
-            .optional()?
-            .unwrap_or_else(|| {
-                if local_id.starts_with(&format!("{collection}/")) {
-                    local_id.to_owned()
-                } else {
-                    format!("{collection}/{local_id}")
-                }
-            }))
+            .optional()?;
+        if let Some(name) = linked {
+            return Ok(name);
+        }
+        let provider: String = self.connection.query_row(
+            "SELECT provider FROM backend_accounts WHERE id = ?1",
+            [account_id],
+            |row| row.get(0),
+        )?;
+        Ok(adapters::default_remote_name(&provider, kind, local_id))
     }
 
     pub fn backend_memo_name(&self, account_id: &str, note_id: &str) -> Result<String> {
-        self.backend_resource_name(account_id, note_id, "memos")
+        self.backend_resource_name(account_id, note_id, adapters::ResourceKind::Note)
     }
 
     pub fn backend_folder_name(&self, account_id: &str, folder_id: &str) -> Result<String> {
-        self.backend_resource_name(account_id, folder_id, "spaces")
+        self.backend_resource_name(account_id, folder_id, adapters::ResourceKind::Folder)
     }
 
     pub fn backend_accounts(&self) -> Result<Vec<BackendAccount>> {
@@ -1275,13 +1349,16 @@ impl Store {
         confirmed_remote_deletions: &[String],
     ) -> Result<()> {
         let transaction = self.connection.unchecked_transaction()?;
-        let valid_account: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM backend_accounts WHERE id = ?1 AND enabled = 1 AND provider = 'memos')",
-            [account_id], |row| row.get(0),
-        )?;
-        if !valid_account {
+        let provider: Option<String> = transaction
+            .query_row(
+                "SELECT provider FROM backend_accounts WHERE id = ?1 AND enabled = 1",
+                [account_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(provider) = provider.filter(|provider| adapters::is_supported(provider)) else {
             bail!(tr("api.memos.error.account_removed_or_disabled"));
-        }
+        };
         let mut protected = HashSet::new();
         let mut pending_note_ids = HashSet::new();
         let mut pending_note_deletions = HashSet::new();
@@ -1330,9 +1407,10 @@ impl Store {
             let id = cached_resource_id(
                 &transaction,
                 account_id,
+                &provider,
                 &folder.id,
                 "folders",
-                "spaces",
+                adapters::ResourceKind::Folder,
                 &protected,
             )?;
             if !protected.contains(&id) {
@@ -1360,9 +1438,10 @@ impl Store {
             let id = cached_resource_id(
                 &transaction,
                 account_id,
+                &provider,
                 &memo.id,
                 "notes",
-                "memos",
+                adapters::ResourceKind::Note,
                 &protected,
             )?;
             let folder_id = match memo.folder_id.as_deref() {
@@ -1379,7 +1458,7 @@ impl Store {
                 None => None,
             };
             transaction.execute(
-                "UPDATE notes SET is_shared = ?3 WHERE id = ?1 AND account_id = ?2",
+                "UPDATE notes SET is_shared = ?3 WHERE id = ?1 AND account_id = ?2 AND is_shared != ?3",
                 params![id, account_id, memo.is_shared],
             )?;
             let remote_state = SyncedNoteState {
@@ -1388,11 +1467,11 @@ impl Store {
                 pinned: memo.pinned,
                 archived: memo.archived,
             };
-            let has_conflict: bool = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM sync_conflicts WHERE account_id = ?1 AND note_id = ?2)",
-                params![account_id, id],
-                |row| row.get(0),
-            )?;
+            let has_conflict: bool = transaction
+                .prepare_cached(
+                    "SELECT EXISTS(SELECT 1 FROM sync_conflicts WHERE account_id = ?1 AND note_id = ?2)",
+                )?
+                .query_row(params![account_id, id], |row| row.get(0))?;
             if has_conflict {
                 update_sync_conflict_remote(&transaction, account_id, &id, Some(&remote_state))?;
                 continue;
@@ -1415,12 +1494,11 @@ impl Store {
                 continue;
             }
             let existing = transaction
-                .query_row(
+                .prepare_cached(
                     "SELECT id, folder_id, content, title, updated_at, pinned, archived, account_id
                      FROM notes WHERE id = ?1 AND account_id = ?2",
-                    params![id, account_id],
-                    note_from_row,
-                )
+                )?
+                .query_row(params![id, account_id], note_from_row)
                 .optional()?;
             let base = load_note_sync_base(&transaction, account_id, &id)?;
             if pending_note_ids.contains(&id) {
@@ -1449,6 +1527,20 @@ impl Store {
                 }
             }
             let updated_at = memo.updated_at.unwrap_or_default();
+            let title = memo::editor_parts(&memo.content).0;
+            // Rewriting identical notes makes every refresh of a large account slow.
+            let unchanged = base.as_ref() == Some(&remote_state)
+                && existing.as_ref().is_some_and(|note| {
+                    note.folder_id == folder_id
+                        && note.content == memo.content
+                        && note.title == title
+                        && note.updated_at == updated_at
+                        && note.pinned == memo.pinned
+                        && note.archived == memo.archived
+                });
+            if unchanged {
+                continue;
+            }
             transaction.execute(
                 "INSERT INTO notes (id, account_id, folder_id, content, title, updated_at, pinned, archived, is_shared)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
@@ -1456,7 +1548,7 @@ impl Store {
                      content = excluded.content, title = excluded.title,
                      updated_at = excluded.updated_at, pinned = excluded.pinned,
                      archived = excluded.archived, is_shared = excluded.is_shared",
-                params![id, account_id, folder_id, memo.content, memo::editor_parts(&memo.content).0,
+                params![id, account_id, folder_id, memo.content, title,
                     updated_at, memo.pinned, memo.archived, memo.is_shared],
             )?;
             save_note_sync_base(&transaction, account_id, &id, &remote_state)?;
@@ -1606,7 +1698,7 @@ impl Store {
              FROM backend_note_bases AS bases
              JOIN backend_resource_links AS links
                ON links.account_id = bases.account_id AND links.local_id = bases.note_id
-             WHERE bases.account_id = ?1 AND links.remote_name LIKE 'memos/%'",
+             WHERE bases.account_id = ?1 AND links.kind = 'note'",
         )?;
         let rows = statement.query_map([account_id], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -1747,11 +1839,10 @@ fn load_note_sync_base(
     note_id: &str,
 ) -> Result<Option<SyncedNoteState>> {
     connection
-        .query_row(
+        .prepare_cached(
             "SELECT state FROM backend_note_bases WHERE account_id = ?1 AND note_id = ?2",
-            params![account_id, note_id],
-            |row| row.get::<_, String>(0),
-        )
+        )?
+        .query_row(params![account_id, note_id], |row| row.get::<_, String>(0))
         .optional()?
         .map(|state| {
             serde_json::from_str::<SyncedNoteState>(&state)
@@ -1858,19 +1949,20 @@ fn ensure_note_sync_event(
 fn cached_resource_id(
     connection: &Connection,
     account_id: &str,
+    provider: &str,
     remote_name: &str,
     table: &str,
-    collection: &str,
+    kind: adapters::ResourceKind,
     protected: &HashSet<String>,
 ) -> Result<String> {
-    let suffix = remote_name
-        .strip_prefix(&format!("{collection}/"))
-        .filter(|id| !id.is_empty() && !id.contains('/'))
-        .context(tr("api.memos.error.invalid_resource_name"))?;
-    if let Some(id) = connection.query_row(
-        "SELECT local_id FROM backend_resource_links WHERE account_id = ?1 AND remote_name = ?2",
-        params![account_id, remote_name], |row| row.get::<_, String>(0),
-    ).optional()? {
+    let suffix = adapters::local_id_from_remote_name(provider, kind, remote_name)?;
+    if let Some(id) = connection
+        .prepare_cached(
+            "SELECT local_id FROM backend_resource_links WHERE account_id = ?1 AND remote_name = ?2",
+        )?
+        .query_row(params![account_id, remote_name], |row| row.get::<_, String>(0))
+        .optional()?
+    {
         return Ok(id);
     }
     let existing = connection
@@ -1881,15 +1973,15 @@ fn cached_resource_id(
         )
         .optional()?;
     let id = existing.unwrap_or_else(|| {
-        if protected.contains(suffix) {
-            suffix.to_owned()
+        if protected.contains(&suffix) {
+            suffix.clone()
         } else {
             Uuid::new_v4().to_string()
         }
     });
     connection.execute(
-        "INSERT INTO backend_resource_links (account_id, remote_name, local_id) VALUES (?1, ?2, ?3)",
-        params![account_id, remote_name, id],
+        "INSERT INTO backend_resource_links (account_id, remote_name, local_id, kind) VALUES (?1, ?2, ?3, ?4)",
+        params![account_id, remote_name, id, kind.as_str()],
     )?;
     Ok(id)
 }
@@ -2498,11 +2590,43 @@ mod tests {
             store
                 .connection
                 .pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(schema_version, 12);
+        assert_eq!(schema_version, 13);
         assert_eq!(store.folders()?[0].count, 1);
         let note = store.note(&id)?.unwrap();
         assert_eq!(note.content, content);
         assert_eq!(store.note_color()?, "mint");
+        Ok(())
+    }
+
+    #[test]
+    fn opening_version_twelve_database_backfills_link_kinds() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("notes.sqlite3");
+        {
+            let store = Store::open(&path)?;
+            store.add_backend_account("one", "Werk", "memos", "https://memos.example.com")?;
+            store.connection.execute_batch(
+                "INSERT INTO backend_resource_links (account_id, remote_name, local_id)
+                    VALUES ('one', 'spaces/work', 'folder-1'), ('one', 'memos/abc', 'note-1');
+                 ALTER TABLE backend_resource_links DROP COLUMN kind;",
+            )?;
+            store.connection.pragma_update(None, "user_version", 12)?;
+        }
+
+        let store = Store::open(&path)?;
+
+        let kinds: Vec<(String, String)> = store
+            .connection
+            .prepare("SELECT remote_name, kind FROM backend_resource_links ORDER BY remote_name")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        assert_eq!(
+            kinds,
+            vec![
+                ("memos/abc".to_owned(), "note".to_owned()),
+                ("spaces/work".to_owned(), "folder".to_owned()),
+            ]
+        );
         Ok(())
     }
 
@@ -2526,7 +2650,7 @@ mod tests {
             store
                 .connection
                 .pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(schema_version, 12);
+        assert_eq!(schema_version, 13);
         assert!(has_column(
             &store.connection,
             "sync_conflicts",
@@ -2918,7 +3042,7 @@ mod tests {
         let version: i64 = store
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
         Ok(())
     }
 
@@ -2953,7 +3077,7 @@ mod tests {
         let version: i64 = store
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
         Ok(())
     }
 

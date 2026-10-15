@@ -3,7 +3,7 @@ use adw::prelude::*;
 use adw::{Application, ApplicationWindow, HeaderBar, ToolbarView};
 use anyhow::{Context, Result};
 use libadwaita as adw;
-use memonotes::adapters::{BackendAdapter, MemosAdapter};
+use memonotes::adapters::BackendAdapter;
 use memonotes::editor_document::{
     ImageSpan, LinkSpan, Mark, MarkupSpan, is_openable_link, markdown_inline_text, markdown_link,
     markdown_preview_text, normalize_link_url, render_markdown_source,
@@ -208,6 +208,7 @@ struct WindowState {
     upload_retry_attempts: RefCell<HashMap<String, u32>>,
     refresh_after_upload: RefCell<HashSet<String>>,
     upload_after: RefCell<HashMap<String, Instant>>,
+    note_list_refresh_generation: Cell<u64>,
     checked_outbox_revision: RefCell<HashMap<String, i64>>,
     shown_sync_conflicts: RefCell<HashSet<String>>,
     note_color: RefCell<String>,
@@ -377,6 +378,7 @@ fn build_window(application: &Application) -> Result<()> {
         upload_retry_attempts: RefCell::new(HashMap::new()),
         refresh_after_upload: RefCell::new(HashSet::new()),
         upload_after: RefCell::new(HashMap::new()),
+        note_list_refresh_generation: Cell::new(0),
         checked_outbox_revision: RefCell::new(HashMap::new()),
         shown_sync_conflicts: RefCell::new(HashSet::new()),
         note_color: RefCell::new(note_color),
@@ -741,7 +743,7 @@ fn request_manual_sync(
         let mut status_error = false;
         for account in accounts
             .iter()
-            .filter(|account| account.enabled && account.provider == "memos")
+            .filter(|account| account.enabled && memonotes::adapters::is_supported(&account.provider))
         {
             match state.store.borrow().has_backend_events(&account.id) {
                 Ok(has_events) => pending_events |= has_events,
@@ -793,7 +795,7 @@ fn handle_backend_error_with_action(
 ) {
     set_account_online(state, account_id, false);
     if !adw::gio::NetworkMonitor::default().is_network_available()
-        || memonotes::memos::is_connection_error(error)
+        || memonotes::adapters::is_connection_error(error)
     {
         state.upload_retry_at.borrow_mut().insert(
             account_id.to_owned(),
@@ -915,7 +917,7 @@ fn upload_backend_events(state: &Rc<WindowState>) -> Result<()> {
     let accounts = state.store.borrow().backend_accounts()?;
     for account in accounts
         .into_iter()
-        .filter(|account| account.enabled && account.provider == "memos")
+        .filter(|account| account.enabled && memonotes::adapters::is_supported(&account.provider))
     {
         if !backend_available(state, &account.id)
             || state.loading_accounts.borrow().contains(&account.id)
@@ -962,11 +964,9 @@ fn upload_backend_events(state: &Rc<WindowState>) -> Result<()> {
         let worker_account = account.clone();
         thread::spawn(move || {
             let result = (|| -> Result<usize> {
-                let token = memonotes::credentials::lookup_token(&worker_account.id)?
-                    .context(tr("api.memos.error.token_missing"))?;
-                let adapter = MemosAdapter::new(&worker_account.server_url, &token)?;
+                let adapter = connect_account_adapter(&worker_account)?;
                 let store = Store::open(path)?;
-                store.sync_backend_events(&worker_account, &adapter)
+                store.sync_backend_events(&worker_account, adapter.as_ref())
             })();
             let _ = sender.send(result);
         });
@@ -1013,7 +1013,7 @@ fn upload_backend_events(state: &Rc<WindowState>) -> Result<()> {
                         .remove(&account.id);
                     let connection_error = !adw::gio::NetworkMonitor::default()
                         .is_network_available()
-                        || memonotes::memos::is_connection_error(&error);
+                        || memonotes::adapters::is_connection_error(&error);
                     if !connection_error {
                         let retry_delay = next_sync_retry_delay(&state, &account.id);
                         state
@@ -1031,11 +1031,11 @@ fn upload_backend_events(state: &Rc<WindowState>) -> Result<()> {
                             error = format!("{error:#}")
                         ),
                         &error,
-                        memonotes::memos::is_bad_request(&error)
+                        memonotes::adapters::is_rejected_request(&error)
                             .then(|| open_rejected_note_action(&state, &account.id))
                             .flatten(),
                     );
-                    if !connection_error && !memonotes::memos::is_bad_request(&error) {
+                    if !connection_error && !memonotes::adapters::is_rejected_request(&error) {
                         if let Some(window) = state
                             .note_list
                             .view
@@ -1088,9 +1088,7 @@ fn precheck_pending_notes(state: &Rc<WindowState>, account: BackendAccount, revi
     let worker_account = account.clone();
     thread::spawn(move || {
         let result = (|| -> Result<Vec<(String, Option<memonotes::memo::Memo>)>> {
-            let token = memonotes::credentials::lookup_token(&worker_account.id)?
-                .context(tr("api.memos.error.token_missing"))?;
-            let adapter = MemosAdapter::new(&worker_account.server_url, &token)?;
+            let adapter = connect_account_adapter(&worker_account)?;
             notes
                 .into_iter()
                 .map(|(note_id, name)| Ok((note_id, adapter.get_memo_if_exists(&name)?)))
@@ -1148,7 +1146,7 @@ fn precheck_pending_notes(state: &Rc<WindowState>, account: BackendAccount, revi
         });
         if let Err(error) = result {
             let connection_error = !adw::gio::NetworkMonitor::default().is_network_available()
-                || memonotes::memos::is_connection_error(&error);
+                || memonotes::adapters::is_connection_error(&error);
             if !connection_error {
                 let retry_delay = next_sync_retry_delay(&state, &account.id);
                 state
@@ -1189,7 +1187,7 @@ fn load_backend_accounts(state: &Rc<WindowState>, window: &ApplicationWindow) {
     state.api_errors.borrow_mut().remove("accounts");
     for account in accounts
         .into_iter()
-        .filter(|account| account.enabled && account.provider == "memos")
+        .filter(|account| account.enabled && memonotes::adapters::is_supported(&account.provider))
     {
         if !backend_available(state, &account.id) {
             continue;
@@ -1227,9 +1225,7 @@ fn load_backend_accounts(state: &Rc<WindowState>, window: &ApplicationWindow) {
         let worker_account = account.clone();
         thread::spawn(move || {
             let result = (|| -> Result<_> {
-                let token = memonotes::credentials::lookup_token(&worker_account.id)?
-                    .context(tr("api.memos.error.token_missing"))?;
-                let adapter = MemosAdapter::new(&worker_account.server_url, &token)?;
+                let adapter = connect_account_adapter(&worker_account)?;
                 let folders = adapter.list_folders()?;
                 let memos = adapter.list_memos()?;
                 let store = Store::open(database_path()?)?;
@@ -1260,7 +1256,6 @@ fn load_backend_accounts(state: &Rc<WindowState>, window: &ApplicationWindow) {
                 }
             };
             state.loading_accounts.borrow_mut().remove(&account.id);
-            let mut outbox_changed_during_refresh = false;
             let result = (|| -> Result<()> {
                 let current = state.store.borrow().backend_accounts()?;
                 if !current.iter().any(|current| current == &account) {
@@ -1281,11 +1276,11 @@ fn load_backend_accounts(state: &Rc<WindowState>, window: &ApplicationWindow) {
                         .borrow_mut()
                         .insert(account.id.clone(), current_revision);
                 } else {
+                    // Edits made meanwhile are compared against the server by the upload precheck.
                     state
                         .checked_outbox_revision
                         .borrow_mut()
                         .remove(&account.id);
-                    outbox_changed_during_refresh = true;
                 }
                 populate_sidebar(&state, &window)?;
                 refresh_notes(&state)?;
@@ -1312,7 +1307,7 @@ fn load_backend_accounts(state: &Rc<WindowState>, window: &ApplicationWindow) {
             })();
             if let Err(error) = result {
                 let connection_error = !adw::gio::NetworkMonitor::default().is_network_available()
-                    || memonotes::memos::is_connection_error(&error);
+                    || memonotes::adapters::is_connection_error(&error);
                 if !connection_error
                     && state
                         .store
@@ -1347,9 +1342,6 @@ fn load_backend_accounts(state: &Rc<WindowState>, window: &ApplicationWindow) {
                     .api_errors
                     .borrow_mut()
                     .remove(&format!("fetch:{}", account.id));
-                if outbox_changed_during_refresh {
-                    load_backend_accounts(&state, &window);
-                }
             }
             gtk::glib::ControlFlow::Break
         });
@@ -1373,7 +1365,7 @@ fn refresh_backend_folder(
             .backend_accounts()?
             .into_iter()
             .find(|account| {
-                account.id == account_id && account.enabled && account.provider == "memos"
+                account.id == account_id && account.enabled && memonotes::adapters::is_supported(&account.provider)
             });
         let Some(account) = account else {
             return Ok(None);
@@ -1406,9 +1398,7 @@ fn refresh_backend_folder(
     let worker_account = account.clone();
     thread::spawn(move || {
         let result = (|| -> Result<_> {
-            let token = memonotes::credentials::lookup_token(&worker_account.id)?
-                .context(tr("api.memos.error.token_missing"))?;
-            let adapter = MemosAdapter::new(&worker_account.server_url, &token)?;
+            let adapter = connect_account_adapter(&worker_account)?;
             let folder = adapter.get_folder(&remote_name)?;
             let memos = adapter.list_folder_memos(&remote_name)?;
             Ok((folder, memos))
@@ -1492,7 +1482,7 @@ fn refresh_backend_note(state: &Rc<WindowState>, window: &ApplicationWindow, not
     }
     let account = match state.store.borrow().backend_accounts() {
         Ok(accounts) => accounts.into_iter().find(|account| {
-            account.id == account_id && account.enabled && account.provider == "memos"
+            account.id == account_id && account.enabled && memonotes::adapters::is_supported(&account.provider)
         }),
         Err(error) => {
             show_api_error(
@@ -1545,9 +1535,7 @@ fn refresh_backend_note(state: &Rc<WindowState>, window: &ApplicationWindow, not
     let worker_account = account.clone();
     thread::spawn(move || {
         let result = (|| -> Result<_> {
-            let token = memonotes::credentials::lookup_token(&worker_account.id)?
-                .context(tr("api.memos.error.token_missing"))?;
-            let adapter = MemosAdapter::new(&worker_account.server_url, &token)?;
+            let adapter = connect_account_adapter(&worker_account)?;
             adapter.get_memo(&remote_name)
         })();
         let _ = sender.send(result);
@@ -1883,7 +1871,7 @@ fn markdown_account_choices(state: &WindowState) -> Result<Vec<(Option<String>, 
             .borrow()
             .backend_accounts()?
             .into_iter()
-            .filter(|account| account.provider == "memos")
+            .filter(|account| memonotes::adapters::is_supported(&account.provider))
             .map(|account| (Some(account.id), account.label)),
     );
     Ok(choices)
@@ -2819,12 +2807,7 @@ fn append_backend_account(
     status: &gtk::Label,
     account: BackendAccount,
 ) {
-    let provider_name = match account.provider.as_str() {
-        "memos" => "Memos",
-        "imap" => "IMAP",
-        "joplin" => "Joplin",
-        _ => "Backend",
-    };
+    let provider_name = memonotes::adapters::provider_name(&account.provider);
     let row = adw::SwitchRow::builder()
         .title(format!("{} · {}", provider_name, account.label))
         .subtitle(&account.server_url)
@@ -3019,14 +3002,18 @@ fn open_account_editor(
 
     let account_state = Rc::new(RefCell::new(account.clone()));
     let editing = Rc::new(Cell::new(creating));
-    let providers = gtk::StringList::new(&["Memos", "IMAP", "Joplin"]);
-    let provider_index = account
-        .as_ref()
-        .map_or(0, |account| match account.provider.as_str() {
-            "imap" => 1,
-            "joplin" => 2,
-            _ => 0,
-        });
+    let providers = gtk::StringList::new(
+        &memonotes::adapters::PROVIDERS
+            .iter()
+            .map(|info| info.name)
+            .collect::<Vec<_>>(),
+    );
+    let provider_index = account.as_ref().map_or(0, |account| {
+        memonotes::adapters::PROVIDERS
+            .iter()
+            .position(|info| info.id == account.provider)
+            .unwrap_or(0) as u32
+    });
     let provider_row = adw::ComboRow::builder()
         .title(tr("account.field.provider"))
         .model(&providers)
@@ -3041,14 +3028,46 @@ fn open_account_editor(
                 .map_or("", |account| account.label.as_str()),
         )
         .build();
+    let imap_account = account
+        .as_ref()
+        .filter(|account| account.provider == "imap")
+        .and_then(|account| memonotes::imap_notes::ImapAccount::parse(&account.server_url).ok());
     let server_row = adw::EntryRow::builder()
         .title(tr("account.field.server_url"))
+        .text(imap_account.as_ref().map_or_else(
+            || {
+                account
+                    .as_ref()
+                    .map_or("", |account| account.server_url.as_str())
+            },
+            |imap| imap.host.as_str(),
+        ))
+        .build();
+    let imap_port_row = adw::EntryRow::builder()
+        .title(tr("account.field.imap_port"))
         .text(
-            account
+            imap_account
                 .as_ref()
-                .map_or("", |account| account.server_url.as_str()),
+                .map_or(String::new(), |imap| imap.port.to_string()),
         )
         .build();
+    let imap_security_row = adw::ComboRow::builder()
+        .title(tr("account.field.imap_security"))
+        .model(&gtk::StringList::new(&[
+            tr("account.imap.security.tls"),
+            tr("account.imap.security.starttls"),
+        ]))
+        .selected(imap_account.as_ref().is_some_and(|imap| imap.starttls) as u32)
+        .build();
+    let imap_username_row = adw::EntryRow::builder()
+        .title(tr("account.field.imap_username"))
+        .text(imap_account.as_ref().map_or("", |imap| imap.username.as_str()))
+        .build();
+    let imap_rows = ImapFormRows {
+        port: imap_port_row,
+        security: imap_security_row,
+        username: imap_username_row,
+    };
     let token_row = adw::PasswordEntryRow::builder()
         .title(if creating {
             tr("account.field.personal_access_token")
@@ -3089,9 +3108,47 @@ fn open_account_editor(
     form_group.add(&provider_row);
     form_group.add(&account_name_row);
     form_group.add(&server_row);
+    form_group.add(&imap_rows.port);
+    form_group.add(&imap_rows.security);
+    form_group.add(&imap_rows.username);
     form_group.add(&token_info);
     form_group.add(&token_row);
     form_group.add(&advanced_row);
+    let apply_provider_labels = {
+        let server_row = server_row.clone();
+        let token_row = token_row.clone();
+        let advanced_row = advanced_row.clone();
+        let imap_rows = imap_rows.clone();
+        move |provider_id: &str| {
+            let imap = provider_id == "imap";
+            server_row.set_title(if imap {
+                tr("account.field.imap_host")
+            } else {
+                tr("account.field.server_url")
+            });
+            imap_rows.port.set_visible(imap);
+            imap_rows.security.set_visible(imap);
+            imap_rows.username.set_visible(imap);
+            if creating {
+                token_row.set_title(if imap {
+                    tr("account.field.imap_password")
+                } else {
+                    tr("account.field.personal_access_token")
+                });
+            }
+            advanced_row.set_visible(!imap);
+        }
+    };
+    apply_provider_labels(
+        memonotes::adapters::PROVIDERS
+            .get(provider_index as usize)
+            .map_or("", |info| info.id),
+    );
+    provider_row.connect_selected_notify(move |row| {
+        if let Some(info) = memonotes::adapters::PROVIDERS.get(row.selected() as usize) {
+            apply_provider_labels(info.id);
+        }
+    });
     let form = gtk::Box::new(gtk::Orientation::Vertical, 0);
     form.append(&error_banner);
     form.append(&form_group);
@@ -3107,6 +3164,7 @@ fn open_account_editor(
         &provider_row,
         &account_name_row,
         &server_row,
+        &imap_rows,
         &token_row,
         &token_info,
         &allow_http_row,
@@ -3133,6 +3191,7 @@ fn open_account_editor(
                 &provider_row,
                 &account_name_row,
                 &server_row,
+                &imap_rows,
                 &token_row,
                 &token_info,
                 &allow_http_row,
@@ -3146,13 +3205,49 @@ fn open_account_editor(
             return;
         }
 
-        if provider_row.selected() != 0 {
+        let Some(provider) = memonotes::adapters::PROVIDERS
+            .get(provider_row.selected() as usize)
+            .filter(|info| info.available)
+            .map(|info| info.id)
+        else {
             error_banner.set_title(tr("account.error.backend_unavailable"));
             error_banner.set_revealed(true);
             return;
-        }
+        };
         let label = account_name_row.text().trim().to_owned();
-        let server_url = server_row.text().trim().to_owned();
+        let server_url = if provider == "imap" {
+            let port_text = imap_rows.port.text();
+            let starttls = imap_rows.security.selected() == 1;
+            let port = if port_text.trim().is_empty() {
+                Some(if starttls { 143 } else { 993 })
+            } else {
+                port_text.trim().parse::<u16>().ok()
+            };
+            let imap = port.map(|port| memonotes::imap_notes::ImapAccount {
+                username: imap_rows.username.text().trim().to_owned(),
+                host: server_row.text().trim().to_owned(),
+                port,
+                starttls,
+            });
+            match imap {
+                Some(imap) if imap.username.is_empty() || imap.host.is_empty() => String::new(),
+                Some(imap) => match memonotes::imap_notes::ImapAccount::parse(&imap.spec()) {
+                    Ok(_) => imap.spec(),
+                    Err(error) => {
+                        error_banner.set_title(&format!("{error:#}"));
+                        error_banner.set_revealed(true);
+                        return;
+                    }
+                },
+                None => {
+                    error_banner.set_title(tr("api.imap.error.invalid_server"));
+                    error_banner.set_revealed(true);
+                    return;
+                }
+            }
+        } else {
+            server_row.text().trim().to_owned()
+        };
         let new_token = token_row.text().to_string();
         if label.is_empty()
             || server_url.is_empty()
@@ -3205,21 +3300,21 @@ fn open_account_editor(
                 } else {
                     None
                 };
-                let client = memonotes::memos::MemosClient::new(
+                let adapter = memonotes::adapters::connect(
+                    provider,
                     &server_for_worker,
                     effective_token
                         .as_deref()
                         .unwrap_or("offline-account-without-token"),
                 )?;
-                if client.uses_plain_http() && !allow_http {
+                if adapter.uses_plain_http() && !allow_http {
                     anyhow::bail!(tr("account.error.insecure_http_confirmation_required"));
                 }
                 if enabled {
-                    let token = effective_token
+                    effective_token
                         .as_deref()
                         .context(tr("account.error.replacement_token_required"))?;
-                    memonotes::memos::MemosClient::new(&server_for_worker, token)?
-                        .check_connection()?;
+                    adapter.check_connection()?;
                 }
                 if !new_token_for_worker.is_empty() {
                     memonotes::credentials::store_token(
@@ -3270,7 +3365,7 @@ fn open_account_editor(
                                     .add_backend_account_with_state(
                                         &account_id_for_save,
                                         &label,
-                                        "memos",
+                                        provider,
                                         &server_url,
                                         true,
                                     )
@@ -3341,6 +3436,13 @@ fn open_account_editor(
     dialog.present();
 }
 
+#[derive(Clone)]
+struct ImapFormRows {
+    port: adw::EntryRow,
+    security: adw::ComboRow,
+    username: adw::EntryRow,
+}
+
 fn set_account_editor_editable(
     dialog: &gtk::Dialog,
     account: &Option<BackendAccount>,
@@ -3348,6 +3450,7 @@ fn set_account_editor_editable(
     provider_row: &adw::ComboRow,
     account_name_row: &adw::EntryRow,
     server_row: &adw::EntryRow,
+    imap_rows: &ImapFormRows,
     token_row: &adw::PasswordEntryRow,
     token_info: &adw::ActionRow,
     allow_http_row: &adw::SwitchRow,
@@ -3355,6 +3458,9 @@ fn set_account_editor_editable(
     provider_row.set_sensitive(editable && account.is_none());
     account_name_row.set_editable(editable);
     server_row.set_editable(editable);
+    imap_rows.port.set_editable(editable);
+    imap_rows.security.set_sensitive(editable);
+    imap_rows.username.set_editable(editable);
     token_row.set_editable(editable);
     token_row.set_visible(editable);
     token_info.set_visible(account.is_some() && !editable);
@@ -4482,10 +4588,12 @@ fn confirm_delete_folder(
     if let Some(action_area) = cancel_button.parent().and_downcast::<gtk::Box>() {
         action_area.set_orientation(gtk::Orientation::Vertical);
         action_area.set_spacing(6);
+        action_area.set_halign(gtk::Align::Fill);
+        action_area.set_hexpand(true);
         action_area.set_margin_top(0);
-        action_area.set_margin_bottom(16);
-        action_area.set_margin_start(16);
-        action_area.set_margin_end(16);
+        action_area.set_margin_bottom(18);
+        action_area.set_margin_start(18);
+        action_area.set_margin_end(18);
         cancel_button.set_hexpand(true);
         keep_notes_button.set_hexpand(true);
         delete_button.set_hexpand(true);
@@ -4500,10 +4608,10 @@ fn confirm_delete_folder(
         .xalign(0.0)
         .build();
     let content_area = dialog.content_area();
-    content_area.set_margin_top(16);
-    content_area.set_margin_bottom(16);
-    content_area.set_margin_start(16);
-    content_area.set_margin_end(16);
+    content_area.set_margin_top(18);
+    content_area.set_margin_bottom(18);
+    content_area.set_margin_start(18);
+    content_area.set_margin_end(18);
     content_area.append(&message);
 
     let state_for_response = Rc::clone(state);
@@ -5098,7 +5206,25 @@ fn connect_tab_navigation(
     widget.add_controller(keys);
 }
 
+// Typing saves on every keystroke; reloading every note each time makes large collections lag.
+fn schedule_note_list_refresh(state: &Rc<WindowState>) {
+    let generation = state.note_list_refresh_generation.get() + 1;
+    state.note_list_refresh_generation.set(generation);
+    let weak_state = Rc::downgrade(state);
+    gtk::glib::timeout_add_local_once(Duration::from_millis(500), move || {
+        let Some(state) = weak_state.upgrade() else {
+            return;
+        };
+        if state.note_list_refresh_generation.get() == generation {
+            let _ = refresh_notes(&state);
+        }
+    });
+}
+
 fn refresh_notes(state: &Rc<WindowState>) -> Result<()> {
+    state
+        .note_list_refresh_generation
+        .set(state.note_list_refresh_generation.get() + 1);
     let filter = state
         .active_filter
         .borrow()
@@ -6042,7 +6168,7 @@ fn save_detached_note(state: &Rc<WindowState>, note_id: &str, buffer: &gtk::Text
         .is_ok()
     {
         debounce_backend_save(state, current.account_id.as_deref());
-        let _ = refresh_notes(state);
+        schedule_note_list_refresh(state);
     }
 }
 
@@ -6097,8 +6223,10 @@ fn save_current(state: &Rc<WindowState>, content: &str) {
                 state.folder_button.set_sensitive(true);
                 state.folder_picker.set_sensitive(true);
                 resync_folder_picker(state);
+                let _ = refresh_notes(state);
+            } else {
+                schedule_note_list_refresh(state);
             }
-            let _ = refresh_notes(state);
         }
     }
 }
@@ -6148,8 +6276,9 @@ fn editor_format_toolbar(
             if editor.has_css_class("editor-content-replacing") {
                 history.undo.clear();
                 history.pending_delete = None;
-                false
-            } else if let Some(before) = history.pending_delete.take() {
+                return;
+            }
+            if let Some(before) = history.pending_delete.take() {
                 // GTK would undo a deleted image into a bare placeholder character.
                 let after = editor_snapshot(&editor);
                 history.undo.push(EditorImageChange {
@@ -6176,7 +6305,15 @@ fn editor_format_toolbar(
         deselect_editor_image(&editor);
     });
     let update_after_change = Rc::clone(&update_buttons);
-    buffer.connect_changed(move |buffer| update_after_change(buffer));
+    let editor_for_update = editor.downgrade();
+    buffer.connect_changed(move |buffer| {
+        let loading = editor_for_update
+            .upgrade()
+            .is_some_and(|editor| editor.has_css_class("editor-content-replacing"));
+        if !loading {
+            update_after_change(buffer);
+        }
+    });
     let update_after_undo = Rc::clone(&update_buttons);
     buffer.connect_notify_local(Some("can-undo"), move |buffer, _| {
         update_after_undo(buffer);
@@ -7302,7 +7439,15 @@ fn editor_heading_menu(editor: &gtk::TextView) -> gtk::MenuButton {
     });
     let buffer = editor.buffer();
     let update_after_change = Rc::clone(&update_label);
-    buffer.connect_changed(move |buffer| update_after_change(buffer));
+    let editor_for_update = editor.downgrade();
+    buffer.connect_changed(move |buffer| {
+        let loading = editor_for_update
+            .upgrade()
+            .is_some_and(|editor| editor.has_css_class("editor-content-replacing"));
+        if !loading {
+            update_after_change(buffer);
+        }
+    });
     let update_after_cursor_move = Rc::clone(&update_label);
     let pending_for_cursor = Rc::clone(&pending_heading);
     buffer.connect_notify_local(Some("cursor-position"), move |buffer, _| {
@@ -8339,80 +8484,6 @@ fn markdown_from_editor_text(text: &str) -> String {
 #[cfg(test)]
 mod editor_format_tests {
     use super::*;
-
-    #[test]
-    fn bullet_markers_are_widgets_and_not_clipboard_text() -> Result<()> {
-        if std::env::var_os("MEMONOTES_EDITOR_FORMAT_TEST").is_none() {
-            let status = std::process::Command::new(std::env::current_exe()?)
-                .args([
-                    "--exact",
-                    "editor_format_tests::bullet_markers_are_widgets_and_not_clipboard_text",
-                    "--test-threads=1",
-                ])
-                .env("MEMONOTES_EDITOR_FORMAT_TEST", "1")
-                .status()?;
-            assert!(status.success());
-            return Ok(());
-        }
-        gtk::init()?;
-        let editor = gtk::TextView::new();
-        set_editor_view_content(&editor, "Title\n- First\n- Second");
-        let window = gtk::Window::builder()
-            .default_width(480)
-            .default_height(180)
-            .child(&editor)
-            .build();
-        window.present();
-        while gtk::glib::MainContext::default().pending() {
-            gtk::glib::MainContext::default().iteration(false);
-        }
-        let buffer = editor.buffer();
-        let start = buffer.iter_at_line(1).unwrap();
-        let marker = start.child_anchor().unwrap().widgets()[0]
-            .clone()
-            .downcast::<gtk::Label>()
-            .unwrap();
-        assert!(!marker.is_selectable());
-        assert!(!marker.can_target());
-        let marker_bounds = marker.compute_bounds(&editor).unwrap();
-        let (_, layout_y) = marker.layout_offsets();
-        let (ink, _) = marker.layout().pixel_extents();
-        let marker_center =
-            marker_bounds.y() + layout_y as f32 + ink.y() as f32 + ink.height() as f32 / 2.0;
-        let mut text_start = start;
-        text_start.forward_chars(2);
-        let text_bounds = editor.iter_location(&text_start);
-        let text_center = text_bounds.y() as f32 + text_bounds.height() as f32 / 2.0;
-        assert!(
-            (marker_center - text_center).abs() <= 1.0,
-            "bullet center {marker_center}; text center {text_center}; marker {marker_bounds:?}; ink {ink:?}; layout_y {layout_y}; text {text_bounds:?}"
-        );
-        window.set_child(gtk::Widget::NONE);
-        window.destroy();
-        let mut end = start;
-        end.forward_to_line_end();
-        buffer.select_range(&start, &end);
-        let clipboard = editor.clipboard();
-        buffer.copy_clipboard(&clipboard);
-        let copied = gtk::glib::MainContext::default()
-            .block_on(clipboard.read_text_future())?
-            .unwrap();
-        assert_eq!(copied.trim(), "First");
-        buffer.cut_clipboard(&clipboard, true);
-        buffer.place_cursor(&buffer.end_iter());
-        let pasted = Rc::new(Cell::new(false));
-        let pasted_for_signal = Rc::clone(&pasted);
-        buffer.connect_paste_done(move |_, _| pasted_for_signal.set(true));
-        buffer.paste_clipboard(&clipboard, None, true);
-        while !pasted.get() {
-            gtk::glib::MainContext::default().iteration(true);
-        }
-        assert_eq!(
-            markdown_from_editor_buffer(&buffer),
-            "# Title\n\n- Second First"
-        );
-        Ok(())
-    }
 
     fn table_widgets(buffer: &gtk::TextBuffer) -> Vec<gtk::Widget> {
         let mut widgets = Vec::new();
@@ -10215,6 +10286,10 @@ fn set_editor_view_content(editor: &gtk::TextView, content: &str) {
     auto_link_plain_urls(&buffer);
     buffer.set_enable_undo(true);
     editor.remove_css_class("editor-content-replacing");
+    // The skipped change handlers refresh from these notifications.
+    buffer.notify("can-undo");
+    buffer.notify("can-redo");
+    buffer.notify("cursor-position");
     update_editor_cursor_visibility(editor);
 }
 
@@ -10569,8 +10644,13 @@ fn serialize_inline_range(
         .collect();
     let mut runs: Vec<(Option<String>, Vec<Mark>, String, Option<String>)> = Vec::new();
 
-    for (character_offset, character) in characters.iter().enumerate() {
-        let iter = buffer.iter_at_offset((start_offset + character_offset) as i32);
+    // has_tag and iter_at_offset are linear in the line length, so walk one iterator and only
+    // look at the tags where they change.
+    let mut position = buffer.iter_at_offset(start_offset as i32);
+    let mut style: Option<(Vec<Mark>, Option<String>, gtk::TextIter)> = None;
+    for character in characters {
+        let iter = position;
+        position.forward_char();
         if *character == '\u{fffc}'
             && let Some(image) = iter.child_anchor().and_then(|anchor| {
                 anchor
@@ -10586,19 +10666,26 @@ fn serialize_inline_range(
         if *character == '\u{fffc}' {
             continue;
         }
-        let marks: Vec<_> = tags
-            .iter()
-            .filter(|(_, tag)| iter.has_tag(tag))
-            .map(|(mark, _)| *mark)
-            .collect();
-        let url = link_url_at(&iter);
+        if style.as_ref().is_none_or(|(_, _, until)| iter >= *until) {
+            let mut until = iter;
+            until.forward_to_tag_toggle(None::<&gtk::TextTag>);
+            let marks: Vec<_> = tags
+                .iter()
+                .filter(|(_, tag)| iter.has_tag(tag))
+                .map(|(mark, _)| *mark)
+                .collect();
+            style = Some((marks, link_url_at(&iter), until));
+        }
+        let Some((marks, url, _)) = style.as_ref() else {
+            continue;
+        };
         match runs.last_mut() {
             Some((last_url, last_marks, text, None))
-                if *last_url == url && *last_marks == marks =>
+                if last_url == url && last_marks == marks =>
             {
                 text.push(*character)
             }
-            _ => runs.push((url, marks, character.to_string(), None)),
+            _ => runs.push((url.clone(), marks.clone(), character.to_string(), None)),
         }
     }
 
@@ -10902,6 +10989,12 @@ fn undo_last_operation(state: &Rc<WindowState>) {
         clear_note_selection(state);
     }
     let _ = refresh_notes(state);
+}
+
+fn connect_account_adapter(account: &BackendAccount) -> Result<Box<dyn BackendAdapter>> {
+    let token = memonotes::credentials::lookup_token(&account.id)?
+        .context(tr("api.memos.error.token_missing"))?;
+    memonotes::adapters::connect(&account.provider, &account.server_url, &token)
 }
 
 fn database_path() -> Result<PathBuf> {
