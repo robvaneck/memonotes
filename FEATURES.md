@@ -6,7 +6,7 @@ see [PLAN.md](PLAN.md) for the roadmap and [README.md](README.md) for technical 
 ## Native Linux and pluggable backends
 
 - Native GTK4/libadwaita interface written in Rust; no Electron or embedded browser.
-- Backend-independent note and folder models behind a `BackendAdapter`; Memos is the first backend (IMAP and Joplin are possible future options, not built).
+- Backend-independent note and folder models behind a `BackendAdapter`; Memos and IMAP are implemented and working.
 - Multiple accounts side by side, each with its own folders, sync state and outbox, plus local-only notes.
 - The same remote name on two servers never mixes notes or folders.
 

@@ -2,10 +2,14 @@
 
 A truly native Linux/GNOME notes app (Rust, GTK4, libadwaita) with an Apple
 Notes-style interface, built on a pluggable backend layer so one app can sync
-multiple accounts from different sources. It works fully offline today and
-syncs with your own [Memos](https://usememos.com) server, including Memos
-running on [Umbrel](https://umbrel.com). Status: early
-development, last updated 2026-10-14.
+multiple accounts from different sources. It works fully offline and syncs with
+two backends that are implemented and working today:
+
+- **Memos**: your own [Memos](https://usememos.com) server, including Memos
+  running on [Umbrel](https://umbrel.com).
+- **IMAP**: notes stored as mail in a `Notes` mailbox, in the Apple Notes layout.
+
+Status: early development, last updated 2026-10-15.
 
 ## Why Memonotes
 
@@ -13,13 +17,12 @@ development, last updated 2026-10-14.
   and libadwaita interface that follows the GNOME look, light/dark mode, keyboard
   conventions, system file chooser and keyring.
 - **Variable backend, many accounts.** The UI talks to a backend-independent
-  `BackendAdapter`, so storage is not tied to one service. Memos is implemented
-  today; the design leaves room for others (IMAP and Joplin are planned options,
-  not built yet). Add several accounts side by side, each syncing independently,
-  next to purely local notes.
+  `BackendAdapter`, so storage is not tied to one service. Memos and IMAP are
+  implemented and working; the design leaves room for others. Add several
+  accounts side by side, each syncing independently, next to purely local notes.
 - **Your notes, your server.** Notes stay on your device and, if you choose, sync
-  with a self-hosted Memos instance (works with Memos on Umbrel). No third-party
-  cloud and no lock-in: content is stored as plain Markdown.
+  with a self-hosted Memos instance (works with Memos on Umbrel) or with an IMAP
+  mailbox. No third-party cloud and no lock-in: content is stored as plain Markdown.
 - **Offline first.** Everything reads and writes locally; a durable outbox uploads
   changes when the network returns. Local-only folders never touch the network.
 - **Sync that does not lose data.** Three-way conflict detection keeps the base,
@@ -56,6 +59,13 @@ Shared spaces and notes with `PROTECTED`, `PUBLIC`, or `SPACE` visibility are
 hidden from the folder and note lists. They remain in the local sync cache for
 reconciliation, but filtering them does not delete anything on the Memos server;
 Memonotes does not support managing shared content.
+
+IMAP accounts are added in Settings with `[imaps://|imap://]user@host[:port]` and
+a password or app password (stored in GNOME Keyring). Every message in the `Notes`
+mailbox is a note and its subfolders are folders. Notes written by Memonotes use
+the Apple Notes layout with the Markdown embedded, so they round-trip exactly;
+mail from other clients is converted. Parsed messages are cached per mailbox, so
+refreshes only fetch new mail.
 
 ### Synchronization
 

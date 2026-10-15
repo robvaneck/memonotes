@@ -56,21 +56,16 @@ const MEMOS: &str = "memos";
 const IMAP: &str = "imap";
 const MEMOS_CONTENT_LIMIT_BYTES: usize = 8 * 1024;
 
-pub const PROVIDERS: [ProviderInfo; 3] = [
+pub const PROVIDERS: [ProviderInfo; 2] = [
     ProviderInfo {
         id: MEMOS,
         name: "Memos",
         available: true,
     },
     ProviderInfo {
-        id: "imap",
+        id: IMAP,
         name: "IMAP",
         available: true,
-    },
-    ProviderInfo {
-        id: "joplin",
-        name: "Joplin",
-        available: false,
     },
 ];
 
