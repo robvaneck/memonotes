@@ -20,7 +20,7 @@
   <screenshots>
     <screenshot type="default">
       <caption>Notes from your Memos server, IMAP or stored only on this device</caption>
-      <image type="source" width="2359" height="1643">https://raw.githubusercontent.com/robvaneck/memonotes/v0.1.0/screenshots/00_hello.png</image>
+      <image type="source" width="2359" height="1559">https://raw.githubusercontent.com/robvaneck/memonotes/v0.1.0/screenshots/00_hello.png</image>
     </screenshot>
     <screenshot>
       <caption>Visual editor with headings, checklists, lists and tables</caption>
