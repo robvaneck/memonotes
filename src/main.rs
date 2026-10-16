@@ -275,6 +275,11 @@ fn main() -> Result<()> {
         .build();
 
     application.connect_activate(|application| {
+        // A second launch is forwarded to this instance; reuse its window.
+        if let Some(window) = application.active_window() {
+            window.present();
+            return;
+        }
         if let Err(error) = build_window(application) {
             eprintln!(
                 "{}",
