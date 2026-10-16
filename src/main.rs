@@ -84,6 +84,7 @@ enum UndoOperation {
 struct EditorSnapshot {
     markdown: String,
     cursor: i32,
+    title_heading: Option<u8>,
 }
 
 #[derive(Clone)]
@@ -6495,9 +6496,12 @@ fn begin_editor_image_change(
 
 fn editor_snapshot(editor: &gtk::TextView) -> EditorSnapshot {
     let buffer = editor.buffer();
+    let title_start = buffer.start_iter();
     EditorSnapshot {
         markdown: markdown_from_editor_buffer(&buffer),
         cursor: buffer.iter_at_mark(&buffer.get_insert()).offset(),
+        title_heading: (1..=6)
+            .find(|level| title_start.has_tag(&heading_style_tag(&buffer, *level))),
     }
 }
 
@@ -6596,10 +6600,19 @@ fn restore_editor_image_change(
         let target = if undo { &change.before } else { &change.after };
         let scroll = editor.vadjustment().map(|adjustment| adjustment.value());
         set_editor_view_content(editor, &target.markdown);
+        let buffer = editor.buffer();
+        let title_start = buffer.start_iter();
+        let mut title_end = title_start;
+        title_end.forward_to_line_end();
+        for level in 1..=6 {
+            buffer.remove_tag(&heading_style_tag(&buffer, level), &title_start, &title_end);
+        }
+        if let Some(level) = target.title_heading {
+            buffer.apply_tag(&heading_style_tag(&buffer, level), &title_start, &title_end);
+        }
         if let Some(scroll) = scroll {
             keep_editor_scroll(editor, scroll);
         }
-        let buffer = editor.buffer();
         buffer.place_cursor(&buffer.iter_at_offset(target.cursor.min(buffer.char_count())));
     }
     editor.remove_css_class("editor-image-moving");
@@ -7696,7 +7709,6 @@ fn install_editor_format_shortcuts(
             update_editor_cursor_visibility(&editor);
         }
     });
-    // The clipboard is read asynchronously, so a copied spreadsheet range can become a table.
     editor.connect_paste_clipboard(move |view| {
         if !view.is_editable() {
             return;
@@ -7705,13 +7717,28 @@ fn install_editor_format_shortcuts(
         let view = view.clone();
         let clipboard = view.clipboard();
         gtk::glib::MainContext::default().spawn_local(async move {
-            let text = clipboard.read_text_future().await.ok().flatten();
+            let formats = clipboard.formats();
+            let text = if formats.contains_type(gtk::glib::Type::STRING)
+                || formats.contain_mime_type("text/plain")
+                || formats.contain_mime_type("text/plain;charset=utf-8")
+            {
+                clipboard.read_text_future().await.ok().flatten()
+            } else {
+                None
+            };
             match text
                 .as_deref()
                 .and_then(memonotes::editor_document::pasted_table_rows)
             {
                 Some(rows) => editor_table::insert_pasted_table(&view, &rows),
                 None => {
+                    if let Some(html) = read_editor_clipboard_html(&clipboard).await {
+                        let markdown = memonotes::editor_document::pasted_html_markdown(&html);
+                        if !markdown.is_empty() {
+                            insert_editor_markdown(&view, &markdown);
+                            return;
+                        }
+                    }
                     let buffer = view.buffer();
                     buffer.paste_clipboard(&clipboard, None, true);
                     view.scroll_mark_onscreen(&buffer.get_insert());
@@ -8332,6 +8359,7 @@ fn toggle_list_prefix(editor: &gtk::TextView, kind: ListPrefixKind) {
         end_line -= 1;
     }
 
+    buffer.begin_user_action();
     for line_number in (start_line..=end_line).rev() {
         let Some(mut line_start) = buffer.iter_at_line(line_number) else {
             continue;
@@ -8372,6 +8400,7 @@ fn toggle_list_prefix(editor: &gtk::TextView, kind: ListPrefixKind) {
         buffer.insert(&mut line_start, insert_prefix);
     }
     install_task_checkbuttons(editor);
+    buffer.end_user_action();
     editor.grab_focus();
 }
 
@@ -8429,7 +8458,13 @@ fn toggle_numbered_list(editor: &gtk::TextView) {
         })
     });
 
-    buffer.begin_user_action();
+    let history = editor_image_history(editor);
+    let before = history
+        .as_ref()
+        .map(|history| begin_editor_image_change(editor, history));
+    if before.is_none() {
+        buffer.begin_user_action();
+    }
     for (index, line_number) in lines.iter().enumerate().rev() {
         let Some(line) = line_text(*line_number) else {
             continue;
@@ -8447,17 +8482,24 @@ fn toggle_numbered_list(editor: &gtk::TextView) {
             buffer.insert(&mut line_start, &format!("{}. ", index + 1));
         }
     }
-    buffer.end_user_action();
     install_task_checkbuttons(editor);
+    if let (Some(history), Some(before)) = (history, before) {
+        finish_editor_image_change(editor, &history, before);
+    } else {
+        buffer.end_user_action();
+    }
     editor.grab_focus();
 }
 
 fn list_prefix_change(line: &str, kind: ListPrefixKind) -> (i32, &'static str) {
+    let numbered_chars = numbered_prefix_chars(line).unwrap_or(0);
     match kind {
+        ListPrefixKind::Task if numbered_chars > 0 => (numbered_chars, "☐ "),
         ListPrefixKind::Task if line.starts_with("☐ ") => (2, "☑ "),
         ListPrefixKind::Task if line.starts_with("☑ ") => (2, "☐ "),
         ListPrefixKind::Task if line.starts_with("• ") => (2, "☐ "),
         ListPrefixKind::Task => (0, "☐ "),
+        ListPrefixKind::Bullet if numbered_chars > 0 => (numbered_chars, "• "),
         ListPrefixKind::Bullet if line.starts_with("☐ ") || line.starts_with("☑ ") => (2, "• "),
         ListPrefixKind::Bullet if line.starts_with("• ") => (2, ""),
         ListPrefixKind::Bullet => (0, "• "),
@@ -8541,6 +8583,94 @@ fn markdown_from_editor_text(text: &str) -> String {
 #[cfg(test)]
 mod editor_format_tests {
     use super::*;
+
+    #[test]
+    fn html_clipboard_preserves_formatting_and_undo() -> Result<()> {
+        if std::env::var_os("MEMONOTES_EDITOR_FORMAT_TEST").is_none() {
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "editor_format_tests::html_clipboard_preserves_formatting_and_undo",
+                    "--test-threads=1",
+                ])
+                .env("MEMONOTES_EDITOR_FORMAT_TEST", "1")
+                .status()?;
+            assert!(status.success());
+            return Ok(());
+        }
+        gtk::init()?;
+        let editor = gtk::TextView::new();
+        let history = new_editor_image_history();
+        install_editor_format_shortcuts(&editor, Rc::clone(&history));
+        let original = "# Title\n\nBefore **existing**\n\nreplace\n\nAfter";
+        set_editor_view_content(&editor, original);
+        let buffer = editor.buffer();
+        let start = buffer.iter_at_line(4).unwrap();
+        let mut end = start;
+        end.forward_to_line_end();
+        buffer.select_range(&start, &end);
+        let html = "<p>Copied <strong>bold</strong>, <em>italic</em> and <code>code</code>.</p><ul><li><strong>App:</strong> native notes</li><li><a href=\"https://example.com\">Website</a></li></ul>";
+        let provider = gtk::gdk::ContentProvider::for_bytes(
+            "text/html",
+            &gtk::glib::Bytes::from_owned(html.as_bytes().to_vec()),
+        );
+        editor.clipboard().set_content(Some(&provider))?;
+        editor.emit_by_name::<()>("paste-clipboard", &[]);
+        let context = gtk::glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while markdown_from_editor_buffer(&buffer) == original {
+            assert!(std::time::Instant::now() < deadline, "HTML paste did not complete");
+            context.iteration(false);
+        }
+        let pasted = markdown_from_editor_buffer(&buffer);
+        assert!(pasted.contains("Before **existing**"), "{pasted}");
+        assert!(pasted.contains("Copied **bold**, *italic* and `code`."), "{pasted}");
+        assert!(pasted.contains("- **App:** native notes"), "{pasted}");
+        assert!(pasted.contains("- [Website](https://example.com)"), "{pasted}");
+        assert!(pasted.ends_with("\n\nAfter"), "{pasted}");
+        assert!(!pasted.contains("replace"));
+        let editor_text = buffer
+            .text(&buffer.start_iter(), &buffer.end_iter(), true)
+            .to_string();
+        assert!(editor_text.contains("• App: native notes"), "{editor_text}");
+        assert!(!editor_text.contains("- App: native notes"), "{editor_text}");
+        assert!(undo_editor_image_change(&editor, &history));
+        assert_eq!(markdown_from_editor_buffer(&buffer), original);
+        assert!(redo_editor_image_change(&editor, &history));
+        assert_eq!(markdown_from_editor_buffer(&buffer), pasted);
+
+        set_editor_view_content(&editor, original);
+        let start = buffer.iter_at_line(4).unwrap();
+        let mut end = start;
+        end.forward_to_line_end();
+        buffer.select_range(&start, &end);
+        let provider = gtk::gdk::ContentProvider::new_union(&[
+            provider,
+            gtk::gdk::ContentProvider::for_value(&"Copied plain text".to_value()),
+        ]);
+        editor.clipboard().set_content(Some(&provider))?;
+        editor.emit_by_name::<()>("paste-clipboard", &[]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while markdown_from_editor_buffer(&buffer) == original {
+            assert!(std::time::Instant::now() < deadline, "Mixed-format paste did not complete");
+            context.iteration(false);
+        }
+        assert_eq!(markdown_from_editor_buffer(&buffer), pasted);
+
+        set_editor_view_content(&editor, "Title\nBody");
+        let title_start = buffer.start_iter();
+        assert!((1..=6).all(|level| !title_start.has_tag(&heading_style_tag(&buffer, level))));
+        let mut body_end = buffer.iter_at_line(1).unwrap();
+        body_end.forward_to_line_end();
+        buffer.select_range(&buffer.iter_at_line(1).unwrap(), &body_end);
+        insert_editor_markdown(&editor, "Pasted **text**");
+        assert_eq!(markdown_from_editor_buffer(&buffer), "# Title\nPasted **text**");
+        undo_editor_change(&editor, &history);
+        assert_eq!(buffer.text(&buffer.start_iter(), &buffer.end_iter(), true), "Title\nBody");
+        let restored_title = buffer.start_iter();
+        assert!((1..=6).all(|level| !restored_title.has_tag(&heading_style_tag(&buffer, level))));
+        Ok(())
+    }
 
     fn table_widgets(buffer: &gtk::TextBuffer) -> Vec<gtk::Widget> {
         let mut widgets = Vec::new();
@@ -9940,6 +10070,7 @@ mod editor_format_tests {
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
         let editor = gtk::TextView::new();
+        install_editor_format_shortcuts(&editor, new_editor_image_history());
         set_editor_view_content(&editor, "Title\n- [ ] Task");
         let window = gtk::Window::builder()
             .default_width(480)
@@ -10092,6 +10223,24 @@ mod editor_format_tests {
             "# Title\nOne\nTwo\nThree"
         );
 
+        set_editor_view_content(&editor, "Title\n- One\n- Two");
+        buffer.set_enable_undo(true);
+        buffer.select_range(&buffer.iter_at_line(1).unwrap(), &buffer.end_iter());
+        toggle_numbered_list(&editor);
+        assert_eq!(markdown_from_editor_buffer(&buffer), "# Title\n1. One\n2. Two");
+        assert!(!buffer.can_undo());
+        undo_editor_change(&editor, &editor_image_history(&editor).unwrap());
+        assert_eq!(markdown_from_editor_buffer(&buffer), "# Title\n- One\n- Two");
+        redo_editor_change(&editor, &editor_image_history(&editor).unwrap());
+        assert_eq!(markdown_from_editor_buffer(&buffer), "# Title\n1. One\n2. Two");
+
+        set_editor_view_content(&editor, "Title\n1. One\n2. Two");
+        buffer.select_range(&buffer.iter_at_line(1).unwrap(), &buffer.end_iter());
+        toggle_list_prefix(&editor, ListPrefixKind::Bullet);
+        assert_eq!(markdown_from_editor_buffer(&buffer), "# Title\n- One\n- Two");
+        toggle_list_prefix(&editor, ListPrefixKind::Task);
+        assert_eq!(markdown_from_editor_buffer(&buffer), "# Title\n- [ ] One\n- [ ] Two");
+
         set_editor_view_content(
             &editor,
             "Title\n- [ ] One\n- [ ] Two\n- [ ] Three\n- [ ] Four\n- [ ] Five\n- [ ] Last",
@@ -10234,9 +10383,14 @@ fn apply_rendered_spans(
     images: &[ImageSpan],
     tables: &[memonotes::editor_document::TableSpan],
     rules: &[std::ops::Range<usize>],
+    offset: i32,
 ) {
-    let (start, end) = buffer.bounds();
-    let char_offsets = memonotes::editor_document::byte_to_char_offsets(text);
+    let char_offsets: Vec<_> = memonotes::editor_document::byte_to_char_offsets(text)
+        .into_iter()
+        .map(|position| position + offset as usize)
+        .collect();
+    let start = buffer.iter_at_offset(offset);
+    let end = buffer.iter_at_offset(offset + text.chars().count() as i32);
     remove_link_tags(buffer, &start, &end);
     let marks = [
         Mark::Bold,
@@ -10352,6 +10506,7 @@ fn set_editor_view_content(editor: &gtk::TextView, content: &str) {
         &rendered.images,
         &rendered.tables,
         &rendered.rules,
+        0,
     );
     install_task_checkbuttons(editor);
     auto_link_plain_urls(&buffer);
@@ -10362,6 +10517,69 @@ fn set_editor_view_content(editor: &gtk::TextView, content: &str) {
     buffer.notify("can-redo");
     buffer.notify("cursor-position");
     update_editor_cursor_visibility(editor);
+}
+
+async fn read_editor_clipboard_html(clipboard: &gtk::gdk::Clipboard) -> Option<String> {
+    if !clipboard.formats().contain_mime_type("text/html") {
+        return None;
+    }
+    let (stream, _) = clipboard
+        .read_future(&["text/html"], gtk::glib::Priority::DEFAULT)
+        .await
+        .ok()?;
+    let mut data = Vec::new();
+    loop {
+        let bytes = stream
+            .read_bytes_future(8192, gtk::glib::Priority::DEFAULT)
+            .await
+            .ok()?;
+        if bytes.is_empty() {
+            break;
+        }
+        data.extend_from_slice(&bytes);
+        if data.len() > 16 * 1024 * 1024 {
+            return None;
+        }
+    }
+    String::from_utf8(data).ok()
+}
+
+fn insert_editor_markdown(editor: &gtk::TextView, markdown: &str) {
+    let Some(history) = editor_image_history(editor) else {
+        return;
+    };
+    let before = begin_editor_image_change(editor, &history);
+    let buffer = editor.buffer();
+    let mapped = editor_text_from_markdown(markdown);
+    let rendered = render_markdown_source(&mapped);
+    editor.add_css_class("editor-content-replacing");
+    if let Some((start, end)) = buffer.selection_bounds() {
+        remove_editor_anchor_widgets(editor, start, end);
+    }
+    buffer.delete_selection(true, true);
+    let mut iter = buffer.iter_at_mark(&buffer.get_insert());
+    let offset = iter.offset();
+    buffer.insert(&mut iter, &rendered.text);
+    let end_mark = buffer.create_mark(None, &iter, false);
+    apply_rendered_spans(
+        editor,
+        &buffer,
+        &rendered.text,
+        &rendered.spans,
+        &rendered.headings,
+        &rendered.links,
+        &rendered.images,
+        &rendered.tables,
+        &rendered.rules,
+        offset,
+    );
+    install_task_checkbuttons(editor);
+    buffer.place_cursor(&buffer.iter_at_mark(&end_mark));
+    buffer.delete_mark(&end_mark);
+    editor.remove_css_class("editor-content-replacing");
+    auto_link_plain_urls(&buffer);
+    finish_editor_image_change(editor, &history, before);
+    editor.scroll_mark_onscreen(&buffer.get_insert());
 }
 
 fn task_checkbox_checked_tag(buffer: &gtk::TextBuffer) -> gtk::TextTag {

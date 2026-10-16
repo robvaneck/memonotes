@@ -52,6 +52,10 @@ pub fn byte_to_char_offsets(text: &str) -> Vec<usize> {
     offsets
 }
 
+pub fn pasted_html_markdown(html: &str) -> String {
+    crate::imap_notes::html_to_markdown(html, &Default::default())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeadingSpan {
     pub range: Range<usize>,

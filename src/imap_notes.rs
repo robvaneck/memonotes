@@ -1166,7 +1166,7 @@ impl HtmlConverter<'_> {
     }
 }
 
-fn html_to_markdown(html: &str, images: &HashMap<String, String>) -> String {
+pub(crate) fn html_to_markdown(html: &str, images: &HashMap<String, String>) -> String {
     let mut converter = HtmlConverter {
         output: String::new(),
         lists: Vec::new(),
