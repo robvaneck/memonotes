@@ -332,7 +332,7 @@ impl Store {
                 "ALTER TABLE backend_accounts ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1;",
             )?;
         }
-        // Removing an account keeps its notes and folders on this device.
+        // Removing an account deletes its notes and folders first; SET NULL is only a safety net.
         for table in ["folders", "notes"] {
             if !has_column(&connection, table, "account_id")? {
                 connection.execute_batch(&format!(
@@ -651,28 +651,43 @@ impl Store {
     }
 
     pub fn set_archived(&self, id: &str, archived: bool) -> Result<()> {
+        self.set_archived_many(&[id], archived)
+    }
+
+    /// Applies all changes in one transaction so large selections need a single commit.
+    pub fn set_archived_many(&self, ids: &[&str], archived: bool) -> Result<()> {
         let transaction = self.connection.unchecked_transaction()?;
-        let changed = transaction.execute(
-            "UPDATE notes SET archived = ?2, updated_at = ?3 WHERE id = ?1",
-            params![id, archived, timestamp()?],
-        )?;
-        self.changed(changed)?;
-        let note = load_note(&transaction, id)?;
-        let event = if archived {
-            SyncEvent::NoteArchived { note: note.into() }
-        } else {
-            SyncEvent::NoteUnarchived { note: note.into() }
-        };
-        append_sync_event(&transaction, event)?;
+        let now = timestamp()?;
+        for id in ids {
+            let changed = transaction.execute(
+                "UPDATE notes SET archived = ?2, updated_at = ?3 WHERE id = ?1",
+                params![id, archived, now],
+            )?;
+            self.changed(changed)?;
+            let note = load_note(&transaction, id)?;
+            let event = if archived {
+                SyncEvent::NoteArchived { note: note.into() }
+            } else {
+                SyncEvent::NoteUnarchived { note: note.into() }
+            };
+            append_sync_event(&transaction, event)?;
+        }
         transaction.commit()?;
         Ok(())
     }
 
     pub fn delete_note(&self, id: &str) -> Result<()> {
+        self.delete_notes(&[id])
+    }
+
+    /// Deletes all notes in one transaction so large selections need a single commit.
+    pub fn delete_notes(&self, ids: &[&str]) -> Result<()> {
         let transaction = self.connection.unchecked_transaction()?;
-        let note = load_note(&transaction, id)?;
-        self.changed(transaction.execute("DELETE FROM notes WHERE id = ?1", [id])?)?;
-        append_sync_event(&transaction, SyncEvent::NoteDeleted { note: note.into() })?;
+        for id in ids {
+            let note = load_note(&transaction, id)?;
+            self.changed(transaction.execute("DELETE FROM notes WHERE id = ?1", [id])?)?;
+            append_sync_event(&transaction, SyncEvent::NoteDeleted { note: note.into() })?;
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -1262,11 +1277,33 @@ impl Store {
         )?)
     }
 
+    /// Removes the account together with its local copies of notes and folders.
     pub fn remove_backend_account(&self, id: &str) -> Result<()> {
-        self.changed(
-            self.connection
-                .execute("DELETE FROM backend_accounts WHERE id = ?1", [id])?,
-        )
+        let transaction = self.connection.unchecked_transaction()?;
+        let mut statement =
+            transaction.prepare("SELECT sequence, payload FROM sync_outbox ORDER BY sequence")?;
+        let queued = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        let events = queued
+            .iter()
+            .map(|(_, payload)| Ok(serde_json::from_str::<SyncEvent>(payload)?))
+            .collect::<Result<Vec<_>>>()?;
+        let folder_owners = outbox_folder_owners(&events);
+        for ((sequence, _), event) in queued.iter().zip(&events) {
+            if self.outbox_event_owner(event, &folder_owners)?.as_deref() == Some(id) {
+                transaction.execute("DELETE FROM sync_outbox WHERE sequence = ?1", [sequence])?;
+            }
+        }
+        transaction.execute("DELETE FROM notes WHERE account_id = ?1", [id])?;
+        transaction.execute("DELETE FROM folders WHERE account_id = ?1", [id])?;
+        let removed = transaction.execute("DELETE FROM backend_accounts WHERE id = ?1", [id])?;
+        self.changed(removed)?;
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn notes(&self, filter: &NoteFilter) -> Result<Vec<Note>> {
@@ -3127,9 +3164,14 @@ mod tests {
         assert!(!store.has_local_data()?);
 
         store.remove_backend_account("work")?;
-        assert_eq!(store.note(&work_note)?.unwrap().account_id, None);
-        assert_eq!(store.folders()?[0].account_id, None);
-        assert!(store.has_local_data()?);
+        assert!(store.note(&work_note)?.is_none());
+        assert!(store.folders()?.is_empty());
+        assert!(!store.has_local_data()?);
+        assert!(store
+            .pending_sync_events(100)?
+            .iter()
+            .all(|entry| !matches!(&entry.event, SyncEvent::NoteCreated { note } if note.id == work_note)));
+        assert!(store.note(&home_note)?.is_some());
         Ok(())
     }
 

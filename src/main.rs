@@ -10909,17 +10909,21 @@ fn delete_current_note(state: &Rc<WindowState>) {
 
 fn archive_selected_notes(state: &Rc<WindowState>) {
     let ids = state.note_list.selected_ids();
-    for id in ids {
-        let note = state.store.borrow().note(&id).ok().flatten();
-        let Some(note) = note else {
-            continue;
-        };
-        if state.store.borrow().set_archived(&id, true).is_ok() {
-            state
-                .undo_stack
-                .borrow_mut()
-                .push(UndoOperation::Archive(note));
-        }
+    let notes: Vec<Note> = ids
+        .iter()
+        .filter_map(|id| state.store.borrow().note(id).ok().flatten())
+        .collect();
+    let note_ids: Vec<&str> = notes.iter().map(|note| note.id.as_str()).collect();
+    let archived = state
+        .store
+        .borrow()
+        .set_archived_many(&note_ids, true)
+        .is_ok();
+    if archived {
+        state
+            .undo_stack
+            .borrow_mut()
+            .extend(notes.into_iter().map(UndoOperation::Archive));
     }
     clear_note_selection(state);
     let _ = refresh_notes(state);
@@ -10962,24 +10966,26 @@ fn delete_selected_notes(state: &Rc<WindowState>) {
             if response != "delete" {
                 return;
             }
+            let note_ids: Vec<&str> = notes.iter().map(|note| note.id.as_str()).collect();
+            let result = state.store.borrow().delete_notes(&note_ids);
+            if let Err(error) = result {
+                state
+                    .toast_overlay
+                    .add_toast(adw::Toast::new(&memonotes::tr_format!(
+                        "note.error.delete_failed",
+                        error = format!("{error:#}")
+                    )));
+                return;
+            }
+            let deleted: HashSet<&str> = note_ids.iter().copied().collect();
+            state
+                .undo_stack
+                .borrow_mut()
+                .retain(|operation| match operation {
+                    UndoOperation::Archive(archived) => !deleted.contains(archived.id.as_str()),
+                });
             let mut accounts: Vec<Option<String>> = Vec::new();
             for note in &notes {
-                let result = state.store.borrow().delete_note(&note.id);
-                if let Err(error) = result {
-                    state
-                        .toast_overlay
-                        .add_toast(adw::Toast::new(&memonotes::tr_format!(
-                            "note.error.delete_failed",
-                            error = format!("{error:#}")
-                        )));
-                    break;
-                }
-                state
-                    .undo_stack
-                    .borrow_mut()
-                    .retain(|operation| match operation {
-                        UndoOperation::Archive(archived) => archived.id != note.id,
-                    });
                 let note_window = state.note_windows.borrow().get(&note.id).cloned();
                 if let Some(window) = note_window {
                     window.close();
