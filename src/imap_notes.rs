@@ -87,6 +87,10 @@ pub trait MailStore: Send {
     /// The mailbox called `prefix` and everything below it.
     fn mailboxes(&mut self, prefix: &str) -> Result<Vec<String>>;
     fn create_mailbox(&mut self, name: &str) -> Result<()>;
+    /// Makes clients that only list subscribed mailboxes show `name`.
+    fn subscribe_mailbox(&mut self, _name: &str) -> Result<()> {
+        Ok(())
+    }
     fn delete_mailbox(&mut self, name: &str) -> Result<()>;
     fn rename_mailbox(&mut self, from: &str, to: &str) -> Result<()>;
     /// UIDVALIDITY and all UIDs of `mailbox`; `None` when it does not exist.
@@ -422,7 +426,8 @@ impl BackendAdapter for ImapAdapter {
                     .then(|| folder.id.clone());
                     match current {
                         Some(from) if store.mailboxes(&from)?.contains(&from) => {
-                            store.rename_mailbox(&from, &wanted)
+                            store.rename_mailbox(&from, &wanted)?;
+                            store.subscribe_mailbox(&wanted)
                         }
                         _ => ensure_mailbox(store, &wanted),
                     }
@@ -509,12 +514,13 @@ fn note_mailboxes(store: &mut dyn MailStore) -> Result<Vec<String>> {
 
 fn ensure_mailbox(store: &mut dyn MailStore, name: &str) -> Result<()> {
     if store.mailboxes(name)?.iter().any(|existing| existing == name) {
-        return Ok(());
+        return store.subscribe_mailbox(name);
     }
     if name != ROOT {
         ensure_mailbox(store, ROOT)?;
     }
-    store.create_mailbox(name)
+    store.create_mailbox(name)?;
+    store.subscribe_mailbox(name)
 }
 
 fn folder_mailbox(delimiter: &str, name: &str) -> String {
@@ -1330,7 +1336,7 @@ impl MailStore for RealMail {
     }
 
     fn create_mailbox(&mut self, name: &str) -> Result<()> {
-        match self.session.create(utf7_encode(name)) {
+        let created: Result<()> = match self.session.create(utf7_encode(name)) {
             Ok(()) => Ok(()),
             Err(::imap::Error::No(error)) => {
                 if self.mailboxes(name)?.iter().any(|existing| existing == name) {
@@ -1339,6 +1345,15 @@ impl MailStore for RealMail {
                     Err(::imap::Error::No(error).into())
                 }
             }
+            Err(error) => Err(error.into()),
+        };
+        created
+    }
+
+    fn subscribe_mailbox(&mut self, name: &str) -> Result<()> {
+        // Some servers answer NO when already subscribed; subscribing is only cosmetic.
+        match self.session.subscribe(utf7_encode(name)) {
+            Ok(()) | Err(::imap::Error::No(_)) => Ok(()),
             Err(error) => Err(error.into()),
         }
     }
