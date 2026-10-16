@@ -17,6 +17,24 @@
       <li>Import and export of Markdown files</li>
     </ul>
   </description>
+  <screenshots>
+    <screenshot type="default">
+      <caption>Visual editor with headings, checklists, lists and tables</caption>
+      <image type="source" width="2359" height="1643">https://raw.githubusercontent.com/robvaneck/memonotes/v0.1.0/screenshots/01_img.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Notes with folders and images</caption>
+      <image type="source" width="2359" height="1643">https://raw.githubusercontent.com/robvaneck/memonotes/v0.1.0/screenshots/03_1_folder-support.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Connect to your own Memos server</caption>
+      <image type="source" width="1240" height="1039">https://raw.githubusercontent.com/robvaneck/memonotes/v0.1.0/screenshots/04_2_account.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Choose a note color</caption>
+      <image type="source" width="2359" height="1643">https://raw.githubusercontent.com/robvaneck/memonotes/v0.1.0/screenshots/05_colors.png</image>
+    </screenshot>
+  </screenshots>
   <launchable type="desktop-id">io.github.robvaneck.Memonotes.desktop</launchable>
   <url type="homepage">https://github.com/robvaneck/memonotes</url>
   <url type="bugtracker">https://github.com/robvaneck/memonotes/issues</url>
