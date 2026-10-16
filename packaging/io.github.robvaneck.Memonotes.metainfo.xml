@@ -19,16 +19,40 @@
   </description>
   <screenshots>
     <screenshot type="default">
+      <caption>Notes from your Memos server, IMAP or stored only on this device</caption>
+      <image type="source" width="2359" height="1643">https://raw.githubusercontent.com/robvaneck/memonotes/v0.1.0/screenshots/00_hello.png</image>
+    </screenshot>
+    <screenshot>
       <caption>Visual editor with headings, checklists, lists and tables</caption>
       <image type="source" width="2359" height="1643">https://raw.githubusercontent.com/robvaneck/memonotes/v0.1.0/screenshots/01_img.png</image>
     </screenshot>
     <screenshot>
-      <caption>Notes with folders and images</caption>
+      <caption>Images inside notes</caption>
+      <image type="source" width="2359" height="1643">https://raw.githubusercontent.com/robvaneck/memonotes/v0.1.0/screenshots/02_image.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Organize notes in folders</caption>
       <image type="source" width="2359" height="1643">https://raw.githubusercontent.com/robvaneck/memonotes/v0.1.0/screenshots/03_1_folder-support.png</image>
     </screenshot>
     <screenshot>
-      <caption>Connect to your own Memos server</caption>
+      <caption>Works with a self-hosted Memos instance, for example on Umbrel</caption>
+      <image type="source" width="2359" height="1643">https://raw.githubusercontent.com/robvaneck/memonotes/v0.1.0/screenshots/03_umbrel.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Manage accounts, with tokens stored in the GNOME Keyring</caption>
+      <image type="source" width="2359" height="1643">https://raw.githubusercontent.com/robvaneck/memonotes/v0.1.0/screenshots/04_1_account.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Edit the connection to your Memos server</caption>
       <image type="source" width="1240" height="1039">https://raw.githubusercontent.com/robvaneck/memonotes/v0.1.0/screenshots/04_2_account.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Add a Memos account</caption>
+      <image type="source" width="1240" height="1039">https://raw.githubusercontent.com/robvaneck/memonotes/v0.1.0/screenshots/04_3_account.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Add an IMAP account</caption>
+      <image type="source" width="1240" height="1151">https://raw.githubusercontent.com/robvaneck/memonotes/v0.1.0/screenshots/04_4_account.png</image>
     </screenshot>
     <screenshot>
       <caption>Choose a note color</caption>
