@@ -7543,6 +7543,57 @@ fn install_pending_heading_style(editor: &gtk::TextView) -> Rc<Cell<Option<(i32,
     pending_heading
 }
 
+/// Typed text extends the heading style of its line; Enter drops the new line back to a paragraph.
+fn install_heading_line_typing(editor: &gtk::TextView) {
+    let editor_weak = editor.downgrade();
+    let closure = gtk::glib::RustClosure::new_local(move |args| {
+        let editor = editor_weak.upgrade()?;
+        if editor.has_css_class("editor-content-replacing") {
+            return None;
+        }
+        let buffer = editor.buffer();
+        let end = args.get(1)?.get::<gtk::TextIter>().ok()?;
+        let text = args.get(2)?.get::<String>().ok()?;
+        let length = text.chars().count() as i32;
+        let start = buffer.iter_at_offset(end.offset() - length);
+        if start.line() == 0 {
+            return None;
+        }
+        if text == "\n" {
+            if start.line_offset() > 0 {
+                let mut line_end = end;
+                line_end.forward_to_line_end();
+                for level in 1..=6 {
+                    buffer.remove_tag(&heading_style_tag(&buffer, level), &end, &line_end);
+                }
+            }
+            return None;
+        }
+        if text.contains('\n') {
+            return None;
+        }
+        let neighbor = if start.line_offset() > 0 {
+            let mut previous = start;
+            previous.backward_char();
+            previous
+        } else {
+            end
+        };
+        let Some(level) =
+            (1..=6).find(|level| neighbor.has_tag(&heading_style_tag(&buffer, *level)))
+        else {
+            return None;
+        };
+        let tag = heading_style_tag(&buffer, level);
+        if !start.has_tag(&tag) || !buffer.iter_at_offset(end.offset() - 1).has_tag(&tag) {
+            buffer.apply_tag(&tag, &start, &end);
+            buffer.emit_by_name::<()>("changed", &[]);
+        }
+        None
+    });
+    editor.buffer().connect_closure("insert-text", true, closure);
+}
+
 fn apply_editor_block_style(
     editor: &gtk::TextView,
     level: Option<u8>,
@@ -7681,6 +7732,7 @@ fn install_editor_format_shortcuts(
             buffer.insert(iter, &cleaned);
         }
     });
+    install_heading_line_typing(editor);
     install_bullet_selection_guard(editor);
     let auto_linking = Rc::new(Cell::new(false));
     let auto_linking_for_change = Rc::clone(&auto_linking);
@@ -9748,6 +9800,20 @@ mod editor_format_tests {
         assert_eq!(
             markdown_from_editor_buffer(&buffer),
             "# Title\nFirst paragraph\nSecond paragraph\n### New heading"
+        );
+
+        install_heading_line_typing(&editor);
+        buffer.insert_at_cursor(" typed");
+        buffer.insert_at_cursor(" on");
+        assert_eq!(
+            markdown_from_editor_buffer(&buffer),
+            "# Title\nFirst paragraph\nSecond paragraph\n### New heading typed on"
+        );
+        buffer.insert_at_cursor("\n");
+        buffer.insert_at_cursor("Body");
+        assert_eq!(
+            markdown_from_editor_buffer(&buffer),
+            "# Title\nFirst paragraph\nSecond paragraph\n### New heading typed on\nBody"
         );
         Ok(())
     }
