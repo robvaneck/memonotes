@@ -29,5 +29,5 @@ modules:
       - type: git
         url: https://github.com/robvaneck/memonotes.git
         tag: v0.1.0
-        commit: c23e7406a8f7605595228177172021c0a75e8efd
+        commit: 5c8446603761b0b376233b4f1510406c658d41f6
       - cargo-sources.json
