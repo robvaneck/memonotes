@@ -49,6 +49,7 @@ actually implemented in the current code. See also [README.md](README.md) and
 
 ### Still to do
 
+- [x] HTML clipboard paste preserves formatting and supports undo/redo in the GTK editor test; user also confirmed formatted paste works manually in the UI (2026-10-17).
 - [x] Fetch all 2,700 notes paginated and sort them correctly; confirmed live.
 - [x] Archive/restore works remotely; tested end to end on the real server.
 - [x] Filter shared Memos spaces and non-private notes out of the UI; keep shared data only in the sync cache.
@@ -67,6 +68,22 @@ actually implemented in the current code. See also [README.md](README.md) and
 - [x] Table support: Markdown pipe tables render as editable grid widgets (top-level tables only; tables inside lists or quotes stay text) at full editor width, with an insert-table toolbar button, row/column add and delete, drag selection of cells with copy, cut, clear and paste, pasting spreadsheet ranges (Excel, Calc, web tables) as a new table, and undo/redo for structure changes.
 - [x] Bulk delete in the note list: Ctrl+A selects all notes, Delete archives the selection (or permanently deletes it, after confirmation, in the archive).
 - [x] Export: write the note title into the Markdown content (as the first H1), not only into the file name.
+
+### Clipboard regression follow-up (2026-10-17)
+
+- The GTK test `editor_format_tests::html_clipboard_preserves_formatting_and_undo`
+  now exercises HTML clipboard paste through the real editor handler and checks
+  inline formatting, list rendering, links, undo/redo and title-style restoration.
+  Bullets are GTK child-anchor `Label` widgets, not literal text-buffer characters.
+- A synthetic `ContentProvider::new_union` offering HTML plus plain text hung while
+  reading HTML in the test harness. The user reports formatted paste works in the
+  actual UI. That synthetic case was removed; mixed-format clipboard behavior is
+  not covered by this regression test and should not be claimed as tested.
+- Verification on 2026-10-17: all 18 `editor_format_tests` passed. No production
+  clipboard code was changed for this test fix.
+- If explicit mixed-format automated coverage is needed later, reproduce with a
+  reliable provider or clipboard fixture first. Do not re-add the hanging union
+  provider, simply extend its timeout, or weaken the HTML formatting assertions.
 
 Not built and outside the current version 1 scope: space members/invitations,
 publishing, PAT management through the API, mobile and React Native. File

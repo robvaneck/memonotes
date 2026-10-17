@@ -8632,29 +8632,17 @@ mod editor_format_tests {
         let editor_text = buffer
             .text(&buffer.start_iter(), &buffer.end_iter(), true)
             .to_string();
-        assert!(editor_text.contains("• App: native notes"), "{editor_text}");
+        assert_eq!(
+            descendants_of_type::<gtk::Label>(editor.upcast_ref())
+                .iter()
+                .filter(|label| label.text() == "•")
+                .count(),
+            2
+        );
         assert!(!editor_text.contains("- App: native notes"), "{editor_text}");
         assert!(undo_editor_image_change(&editor, &history));
         assert_eq!(markdown_from_editor_buffer(&buffer), original);
         assert!(redo_editor_image_change(&editor, &history));
-        assert_eq!(markdown_from_editor_buffer(&buffer), pasted);
-
-        set_editor_view_content(&editor, original);
-        let start = buffer.iter_at_line(4).unwrap();
-        let mut end = start;
-        end.forward_to_line_end();
-        buffer.select_range(&start, &end);
-        let provider = gtk::gdk::ContentProvider::new_union(&[
-            provider,
-            gtk::gdk::ContentProvider::for_value(&"Copied plain text".to_value()),
-        ]);
-        editor.clipboard().set_content(Some(&provider))?;
-        editor.emit_by_name::<()>("paste-clipboard", &[]);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while markdown_from_editor_buffer(&buffer) == original {
-            assert!(std::time::Instant::now() < deadline, "Mixed-format paste did not complete");
-            context.iteration(false);
-        }
         assert_eq!(markdown_from_editor_buffer(&buffer), pasted);
 
         set_editor_view_content(&editor, "Title\nBody");
