@@ -11,6 +11,17 @@ two backends that are implemented and working today:
 
 Status: early development, last updated 2026-10-15.
 
+## Install from GitHub Releases
+
+Download the `.flatpak` bundle from the [latest release](https://github.com/robvaneck/memonotes/releases/latest), then install or update it with:
+
+```sh
+flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+flatpak install --user --or-update ./io.github.robvaneck.Memonotes-vX.Y.Z.flatpak
+```
+
+Replace `vX.Y.Z` with the version in the downloaded filename. GitHub Release bundles are currently built for x86_64.
+
 ## Why Memonotes
 
 - **Native Linux UI, not a web wrapper.** No Electron or embedded browser: a GTK4

@@ -1,0 +1,51 @@
+name: Release Flatpak
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build, for example v0.1.0
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install Flatpak build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+
+      - name: Build Flatpak
+        run: >-
+          flatpak-builder --user --install-deps-from=flathub --force-clean
+          --repo=repo build-dir
+          packaging/flatpak/io.github.robvaneck.Memonotes.yml
+
+      - name: Create Flatpak bundle
+        run: |
+          flatpak build-bundle repo \
+            "io.github.robvaneck.Memonotes-${RELEASE_TAG}.flatpak" \
+            io.github.robvaneck.Memonotes stable
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          files: io.github.robvaneck.Memonotes-${{ inputs.tag || github.ref_name }}.flatpak
