@@ -11,6 +11,8 @@ two backends that are implemented and working today:
 
 Status: early development, last updated 2026-10-15.
 
+Watch the [Memonotes demo on YouTube](https://www.youtube.com/watch?v=ioX5DLYnWpE).
+
 ## Install from GitHub Releases
 
 Download the `.flatpak` bundle from the [latest release](https://github.com/robvaneck/memonotes/releases/latest), then install or update it with:

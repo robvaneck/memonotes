@@ -41,11 +41,15 @@ jobs:
         run: |
           flatpak build-bundle repo \
             "io.github.robvaneck.Memonotes-${RELEASE_TAG}.flatpak" \
-            io.github.robvaneck.Memonotes stable
+            io.github.robvaneck.Memonotes master
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           generate_release_notes: true
+          body: |
+            [Watch the Memonotes demo on YouTube](https://www.youtube.com/watch?v=ioX5DLYnWpE).
+
+            Download the Flatpak bundle below. For installation instructions, see the [README](https://github.com/robvaneck/memonotes#install-from-github-releases).
           files: io.github.robvaneck.Memonotes-${{ inputs.tag || github.ref_name }}.flatpak
